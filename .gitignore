@@ -1,0 +1,5 @@
+build/
+*.o
+*.dylib
+*.metallib
+.DS_Store
