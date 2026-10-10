@@ -471,7 +471,6 @@ mx::array mla_layer_batch(const G5Layer& l, const ModelConfig& cfg, const mx::ar
                           const mx::array& q_resid) {
   const int B = (int)h.shape(0);
   const int H = cfg.num_heads;
-  const int kvr = (int)l.kv_b.in_features;        // kv_lora_rank (512)
   const int qk = (int)l.q_b.out_features / H;     // qk_head_dim (nope only: rope = 0)
   const int vd = (int)l.kv_b.out_features / H - qk;
   if ((int)len.size() != B) throw std::runtime_error("GLM MLA batch: len/B mismatch");

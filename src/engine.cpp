@@ -470,8 +470,6 @@ void Engine::batch_worker_loop() {
     bool finished = false;
   };
   std::vector<Req> live;
-  const int V = model_.glm5()->vocab_size();
-  const std::vector<int> eos = config().eos_token_ids;
 
   auto finish_req = [](Req& r, const char* fallback) {
     r.finished = true;
@@ -568,6 +566,10 @@ void Engine::batch_worker_loop() {
   };
 
   try {
+  // Everything below can throw (the model's own accessors included), and every
+  // path out of it answers the requests the scheduler holds.
+  const int V = model_.glm5()->vocab_size();
+  const std::vector<int> eos = config().eos_token_ids;
   while (!batch_stop_.load()) {
     if (batch_max_ <= 0) {
       // Serial mode: take one request and finish it before the next.

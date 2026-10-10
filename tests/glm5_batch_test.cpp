@@ -12,19 +12,26 @@
 //      (the batch adds no cross-slot coupling);
 //   3. four slots with four DIFFERENT prompts, decoded greedily for N steps ==
 //      four independent serial runs, token by token;
-//   4. the aggregate decode rate for B = 1/2/4/8 against the serial rate
-//      (same session, warmed).
+//   4. the engine's scheduler: concurrent requests submitted from other threads
+//      through the serving path == their serial runs, and a scheduler stopped
+//      with a request in flight never leaves its submitter waiting (the MLX
+//      stream is bound to the thread that created it, so the serving thread
+//      contract is a correctness gate - see docs/perf.md);
+//   5. the aggregate decode rate for B = 1/2/4/8 over 1/2/4/8 distinct prompts
+//      (same session, warmed), the expert-set size printed beside each cell.
 //
 // usage: glm5_batch_test <model_dir> [steps] [--bench]
 #include <mlx/mlx.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "engine.h"
@@ -85,6 +92,7 @@ static int run(int argc, char** argv) {
   }
   const bool sec1 = only == 0 || only == 1, sec2 = only == 0 || only == 2;
   const bool sec3 = only == 0 || only == 3;
+  const bool sec4 = only == 0 || only == 4;
 
   exl3::Engine engine;
   std::string err;
@@ -136,11 +144,18 @@ static int run(int argc, char** argv) {
     return m;
   };
 
+  // The first four drive the correctness gates; the whole set is used by the
+  // bench's `prom` axis (rows that share a prompt share their routing, so the
+  // number of distinct prompts is what the expert-set size follows).
   std::vector<std::string> prompts = {
       "In one sentence, what is a trellis? Answer briefly.",
       "Name the largest planet in the solar system.",
       "Write the first eight digits of pi, separated by spaces.",
       "What colour is a ripe banana?",
+      "Translate 'good morning' into Japanese and Korean.",
+      "List four prime numbers above twenty.",
+      "Explain what a hash table is in one sentence.",
+      "What is the capital of Australia?",
   };
   std::vector<std::vector<int>> ids;
   for (auto& p : prompts) {
@@ -275,9 +290,70 @@ static int run(int argc, char** argv) {
     g5->batch_reset();
   }
 
-  // ---- 4. aggregate throughput --------------------------------------------
+  // ---- 4. the serving thread (the engine's scheduler) ----------------------
+  //
+  // The HTTP server loads the checkpoint on main and serves requests on other
+  // threads. MLX binds a stream to the thread that created it and refuses to
+  // evaluate a primitive on a stream that thread does not have, so two things
+  // must hold, and this gate is the regression test for both:
+  //   (a) nothing the loader leaves in the model may be an unresolved graph
+  //       (a lazy `slice/view/reshape` chain over a zero-copy shard view carries
+  //       the LOADING thread's stream). That was the "There is no Stream(gpu, 0)
+  //       in current thread." failure: every served request threw it;
+  //   (b) every request must be built and evaluated on the same thread - the
+  //       engine's scheduler thread - not on whichever HTTP worker picked the
+  //       request up.
+  // And a request must never be left waiting: the scheduler answers everything
+  // it holds when it stops, so a submitter cannot block on a thread that is gone
+  // (the old failure left the next submitter in cv.wait() forever, which is why
+  // tools/batch_server_bench.sh printed nothing for 25 minutes).
+  if (sec4) {
+    std::printf("\n== 4. serving thread: the engine's scheduler ==\n");
+    exl3::GenerateOptions o;
+    o.max_tokens = steps;
+    o.sample.temperature = 0.0f; // greedy, as the batch test's reference runs
+    o.ignore_eos = true;         // so the token count is exactly `steps`
+    o.split_think = false;
+    for (int mode : {0, 2}) {
+      engine.start_batch(mode);
+      eq("scheduler running", engine.batch_running());
+      std::vector<exl3::GenerateResult> got(2);
+      std::vector<std::thread> ts;
+      for (int i = 0; i < 2; ++i)
+        ts.emplace_back([&engine, &got, &o, &ids, i] {
+          got[(size_t)i] = engine.submit_batch(ids[(size_t)i], o);
+        });
+      for (auto& t : ts) t.join();
+      engine.stop_batch();
+      for (int i = 0; i < 2; ++i) {
+        std::vector<int> want(ref[(size_t)i].tokens.begin(),
+                              ref[(size_t)i].tokens.begin() + steps);
+        char msg[160];
+        std::snprintf(msg, sizeof(msg), "--batch %d: concurrent request %d == its serial run",
+                      mode, i);
+        eq(msg, got[(size_t)i].tokens == want);
+      }
+    }
+    // Stop the scheduler while a request is mid-generation: the submitter must
+    // come back (either with what it generated, or as "cancelled"), not hang.
+    engine.start_batch(4);
+    std::thread slow([&engine, &ids, &o] {
+      exl3::GenerateOptions lo = o;
+      lo.max_tokens = 512; // long enough that the request is still in flight
+      (void)engine.submit_batch(ids[0], lo);
+    });
+    std::this_thread::sleep_for(std::chrono::seconds(3));
+    const double t0 = now_s();
+    engine.stop_batch();
+    slow.join();
+    const double stopped = now_s() - t0;
+    std::printf("  stop_batch() with a request in flight returned in %.2fs\n", stopped);
+    eq("stop_batch() releases the in-flight submitter (no hang)", stopped < 30.0);
+  }
+
+  // ---- 5. aggregate throughput --------------------------------------------
   if (bench) {
-    std::printf("\n== 4. aggregate decode rate (same session, warmed) ==\n");
+    std::printf("\n== 5. aggregate decode rate (same session, warmed) ==\n");
     const int warm = 12, meas = 8;
     // serial
     {
@@ -302,44 +378,73 @@ static int run(int argc, char** argv) {
     // state is part of the measurement (a step whose experts are not resident
     // runs at the SSD's rate), so every configuration is measured next to every
     // other one and the reported number is the best round of each.
+    //
+    // `prom` is how many DISTINCT prompts the B rows are drawn from: the rows
+    // that share one prompt share its routing (and so its experts), which is the
+    // only thing that makes a batch's expert reads collapse (1 prompt: 8
+    // distinct experts; 4 prompts: ~28; 8: ~57.6, expected = E*(1-(1-K/E)^prom)
+    // for independent routings - printed so the gradient can be read against the
+    // expert-set size rather than against the row count).
     struct Case {
       int B;
-      bool shared;
+      int prom;
       std::vector<double> ms;
     };
     std::vector<Case> cases;
-    for (int B : {1, 2, 4, 8}) cases.push_back({B, false, {}});
-    for (int B : {4, 8}) cases.push_back({B, true, {}});
+    for (int B : {1, 2, 4, 8}) cases.push_back({B, 4, {}});
+    for (int B : {4, 8}) cases.push_back({B, 1, {}});
+    // Appended last so the six cases above keep their position in the round
+    // order (the box drifts; a reordered round is not comparable).
+    cases.push_back({8, 2, {}});
+    cases.push_back({8, 8, {}});
+    // 13-16 rows is the width a simdgroup_matrix path would need (matrix ops
+    // zero-pad to 13 or 16 rows), so the batch must also be measured there - it
+    // is the row count the next phase's kernel would want, and the pair layout
+    // above is deliberately free of any 2*B launch bound.
+    cases.push_back({16, 1, {}});
+    cases.push_back({16, 4, {}});
+    const int E = engine.config().n_routed_experts, K = engine.config().num_experts_per_tok;
+    const int nprom = (int)ids.size();
     for (int r = 0; r < 3; ++r) {
       for (auto& c : cases) {
         std::vector<int> feed((size_t)c.B);
-        for (int b = 0; b < c.B; ++b) {
-          const size_t pi = c.shared ? 0 : (size_t)(b % (int)ids.size());
-          (void)g5->batch_join(ids[pi]);
-          feed[(size_t)b] = ref[pi].tokens[0];
-        }
-        auto one = [&]() {
-          mx::array lg = g5->batch_step(feed);
-          const float* p = lg.data<float>();
+        try {
           for (int b = 0; b < c.B; ++b) {
-            const float* row = p + (size_t)b * (size_t)V;
-            feed[(size_t)b] = (int)(std::max_element(row, row + V) - row);
+            const size_t pi = (size_t)(b % std::min(c.prom, nprom));
+            (void)g5->batch_join(ids[pi]);
+            feed[(size_t)b] = ref[pi].tokens[0];
           }
-        };
-        for (int i = 0; i < warm; ++i) one();
-        const double s0 = now_s();
-        for (int i = 0; i < meas; ++i) one();
-        c.ms.push_back((now_s() - s0) / meas);
+          auto one = [&]() {
+            mx::array lg = g5->batch_step(feed);
+            const float* p = lg.data<float>();
+            for (int b = 0; b < c.B; ++b) {
+              const float* row = p + (size_t)b * (size_t)V;
+              feed[(size_t)b] = (int)(std::max_element(row, row + V) - row);
+            }
+          };
+          for (int i = 0; i < warm; ++i) one();
+          const double s0 = now_s();
+          for (int i = 0; i < meas; ++i) one();
+          c.ms.push_back((now_s() - s0) / meas);
+        } catch (const std::exception& e) {
+          // A width this box cannot hold (the batch state is ~150 MB per slot
+          // plus the caches) is reported, not fatal: the numbers above it stay
+          // valid.
+          std::printf("  B=%d %d prompts: SKIPPED (%s)\n", c.B, c.prom, e.what());
+        }
         // The slots' state is per-batch, so dropping it here is what a finished
         // request does (batch_leave); reset is the bulk form.
         g5->batch_reset();
       }
     }
     for (auto& c : cases) {
+      if (c.ms.empty()) continue;
       const double best = *std::min_element(c.ms.begin(), c.ms.end());
-      std::printf("  B=%d %-11s: %7.2f ms/step -> %5.2f tok/s per seq, aggregate %6.2f tok/s\n",
-                  c.B, c.shared ? "same-prompt" : "batch", best * 1000, 1.0 / best,
-                  (double)c.B / best);
+      const int distinct = (int)(E * (1.0 - std::pow(1.0 - (double)K / E, std::min(c.prom, nprom))));
+      std::printf("  B=%d %2d prompt%s (~%2d distinct experts): %7.2f ms/step -> %5.2f tok/s "
+                  "per seq, aggregate %6.2f tok/s\n",
+                  c.B, std::min(c.prom, nprom), c.prom == 1 ? " " : "s", distinct, best * 1000,
+                  1.0 / best, (double)c.B / best);
     }
   }
 
