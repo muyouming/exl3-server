@@ -67,6 +67,26 @@ Per-layer parameter names to load (prefix `model.language_model.layers.{i}.`):
 | Gated norm | `RMSNormGated.weight` |
 | Model-level | `model.language_model.embed_tokens.weight`, `model.language_model.norm.weight`, `lm_head.{trellis,suh,svh,mul1}`, plus the `mtp.*` block (1 next-token layer) |
 
+## Checkpoint tensor names (verified from a completed shard)
+
+Shard `model-00005-of-00013.safetensors` (13992 tensors) confirms the on-disk
+layout the loader must follow:
+
+```
+model.language_model.layers.{i}.input_layernorm.weight
+model.language_model.layers.{i}.post_attention_layernorm.weight
+model.language_model.layers.{i}.hc_attn_{base,fn,scale}       # hyper-connections
+model.language_model.layers.{i}.hc_ffn_{base,fn,scale}
+model.language_model.layers.{i}.mlp.gate.weight               # router (+ e_score_correction_bias)
+model.language_model.layers.{i}.mlp.shared_experts.{gate,up,down}_proj.{trellis,suh,svh,mul1}
+model.language_model.layers.{i}.mlp.experts.{e}.{gate,up,down}_proj.{trellis,suh,svh,mul1}
+model.language_model.layers.{i}.self_attn.A_log               # KDA forget gate (+ dt_bias, conv1d, ...)
+```
+
+Bitrates observed in that shard: **K = 2 for the routed experts** (3456 tensors)
+and **K = 4 for the attention/dense tensors** (23), i.e. all integer K in 2..6 -
+the existing trellis decoder and GEMV kernel cover them as-is.
+
 ## Chat template (from the checkpoint's `chat_template.jinja`)
 
 `[gMASK]<sop>` prompt prefix, `<|system|>Reasoning Effort: {Low|High|Max}` for a
