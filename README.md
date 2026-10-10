@@ -150,6 +150,31 @@ after it in `content`.
 5. **Detokenization** is byte-level and incremental: only complete UTF-8 sequences are
    emitted, and stop strings are matched with a holdback window so they never leak.
 
+## Performance
+
+Measured on an M4 Max (128 GB), MiniCPM5-2B-EXL3 (4 bpw body, 6 bpw head), greedy,
+single stream, 96-token generations:
+
+| Path | Decode | Notes |
+| --- | ---: | --- |
+| fp16 weights materialized (`--fp16-weights`) | ~50 tok/s | 4.5 GB of weights read per token |
+| **trellis-resident, in-kernel decode (default)** | **~105 tok/s** | **1.19 GB resident, ~1.2 GB read per token** |
+
+The default path never materializes fp16 weights: the packed trellis stays in memory
+and a custom Metal GEMV decodes values inside the kernel, with both 128-point
+Hadamard rotations (+ `suh`/`svh` scaling) fused into single kernels rather than
+expressed as MLX operators. That keeps the per-token graph at ~4 operators per
+linear instead of ~11, which matters because decode is as much CPU-graph-bound as
+bandwidth-bound at these sizes.
+
+Absolute limits on this machine, for reference: the model reads ~1.2 GB of weights
+per token and the measured streaming bandwidth is ~425 GB/s, so a perfect kernel
+could not exceed ~350 tok/s without speculative decoding.
+
+Tuning knobs (environment, mainly for experiments): `EXL3_QMV_NT` (output tiles per
+threadgroup), `EXL3_QMV_SG` (simdgroups per threadgroup), `EXL3_QMV_MB` (rows per
+threadgroup block), `EXL3_QMV_SPLITS` (split-K factor).
+
 ## Verification
 
 The implementation was checked against independent references, not just by "it runs":
@@ -165,8 +190,8 @@ The implementation was checked against independent references, not just by "it r
   cosine 0.997, relative Frobenius error 7.5% for 4-bit tensors and 2.2% for the 6-bit
   `lm_head` — i.e. the checkpoint's own quantization error, consistent across layers.
 - One-shot prefill vs token-by-token decoding: cosine 0.999997 with identical argmax.
-- Measured on an M4 Max (128 GB) with MiniCPM5-2B-EXL3: ~5 s to load 4.5 GB of weights,
-  ~44 tokens/s decode, ~2k tokens/s prefill.
+- Measured on an M4 Max (128 GB) with MiniCPM5-2B-EXL3: ~1 s to load 1.19 GB of weights,
+  ~105 tokens/s decode (see Performance), ~2k tokens/s prefill.
 
 ## Limitations
 

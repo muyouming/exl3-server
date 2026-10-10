@@ -159,6 +159,45 @@ mx::array Model::load_vector(const SafetensorsFile& st, const std::string& name,
   return wrap_f16(buf, std::move(shape));
 }
 
+// Load a packed EXL3 tensor for the on-the-fly decode path. The Metal kernels
+// read these arrays directly, so they must live in memory we own (MLX's no-copy
+// path is not safe for read-only file mappings).
+bool Model::load_trellis(const SafetensorsFile& st, const std::string& key, TrellisWeight& out,
+                         std::string& err) {
+  const STTensor& info = st.tensor(key + ".trellis");
+  if (info.shape.size() != 3) {
+    err = key + ".trellis must be 3-dimensional";
+    return false;
+  }
+  const uint16_t* src = (const uint16_t*)st.i16_data(key + ".trellis", err);
+  if (!src) return false;
+  const int64_t k_tiles = info.shape[0], n_tiles = info.shape[1], words16 = info.shape[2];
+  if (words16 % 16 != 0) {
+    err = key + ": trellis width is not a multiple of 16";
+    return false;
+  }
+  out.K = (int)(words16 / 16);
+  out.codebook = st.has(key + ".mul1") ? 2 : (st.has(key + ".mcg") ? 1 : 0);
+  out.in_features = (int)(k_tiles * 16);
+  out.out_features = (int)(n_tiles * 16);
+  if (st.tensor(key + ".suh").shape[0] != k_tiles * 16 ||
+      st.tensor(key + ".svh").shape[0] != n_tiles * 16) {
+    err = key + ": trellis shape does not match the scale vectors";
+    return false;
+  }
+  {
+    auto* holder = new std::vector<uint32_t>((size_t)(k_tiles * n_tiles * words16 / 2));
+    std::memcpy(holder->data(), src, holder->size() * 4);
+    out.words = mx::array((void*)holder->data(),
+                          mx::Shape{(int)k_tiles, (int)n_tiles, (int)(words16 / 2)}, mx::uint32,
+                          [holder](void*) { delete holder; });
+  }
+  out.suh = load_vector(st, key + ".suh", err, false);
+  out.svh = load_vector(st, key + ".svh", err, false);
+  if (!err.empty()) return false;
+  return true;
+}
+
 mx::array Model::load_linear(const SafetensorsFile& st, const std::string& key,
                              std::string& err, int threads) {
   const STTensor& info = st.tensor(key + ".trellis");
@@ -203,9 +242,10 @@ mx::array Model::load_linear(const SafetensorsFile& st, const std::string& key,
   return wrap_f16(buf, mx::Shape{(int)t.in_features, (int)t.out_features});
 }
 
-bool Model::load(const std::string& path, std::string& err, int threads) {
+bool Model::load(const std::string& path, std::string& err, int threads, bool fp16_weights) {
   namespace fs = std::filesystem;
   int64_t t0 = now_ms();
+  fp16_weights_ = fp16_weights;
   std::string dir = path;
   if (fs::is_regular_file(path)) dir = fs::path(path).parent_path().string();
   if (!ModelConfig::load(dir, cfg_, err)) return false;
@@ -219,9 +259,17 @@ bool Model::load(const std::string& path, std::string& err, int threads) {
   std::fprintf(stderr, "exl3-server: loading %d layers from %s\n", cfg_.num_layers, dir.c_str());
   layers_.resize((size_t)cfg_.num_layers);
 
-  auto load_any_linear = [&](const std::string& key) -> mx::array {
+  auto load_any_linear = [&](const std::string& key, Linear& lin) -> mx::array {
     const SafetensorsFile* f = store.file_for(key + ".trellis");
-    if (f) return load_linear(*f, key, err, threads);
+    if (f) {
+      if (!fp16_weights_) {
+        if (!load_trellis(*f, key, lin.tw, err)) return mx::array(0.0f);
+        lin.quantized = true;
+        weight_bytes_ += (size_t)lin.tw.bytes();
+        return mx::array(0.0f);
+      }
+      return load_linear(*f, key, err, threads);
+    }
     f = store.file_for(key + ".weight");
     if (!f) {
       err = "missing tensor " + key;
@@ -253,13 +301,13 @@ bool Model::load(const std::string& path, std::string& err, int threads) {
   for (int i = 0; i < cfg_.num_layers; ++i) {
     Layer& l = layers_[(size_t)i];
     const std::string p = "model.layers." + std::to_string(i);
-    l.q.w = load_any_linear(p + ".self_attn.q_proj");
-    l.k.w = load_any_linear(p + ".self_attn.k_proj");
-    l.v.w = load_any_linear(p + ".self_attn.v_proj");
-    l.o.w = load_any_linear(p + ".self_attn.o_proj");
-    l.gate.w = load_any_linear(p + ".mlp.gate_proj");
-    l.up.w = load_any_linear(p + ".mlp.up_proj");
-    l.down.w = load_any_linear(p + ".mlp.down_proj");
+    l.q.w = load_any_linear(p + ".self_attn.q_proj", l.q);
+    l.k.w = load_any_linear(p + ".self_attn.k_proj", l.k);
+    l.v.w = load_any_linear(p + ".self_attn.v_proj", l.v);
+    l.o.w = load_any_linear(p + ".self_attn.o_proj", l.o);
+    l.gate.w = load_any_linear(p + ".mlp.gate_proj", l.gate);
+    l.up.w = load_any_linear(p + ".mlp.up_proj", l.up);
+    l.down.w = load_any_linear(p + ".mlp.down_proj", l.down);
     if (!err.empty()) return false;
     load_bias(p + ".self_attn.q_proj", l.q);
     load_bias(p + ".self_attn.k_proj", l.k);
@@ -276,15 +324,23 @@ bool Model::load(const std::string& path, std::string& err, int threads) {
   }
   const int64_t layer_ms = now_ms() - layer0;
 
-  lm_head_.w = load_any_linear(lm_head_key);
+  lm_head_.w = load_any_linear(lm_head_key, lm_head_);
   if (!err.empty()) return false;
-  if (lm_head_.w.shape(0) != hidden) {
-    err = "lm_head input dimension does not match hidden_size";
-    return false;
-  }
-  if (lm_head_.w.shape(1) != cfg_.vocab_size) {
-    // tolerate padded vocab: keep the model's own output width
-    cfg_.vocab_size = (int)lm_head_.w.shape(1);
+  if (lm_head_.quantized) {
+    if (lm_head_.tw.in_features != hidden) {
+      err = "lm_head input dimension does not match hidden_size";
+      return false;
+    }
+    cfg_.vocab_size = lm_head_.tw.out_features;
+  } else {
+    if (lm_head_.w.shape(0) != hidden) {
+      err = "lm_head input dimension does not match hidden_size";
+      return false;
+    }
+    if (lm_head_.w.shape(1) != cfg_.vocab_size) {
+      // tolerate padded vocab: keep the model's own output width
+      cfg_.vocab_size = (int)lm_head_.w.shape(1);
+    }
   }
 
   // Release the file mappings; all weights now live in MLX arrays.
@@ -324,17 +380,18 @@ std::vector<float> Model::forward(const std::vector<int>& tokens, KVCache& cache
                      mx::array(-INFINITY, mx::float16));
   }
   const float attn_scale = 1.0f / std::sqrt((float)hd);
+  auto linear = [](const Linear& lin, const mx::array& x) -> mx::array {
+    mx::array y = lin.quantized ? trellis_linear(lin.tw, x) : mx::matmul(x, lin.w);
+    return lin.has_bias ? mx::add(y, lin.bias) : y;
+  };
 
   for (int i = 0; i < cfg_.num_layers; ++i) {
     Layer& l = layers_[(size_t)i];
     auto r = mx::fast::rms_norm(h, l.input_norm, cfg_.rms_norm_eps);
 
-    auto q = mx::matmul(r, l.q.w);
-    auto k = mx::matmul(r, l.k.w);
-    auto v = mx::matmul(r, l.v.w);
-    if (l.q.has_bias) q = mx::add(q, l.q.bias);
-    if (l.k.has_bias) k = mx::add(k, l.k.bias);
-    if (l.v.has_bias) v = mx::add(v, l.v.bias);
+    auto q = linear(l.q, r);
+    auto k = linear(l.k, r);
+    auto v = linear(l.v, r);
 
     q = mx::transpose(mx::reshape(q, {1, L, n_heads, hd}), {0, 2, 1, 3});
     k = mx::transpose(mx::reshape(k, {1, L, n_kv, hd}), {0, 2, 1, 3});
@@ -354,24 +411,18 @@ std::vector<float> Model::forward(const std::vector<int>& tokens, KVCache& cache
         q, k, v, attn_scale, /*mask_mode=*/"",
         need_mask ? std::optional<mx::array>(mask) : std::nullopt);
     attn = mx::reshape(mx::transpose(attn, {0, 2, 1, 3}), {1, L, n_heads * hd});
-    h = mx::add(h, l.o.has_bias ? mx::add(mx::matmul(attn, l.o.w), l.o.bias)
-                                : mx::matmul(attn, l.o.w));
+    h = mx::add(h, linear(l.o, attn));
 
     r = mx::fast::rms_norm(h, l.post_norm, cfg_.rms_norm_eps);
-    auto g = mx::matmul(r, l.gate.w);
-    auto u = mx::matmul(r, l.up.w);
-    if (l.gate.has_bias) g = mx::add(g, l.gate.bias);
-    if (l.up.has_bias) u = mx::add(u, l.up.bias);
+    auto g = linear(l.gate, r);
+    auto u = linear(l.up, r);
     auto act = mx::multiply(g, mx::sigmoid(g)); // SiLU
-    auto d = mx::matmul(mx::multiply(act, u), l.down.w);
-    if (l.down.has_bias) d = mx::add(d, l.down.bias);
-    h = mx::add(h, d);
+    h = mx::add(h, linear(l.down, mx::multiply(act, u)));
   }
 
   h = mx::fast::rms_norm(h, final_norm_, cfg_.rms_norm_eps);
   auto last = mx::slice(h, {0, L - 1, 0}, {1, L, hidden});
-  mx::array logits = mx::matmul(last, lm_head_.w);
-  if (lm_head_.has_bias) logits = mx::add(logits, lm_head_.bias);
+  mx::array logits = linear(lm_head_, last);
   logits = mx::reshape(mx::astype(logits, mx::float32), {cfg_.vocab_size});
 
   std::vector<mx::array> to_eval;

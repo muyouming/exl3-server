@@ -4,6 +4,8 @@
 
 #include <mlx/mlx.h>
 
+#include "trellis_gemm.h"
+
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -43,7 +45,8 @@ struct KVCache {
 class Model {
  public:
   // Load config + safetensors from a model directory (or a .safetensors file).
-  bool load(const std::string& path, std::string& err, int threads = 0);
+  bool load(const std::string& path, std::string& err, int threads = 0,
+            bool fp16_weights = false);
   const ModelConfig& config() const { return cfg_; }
   size_t weight_bytes() const { return weight_bytes_; }
   double load_seconds() const { return load_seconds_; }
@@ -57,9 +60,11 @@ class Model {
 
  private:
   struct Linear {
-    mx::array w = mx::array(0.0f);    // f16 (in, out)
+    mx::array w = mx::array(0.0f);    // f16 (in, out), when !quantized
     mx::array bias = mx::array(0.0f); // f16 (out) or empty
     bool has_bias = false;
+    bool quantized = false;           // weights stay in the packed trellis
+    TrellisWeight tw;                 // valid when quantized
   };
   struct Layer {
     Linear q, k, v, o, gate, up, down;
@@ -69,9 +74,12 @@ class Model {
 
   mx::array load_linear(const struct SafetensorsFile& st, const std::string& key,
                         std::string& err, int threads);
+  bool load_trellis(const struct SafetensorsFile& st, const std::string& key, TrellisWeight& out,
+                    std::string& err);
   mx::array load_vector(const struct SafetensorsFile& st, const std::string& name,
                         std::string& err, bool transpose2d = false);
 
+  bool fp16_weights_ = false;
   ModelConfig cfg_;
   std::vector<Layer> layers_;
   mx::array embed_ = mx::array(0.0f);      // f16 (vocab, hidden)

@@ -55,18 +55,12 @@ void usage() {
       "\n"
       "other:\n"
       "      --threads N       threads for weight reconstruction (default: all cores)\n"
+      "      --fp16-weights    materialize fp16 weights instead of decoding the trellis in-kernel\n"
+      "                        (much more memory, useful for A/B comparison)\n"
       "      --model-name NAME model id reported by the API\n"
       "      --quiet           no per-request stats\n"
       "  -h, --help            this help\n",
       stdout);
-}
-
-bool need_value(int i, int argc) {
-  if (i + 1 >= argc) {
-    std::fprintf(stderr, "exl3-server: option %s requires a value\n", "");
-    return false;
-  }
-  return true;
 }
 
 } // namespace
@@ -79,6 +73,7 @@ int main(int argc, char** argv) {
   int port = 8080;
   int threads = 0;
   bool serve = false;
+  bool fp16_weights = false;
   exl3::CliOptions cli;
   bool verbose = true;
 
@@ -114,6 +109,8 @@ int main(int argc, char** argv) {
       model_name = arg(i, "--model-name");
     } else if (a == "--system" || a.rfind("--system=", 0) == 0) {
       system = arg(i, "--system");
+    } else if (a == "--fp16-weights") {
+      fp16_weights = true;
     } else if (a == "--think") {
       cli.thinking = 1;
     } else if (a == "--no-think") {
@@ -160,7 +157,7 @@ int main(int argc, char** argv) {
 
   exl3::Engine engine;
   std::string err;
-  if (!engine.load(model, err, threads)) {
+  if (!engine.load(model, err, threads, fp16_weights)) {
     std::fprintf(stderr, "exl3-server: %s\n", err.c_str());
     return 1;
   }

@@ -34,6 +34,7 @@ add_executable(exl3-server
   src/main.cpp
   src/safetensors.cpp
   src/exl3.cpp
+  src/trellis_gemm.cpp
   src/model.cpp
   src/tokenizer.cpp
   src/engine.cpp

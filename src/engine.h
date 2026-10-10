@@ -37,7 +37,8 @@ using CancelFn = std::function<bool()>;
 
 class Engine {
  public:
-  bool load(const std::string& model_path, std::string& err, int threads = 0);
+  bool load(const std::string& model_path, std::string& err, int threads = 0,
+            bool fp16_weights = false);
   const ModelConfig& config() const { return model_.config(); }
   const Tokenizer& tokenizer() const { return tok_; }
   const std::string& model_name() const { return model_name_; }

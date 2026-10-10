@@ -87,8 +87,8 @@ class ThinkSplitter {
 // Engine
 // ---------------------------------------------------------------------------
 
-bool Engine::load(const std::string& model_path, std::string& err, int threads) {
-  if (!model_.load(model_path, err, threads)) return false;
+bool Engine::load(const std::string& model_path, std::string& err, int threads, bool fp16_weights) {
+  if (!model_.load(model_path, err, threads, fp16_weights)) return false;
   if (!tok_.load(model_path, err)) return false;
 
   namespace fs = std::filesystem;
