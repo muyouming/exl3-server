@@ -159,6 +159,7 @@ speed; the only byte-reducing mechanism in this family is the t5 base-3 repack (
 - The NAX/M5 non-transferability is NARROWER than first written: most of the cited family (GEMV/row-amortisation/expert-gather: `glm_qmv_rows`, `multi_qmv`, `mla_head_qmv`, `moe_verify_gather`, `moe_router_logits`, the KDA decode step and the 8-row DSA scores/topk) is CLASSIC Metal (plain simdgroup/qdot arithmetic), so it IS portable to our M4 Max. Only the hyper-connection comb-product/expand paths (`hc_post_mm`, `hc_pre_fused`'s MPP parts) are NAX-gated.
 - The portable layer is `omlx/patches/mlx_vlm_glm5_next_compat/decode_kernels.py`: pure `mx.fast.metal_kernel` source strings (no nanobind, no metallib, no MLX-private symbols except where it transcribes MLX's own qmv/qmv_wide traversal arithmetic) - i.e. the same mechanism we already use in src/trellis_gemm.cpp. Stage map: glm_qmv_rows 191-195, DSA scores/topk 1137-1450, KDA decode step 1537-1947, moe_router_logits 2088-2173, hc_pre_fused 2352-2750, hc_post_mm 2680-2765 (NAX), mla_head_qmv 2776-2874, multi_qmv 2946-3004.
 - The exactness contract everywhere is transcription of the reference reduction order followed by token-identity tests.
+- WITHDRAWN FACT: any 'lm_head M=1 1.2 ms -> M=4 4.3 ms' row-amortisation measurement is NOT attributable to commit 013bc3f3 (the mechanism is present, the number was not found in the clone); it must not be cited. Treat the row-amortisation *design* as evidence-backed and the *number* as unverified.
 
 ## 4. Quantization support and layout
 
