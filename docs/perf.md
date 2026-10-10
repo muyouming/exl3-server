@@ -152,10 +152,15 @@ weight reads:
    launches (input Hadamard, GEMV, output Hadamard) x ~1450 linears per token,
    and ~20 us per dispatch is visible when the ops are chained rather than
    batched.
-3. Merge the small per-layer projections (34 layers x ~3 MB: f_a/g_a/b and the
-   MoE's shared expert) into grouped GEMVs - they are latency-bound, and the
-   grouped kernel already exists for them; what is missing is a load-time
-   concatenation of those tensors so one launch can cover several layers.
+3. Merge the small per-layer projections (f_a/g_a/b_proj and the MoE's shared
+   expert) into grouped GEMVs. Within one layer they share the hidden row, so
+   `trellis_linear_group` already covers them; *across* layers it cannot, because
+   the layers are a sequential dependency chain (layer i+1's activation is
+   layer i's output) and only their weights are independent. Measured headroom:
+   the whole small-projection set is ~1.7 ms of a 153 ms step, and 7 of every
+   10 us of it is launch overhead rather than the kernel, so the win here is
+   bounded by ~1 ms - it is the mechanism (multi-buffer launches) that was the
+   expensive part, and that now exists.
 4. **`mx::async_eval`** in the steady-state decode path (evaluation batching),
    and `mx::set_wired_limit` to keep the working set from being evicted (a
    refill from the external SSD runs at ~2.6 GB/s, i.e. 400 ms per GB).

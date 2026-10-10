@@ -69,7 +69,8 @@ static exl3::G5Linear make_trellis(int in, int out, int K, unsigned seed) {
   l.tw.codebook = 2;
   l.tw.in_features = in;
   l.tw.out_features = out;
-  const int64_t nwords = (int64_t)(in / 16) * (out / 16) * (8 * K);
+  // trellis_pack reads the raw i16 stream: 16*K u16 per 16x16 tile.
+  const int64_t nwords = (int64_t)(in / 16) * (out / 16) * (16 * K);
   std::vector<uint16_t> src((size_t)nwords);
   std::mt19937 rng(seed);
   for (auto& v : src) v = (uint16_t)rng();
