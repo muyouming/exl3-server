@@ -65,6 +65,42 @@ costs its own ~4.6 GB, so speculative gains vanish once the bandwidth wall is
 reached. Report both the serial step and the effective rate with
 `--draft-mtp N`.
 
+## Measured facts (2026-10-10, layer-0 tensors, real checkpoint)
+
+| item | value |
+|---|---|
+`mx::eval` | ~0.2 ms per call (thread handoff + command-buffer wait) - fatal inside a decode loop; the MoE host loop alone spent ~8 ms/token |
+MLX elementwise dispatch | ~5-6 us |
+custom metal_kernel dispatch | ~4-10 us |
+trellis GEMV, 4096x24576 K=4 (50.4 MB) | 0.522 ms per row with an eval per sample (0.113 ms no-op+eval baseline) => **~96-123 GB/s, ~20% of the M4 Max's ~546 GB/s** |
+trellis GEMV, small tensor (3 MB) | 0.070-0.086 ms => 40-58 GB/s (latency/parallelism-bound, not bandwidth-bound) |
+scaling with rows | 1/2/4/8 rows cost 0.52/0.85/0.82/2.05 ms: ~4x for 8 rows, i.e. the weights are re-read per row instead of being blocked in registers/shared memory |
+
+Consequences: at ~120 GB/s the 4.6 GB/token means a **~27 tok/s ceiling** today
+regardless of dispatch fusion, so the remaining work is memory layout and kernel
+blocking, not launch count:
+
+1. **Repack the trellis weights at load time** into a GEMV-friendly layout (the
+   on-disk `(in/16, out/16, 16*K)` form with per-16-element scales gives
+   strided, poorly coalesced loads). It is a pure byte permutation, so it can be
+   RAM-neutral if done per tensor (materialise, repack, unmap) or in place; a
+   slow load is acceptable when decode is the goal.
+2. **Reuse the packed weights across batch rows inside the kernel** (register or
+   shared-memory blocking) - this is what makes speculative batches and prefill
+   pay, and today they do not.
+3. Only then the dispatch items: kill in-loop `mx::eval`, fuse the
+   hyper-connection/Sinkhorn work (`mx::compile` exists in the C++ API:
+   `mlx/compile.h`), fuse the two Hadamards into the trellis GEMV, and batch the
+   small per-layer projections (34 layers x ~3 MB) into single large GEMVs.
+
+Methodology warnings, both learned the hard way here: (a) measuring with an
+`mx::eval` per sample adds 0.11-0.2 ms, which exceeds the op itself for small
+tensors - subtract a no-op baseline or batch correctly; (b) a lazy-evaluation
+loop that drops the previous result each iteration measures graph construction
+only (it reported 2259 GB/s for the 50 MB tensor, i.e. work that never ran) -
+keep every intermediate alive and treat anything above ~546 GB/s as a sign the
+work was optimised away.
+
 ## Measurement discipline
 
 - `tests/glm5_bench.cpp` reports the per-component breakdown (evaluate after
