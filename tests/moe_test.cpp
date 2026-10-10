@@ -10,13 +10,15 @@
 // Build (from the repo root):
 //   clang++ -std=c++20 -O2 -Ivendor -Isrc -I$(brew --prefix mlx)/include -o /tmp/moe_test \
 //     tests/moe_test.cpp src/glm5_moe.cpp src/glm5_kda.cpp src/glm5_attn.cpp src/glm5.cpp \
-//     src/model.cpp src/exl3.cpp src/safetensors.cpp src/trellis_gemm.cpp \
+//     src/glm5_forward.cpp src/glm5_hc.cpp src/glm5_mtp.cpp src/model.cpp src/exl3.cpp \
+//     src/safetensors.cpp src/trellis_gemm.cpp \
 //     -L$(brew --prefix mlx)/lib -lmlx -Wl,-rpath,$(brew --prefix mlx)/lib
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <limits>
 #include <numeric>
+#include <cstdlib>
 #include <random>
 #include <vector>
 
@@ -318,6 +320,28 @@ int main() {
     eq("tokens route differently", per_tok[0] != per_tok[1] || per_tok[1] != per_tok[2]);
     check("moe_layer vs oracle", out, exp, 3e-3);
     (void)o;
+  }
+
+  std::printf("== (c2) decode fast path vs general path (1 token) ==\n");
+  {
+    // One row: every work item reads the same row, which is what the decode fast
+    // path exploits. It must reproduce the general path element for element.
+    std::vector<float> xs = {1, 0}; // (1,1,2)
+    mx::array h = mx::reshape(mk2(xs, 1, H), {1, 1, H});
+    mx::eval(h);
+    unsetenv("EXL3_MOE_GENERAL");
+    mx::array fast = exl3::moe_layer(l, cfg, h);
+    mx::eval(fast);
+    setenv("EXL3_MOE_GENERAL", "1", 1);
+    mx::array gen = exl3::moe_layer(l, cfg, h);
+    mx::eval(gen);
+    unsetenv("EXL3_MOE_GENERAL");
+    const float* fa = fast.data<float>();
+    const float* gb = gen.data<float>();
+    double maxd = 0;
+    for (int i = 0; i < H; ++i) maxd = std::max(maxd, (double)std::fabs(fa[i] - gb[i]));
+    std::printf("  decode fast vs general     max|diff| = %.3g\n", maxd);
+    eq("1-row fast path == general path", maxd == 0.0);
   }
 
   std::printf("== (d) dense MLP with swiglu_limit clamp ==\n");

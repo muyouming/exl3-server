@@ -4,6 +4,7 @@
 #include "glm5_kda.h" // g5_linear
 
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <vector>
 
@@ -92,32 +93,54 @@ mx::array moe_layer(const G5Layer& l, const ModelConfig& cfg, const mx::array& h
   // Group the (token, top-k) work items by expert, mirroring the reference's
   // per-expert loop (each expert's weights are applied in one matmul).
   const int32_t* idx = indices.data<int32_t>();
-  std::vector<std::vector<int>> work(E);
-  for (int t = 0; t < N; ++t)
-    for (int k = 0; k < K; ++k) work[(size_t)idx[(size_t)t * K + k]].push_back(t * K + k);
+  mx::array routed = mx::array(0.0f);
+  // The single-row (decode) fast path is numerically the general path's; this
+  // switch forces the general one so the two can be compared (moe_test).
+  const bool moe_general = std::getenv("EXL3_MOE_GENERAL") != nullptr;
+  if (N == 1 && !moe_general) {
+    // Decode fast path: every work item reads the SAME row, so the per-expert
+    // gather + scatter bookkeeping (an index upload, two takes, a broadcast, a
+    // scatter-add and an astype per expert) collapses into one stack plus a
+    // weighted sum. The arithmetic is the general path's: each expert output is
+    // scaled in f32, rounded to the streams' dtype, and the K terms are summed
+    // k = 0, 1, ... in the same order the general path accumulates them.
+    std::vector<mx::array> outs;
+    outs.reserve((size_t)K);
+    for (int k = 0; k < K; ++k) {
+      const int e = (int)idx[k];
+      outs.push_back(swiglu(l.experts[(size_t)(e * 3 + 0)], l.experts[(size_t)(e * 3 + 1)],
+                            l.experts[(size_t)(e * 3 + 2)], h, cfg.swiglu_limit));
+    }
+    mx::array st = mx::stack(outs, 0);                       // (K, 1, 1, H)
+    mx::array wt = mx::reshape(weights, {K, 1, 1, 1});       // (K, 1, 1, 1), f32
+    routed = mx::reshape(mx::sum(mx::astype(mx::multiply(st, wt), h.dtype()), 0), {B, L, H});
+  } else {
+    std::vector<std::vector<int>> work(E);
+    for (int t = 0; t < N; ++t)
+      for (int k = 0; k < K; ++k) work[(size_t)idx[(size_t)t * K + k]].push_back(t * K + k);
 
-  mx::array hflat = mx::reshape(h, {N, H});
-  mx::array wflat = mx::reshape(weights, {N * K});
-  mx::array acc = mx::zeros({N * K, H}, h.dtype());
-  for (int e = 0; e < E; ++e) {
-    const std::vector<int>& ids = work[(size_t)e];
-    if (ids.empty()) continue;
-    const int n = (int)ids.size();
-    std::vector<int32_t> toks((size_t)n);
-    for (int i = 0; i < n; ++i) toks[(size_t)i] = ids[(size_t)i] / K;
-    mx::array wid = mx::array(ids.begin(), mx::Shape{n}, mx::int32);
-    mx::array tid = mx::array(toks.begin(), mx::Shape{n}, mx::int32);
+    mx::array hflat = mx::reshape(h, {N, H});
+    mx::array wflat = mx::reshape(weights, {N * K});
+    mx::array acc = mx::zeros({N * K, H}, h.dtype());
+    for (int e = 0; e < E; ++e) {
+      const std::vector<int>& ids = work[(size_t)e];
+      if (ids.empty()) continue;
+      const int n = (int)ids.size();
+      std::vector<int32_t> toks((size_t)n);
+      for (int i = 0; i < n; ++i) toks[(size_t)i] = ids[(size_t)i] / K;
+      mx::array wid = mx::array(ids.begin(), mx::Shape{n}, mx::int32);
+      mx::array tid = mx::array(toks.begin(), mx::Shape{n}, mx::int32);
 
-    mx::array rows = mx::take(hflat, tid, 0); // (n, H)
-    mx::array cur = swiglu(l.experts[(size_t)(e * 3 + 0)], l.experts[(size_t)(e * 3 + 1)],
-                           l.experts[(size_t)(e * 3 + 2)], rows, cfg.swiglu_limit);
-    mx::array wt = mx::take(wflat, wid, 0); // (n,)
-    cur = mx::astype(mx::multiply(cur, mx::reshape(wt, {n, 1})), acc.dtype());
-    mx::array scatter_idx = mx::broadcast_to(mx::reshape(wid, {n, 1}), {n, H});
-    acc = mx::scatter_add_axis(acc, scatter_idx, cur, 0);
+      mx::array rows = mx::take(hflat, tid, 0); // (n, H)
+      mx::array cur = swiglu(l.experts[(size_t)(e * 3 + 0)], l.experts[(size_t)(e * 3 + 1)],
+                             l.experts[(size_t)(e * 3 + 2)], rows, cfg.swiglu_limit);
+      mx::array wt = mx::take(wflat, wid, 0); // (n,)
+      cur = mx::astype(mx::multiply(cur, mx::reshape(wt, {n, 1})), acc.dtype());
+      mx::array scatter_idx = mx::broadcast_to(mx::reshape(wid, {n, 1}), {n, H});
+      acc = mx::scatter_add_axis(acc, scatter_idx, cur, 0);
+    }
+    routed = mx::reshape(mx::sum(mx::reshape(acc, {N, K, H}), 1), {B, L, H});
   }
-
-  mx::array routed = mx::reshape(mx::sum(mx::reshape(acc, {N, K, H}), 1), {B, L, H});
   mx::array shared = swiglu(l.shared_gate, l.shared_up, l.shared_down, h, cfg.swiglu_limit);
   return mx::add(routed, shared);
 }

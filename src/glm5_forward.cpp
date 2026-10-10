@@ -1,6 +1,7 @@
 #include "glm5_forward.h"
 
 #include <cstdio>
+#include <initializer_list>
 #include <stdexcept>
 
 #include "glm5_moe.h"
@@ -84,6 +85,18 @@ mx::array Glm5Model::forward_hidden(const std::vector<int>& ids, int start_pos, 
   mx::array emb = mx::take(w_.embed, ids_a, 0);        // (1, L, hidden) f16
   mx::array streams = g5_hc_expand(emb, hc_.mult);     // (1, L, N, hidden)
 
+  // Bench instrumentation: when a profile is installed, every stage boundary is
+  // an eval() and the elapsed wall time is charged to that stage.
+  const bool prof = profile_ != nullptr;
+  int64_t t_stage = prof ? now_ms() : 0;
+  const int64_t t_begin = t_stage;
+  auto prof_stage = [&](double& acc, std::initializer_list<mx::array> outs) {
+    if (!prof) return;
+    if (outs.size() != 0) mx::eval(std::vector<mx::array>(outs));
+    acc += (double)(now_ms() - t_stage);
+    t_stage = now_ms();
+  };
+
   for (int i = 0; i < cfg_.num_layers; ++i) {
     const G5Layer& l = w_.layers[(size_t)i];
     LayerState& st = states_[(size_t)i];
@@ -92,28 +105,39 @@ mx::array Glm5Model::forward_hidden(const std::vector<int>& ids, int start_pos, 
     mx::array residual = streams;
     G5HcActivation a =
         g5_hc_prepare(streams, l.hc_attn_base, l.hc_attn_fn, l.hc_attn_scale, hc_);
+    prof_stage(profile_->hc_prepare_ms, {a.collapsed, a.post, a.comb});
     mx::array h = rms_norm(a.collapsed, l.input_norm, cfg_.rms_norm_eps);
+    prof_stage(profile_->rms_norm_ms, {h});
     mx::array out = mx::array(0.0f);
     if (l.plan.linear_attention) {
       out = kda_layer(l, cfg_, h, st.kda, capture ? &kda_rewind_[(size_t)i] : nullptr);
+      prof_stage(profile_->kda_ms, {out});
     } else {
       // The indexer shares q_resid with the MLA (reference 1185-1188, 1221).
       mx::array q_resid = mla_q_resid(l, h);
       mx::array topk = indexer_topk(l, cfg_, h, q_resid, st.idx, start_pos);
+      prof_stage(profile_->indexer_ms, {topk});
       out = mla_layer(l, cfg_, h, st.mla, start_pos, topk, q_resid);
+      prof_stage(profile_->mla_ms, {out});
     }
     streams = g5_hc_mix(out, a.post, a.comb, residual);
+    prof_stage(profile_->hc_mix_ms, {streams});
 
     // ---- MLP sub-layer (reference 1339-1346) -------------------------------
     residual = streams;
     G5HcActivation f = g5_hc_prepare(streams, l.hc_ffn_base, l.hc_ffn_fn, l.hc_ffn_scale, hc_);
+    prof_stage(profile_->hc_prepare_ms, {f.collapsed, f.post, f.comb});
     h = rms_norm(f.collapsed, l.post_norm, cfg_.rms_norm_eps);
+    prof_stage(profile_->rms_norm_ms, {h});
     out = l.moe ? moe_layer(l, cfg_, h) : dense_mlp(l, cfg_, h);
+    prof_stage(l.moe ? profile_->moe_ms : profile_->dense_ms, {out});
     streams = g5_hc_mix(out, f.post, f.comb, residual);
+    prof_stage(profile_->hc_mix_ms, {streams});
   }
 
   // norm(hc_head(streams)): reference 1508.
   mx::array hidden = rms_norm(g5_hc_head(streams), w_.final_norm, cfg_.rms_norm_eps);
+  prof_stage(profile_->head_ms, {hidden});
 
   // The MTP draft rows of this chunk (row j for every token of the chunk whose
   // row is missing), then the bookkeeping a rewind needs. A compact copy of the
@@ -127,6 +151,10 @@ mx::array Glm5Model::forward_hidden(const std::vector<int>& ids, int start_pos, 
   batch_captured_ = capture;
   batch_hidden_ = capture ? hidden : mx::array(0.0f);
   mx::eval(last_hidden_);
+  if (prof) {
+    profile_->total_ms += (double)(now_ms() - t_begin);
+    profile_->steps += 1;
+  }
 
   pos_ = start_pos + L;
   return hidden;

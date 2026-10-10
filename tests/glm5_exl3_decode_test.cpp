@@ -17,7 +17,7 @@
 //   clang++ -std=c++20 -O2 -Ivendor -Isrc -I$(brew --prefix mlx)/include \
 //     -o /tmp/glm5_exl3_decode_test tests/glm5_exl3_decode_test.cpp src/glm5_forward.cpp \
 //     src/glm5.cpp src/glm5_kda.cpp src/glm5_attn.cpp src/glm5_hc.cpp src/glm5_moe.cpp \
-//     src/trellis_gemm.cpp src/safetensors.cpp src/model.cpp src/exl3.cpp \
+//     src/glm5_mtp.cpp src/trellis_gemm.cpp src/safetensors.cpp src/model.cpp src/exl3.cpp \
 //     -L$(brew --prefix mlx)/lib -lmlx -Wl,-rpath,$(brew --prefix mlx)/lib \
 //     -framework Foundation -framework Metal -framework Accelerate
 //

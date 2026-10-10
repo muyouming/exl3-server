@@ -3,8 +3,9 @@
 //
 // Build (from the repo root):
 //   clang++ -std=c++20 -O2 -Ivendor -Isrc -I$(brew --prefix mlx)/include \
-//     -o /tmp/kda_test tests/kda_recurrence_test.cpp src/glm5_kda.cpp \
-//     -L$(brew --prefix mlx)/lib -lmlx -Wl,-rpath,$(brew --prefix mlx)/lib
+//     -o /tmp/kda_test tests/kda_recurrence_test.cpp src/glm5_kda.cpp src/trellis_gemm.cpp \
+//     -L$(brew --prefix mlx)/lib -lmlx -Wl,-rpath,$(brew --prefix mlx)/lib \
+//     -framework Metal -framework Accelerate
 // Expected: "max|diff| = ~4e-08, mismatches(>1e-4) = 0 / 56"
 // KDA recurrence: MLX implementation vs a scalar CPU oracle (the reference formula).
 #include <cstdio>

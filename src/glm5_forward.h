@@ -45,6 +45,26 @@ namespace exl3 {
 
 namespace mx = mlx::core;
 
+// Per-stage decode profile (benchmark instrumentation only). Each stage is
+// `mx::eval`d at its boundary, so the reported milliseconds include the stage's
+// lazy graph evaluation, its kernel launches and one CPU/GPU sync. Enabling it
+// therefore perturbs the schedule; the totals are an upper bound on each
+// component and the *uninstrumented* run is the end-to-end instrument.
+struct Glm5Profile {
+  double hc_prepare_ms = 0.0; // 2 per layer: RMSNorm + projection + softmax + Sinkhorn
+  double rms_norm_ms = 0.0;   // 2 per layer: the norm before attention and before the MLP
+  double kda_ms = 0.0;        // KDA (linear-attention) layers only
+  double indexer_ms = 0.0;    // DSA indexer (pooling/scoring + host top-k selection)
+  double mla_ms = 0.0;        // MLA (sparse-attention) layers only
+  double moe_ms = 0.0;        // routed + shared experts
+  double dense_ms = 0.0;      // the first_k_dense_replace layers
+  double hc_mix_ms = 0.0;     // 2 per layer: post/comb + residual mixing
+  double head_ms = 0.0;       // hyper-head + final norm + lm_head
+  double total_ms = 0.0;      // whole forward_hidden (profiled)
+  int64_t steps = 0;
+  void reset() { *this = Glm5Profile{}; }
+};
+
 class Glm5Model {
  public:
   Glm5Model() = default;
@@ -57,6 +77,11 @@ class Glm5Model {
 
   // Drops every per-layer state and rewinds to position 0.
   void reset();
+
+  // Benchmark instrumentation: when non-null, forward_hidden() evaluates (and
+  // accumulates the time of) every named stage. Null by default, so the
+  // production path keeps its single lazy graph.
+  void set_profile(Glm5Profile* p) { profile_ = p; }
 
   // Absolute position of the next token fed to forward_tokens().
   int position() const { return pos_; }
@@ -151,6 +176,7 @@ class Glm5Model {
 
   Glm5MtpState mtp_;
   bool mtp_drafting_ = false;              // Model::make_mtp_drafter() installed it
+  Glm5Profile* profile_ = nullptr;         // set by set_profile() (bench only)
   std::vector<KdaRewind> kda_rewind_;      // per trunk layer, for rewind()
   mx::array last_hidden_ = mx::array(0.0f);  // (1,1,hidden) at pos_-1, compact
   mx::array batch_hidden_ = mx::array(0.0f); // (1,L,hidden) of the last rewound-able chunk

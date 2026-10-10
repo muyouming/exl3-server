@@ -196,11 +196,14 @@ std::string codebook_prologue(int cb) {
 const char* kHadSource = R"METAL(
   uint tid = thread_position_in_threadgroup.x;
   uint block = threadgroup_position_in_grid.x;
-  const device half* xp = x + block * 128u;
   const device half* sp = scale_vec + (block % uint(BLOCKS_PER_ROW)) * 128u;
   threadgroup float buf[128];
   threadgroup float buf2[128];
-  float v = float(xp[tid]);
+  // The input is rounded to f16 before the transform, which is where the
+  // operator graph used to place its `astype` (the QMV writes f32): folding it
+  // in removes one dispatch per linear and is exact, `half(half(x)) == x` for
+  // the f16 input side.
+  float v = float(half(x[block * 128u + tid]));
   if (HAD_PRE) v *= float(sp[tid]);
   buf[tid] = v;
   threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -228,7 +231,7 @@ struct HadConfig {
 };
 
 std::string had_key(const HadConfig& c) {
-  char buf[64];
+  char buf[96];
   std::snprintf(buf, sizeof(buf), "had_%d_%d", c.blocks_per_row, (int)c.pre);
   return buf;
 }
@@ -299,15 +302,23 @@ const mx::fast::CustomKernelFunction& had_kernel_for(const HadConfig& c) {
   return g_had_kernels.emplace(key, std::move(fn)).first->second;
 }
 
-// y = (H128 (x . s) ) * scale / sqrt(128)   (pre = true)
-// y = (H128 x) * scale / sqrt(128) . s      (pre = false)
-mx::array hadamard_scale(const mx::array& x, const mx::array& s, int blocks_per_row, bool pre) {
-  const int64_t total = x.size();
+// The Hadamard on either side of a trellis linear, in one kernel:
+//   input  side: y = (H128 (x . suh)) / sqrt(128)              [f16 in, f16 out]
+//   output side: y = (H128 f16(y)) / sqrt(128) . svh           [f32 in, f16 out]
+// The output side reads the QMV's f32 result and rounds it to f16 itself,
+// which is where the operator graph used to put its `astype`: one dispatch
+// fewer per linear (~1450 per decode token) with the same arithmetic.
+mx::array hadamard_run(const mx::array& x, const mx::array& s, int blocks_per_row, bool pre,
+                       const mx::Shape& out_shape) {
+  // NOTE: mx::Shape is a std::vector<int>, so `.size()` is the rank, not the
+  // element count (a zero grid silently skips the whole transform).
+  int64_t total = 1;
+  for (auto d : out_shape) total *= d;
   const int64_t blocks = total / 128;
   HadConfig cfg{blocks_per_row, pre};
   std::lock_guard<std::mutex> lk(g_mutex);
   const auto& kernel = had_kernel_for(cfg);
-  auto outs = kernel({x, s}, {x.shape()}, {mx::float16}, {(int)blocks * 128, 1, 1}, {128, 1, 1},
+  auto outs = kernel({x, s}, {out_shape}, {mx::float16}, {(int)blocks * 128, 1, 1}, {128, 1, 1},
                      std::vector<std::pair<std::string, mx::fast::TemplateArg>>{}, std::nullopt,
                      false, mx::default_device());
   return outs[0];
@@ -411,7 +422,7 @@ mx::array trellis_linear(const TrellisWeight& w, const mx::array& x) {
   // restored on the way out (mx::matmul semantics).
   mx::array x2 = x.ndim() == 2 ? x : mx::reshape(x, {(int)rows, in});
   // xhat = ((x . suh) H128 / sqrt(128)), one fused kernel, shapes preserved.
-  mx::array xhat = hadamard_scale(x2, w.suh, in / 128, /*pre=*/true);
+  mx::array xhat = hadamard_run(x2, w.suh, in / 128, /*pre=*/true, x2.shape());
 
   // yhat = xhat @ W_hat, split rows padded so the kernel needs no row bound.
   const int k_tiles = in / 16;
@@ -451,11 +462,12 @@ mx::array trellis_linear(const TrellisWeight& w, const mx::array& x) {
                        false, mx::default_device());
     y = outs[0];
   }
+  // The k-split partials are summed in f32 exactly as before (MLX's reduction
+  // order is its own; reordering it here moved the model's logits), then
+  // y = (H128 y / sqrt(128)) . svh with the f16 rounding inside the kernel.
   if (splits > 1) y = mx::sum(y, std::vector<int>{0}, false);
+  y = hadamard_run(y, w.svh, out / 128, /*pre=*/false, mx::Shape{pad_rows, out});
   if (pad_rows > rows) y = mx::slice(y, {0, 0}, {(int)rows, out});
-  // y = (yhat H128 / sqrt(128)) . svh
-  y = mx::astype(y, mx::float16);
-  y = hadamard_scale(y, w.svh, out / 128, /*pre=*/false);
   // Rows above were flattened to x.size()/in, so restore x's leading dimensions
   // with the feature dim replaced by `out` (mx::matmul semantics) - a no-op for
   // the 2-D callers, and what the 3-D ones (KDA/MLA activations) need.
