@@ -63,3 +63,34 @@ the prompt.
 | fp16 weights, MLX matmul (`--fp16-weights`) | ~50 tok/s | 4.5 GB |
 | trellis-resident in-kernel decode (default) | ~105 tok/s | 1.2 GB |
 | + DSpark speculation (projected, acceptance 5.5) | 250-400 tok/s | ~0.35 GB |
+
+## Remaining port work (precisely scoped)
+
+Done:
+
+- target-side verification (`Model::forward_multi`, speculative loop, lossless)
+- draft checkpoint loading + structure validation: `src/dspark.{h,cpp}`
+  (`fc` 10240x2048, `hidden_norm`, 5 Qwen3-style layers with q/k head norms,
+  `markov_w1` 130560x256, `markov_w2` 256x130560, `confidence_head` 1x2304;
+  block_size 7, mask_token_id 75982, taps [1,10,20,30,39] - all verified against
+  the published checkpoint)
+
+Next, in order:
+
+1. **Block forward** (unambiguous): build the 7-position block
+   `[anchor_token, MASK x 6]` embedded through the *target's* `embed_tokens`,
+   replace/annotate the anchor position with `hidden_norm(fc(cat(taps)))`, run the
+   5 layers (RMSNorm -> GQA + RoPE -> q/k head-norm -> SwiGLU), project through the
+   target's `lm_head`, then the markov rollout
+   `logits_i = base_logits[:, i, :] + markov_w2 @ markov_w1[prev]`, argmax per step.
+2. **Draft attention context** (needs the reference, do not guess): SGLang's DFlash
+   design supplies the draft's per-layer KV from the target's hidden states
+   (`write_target_hidden_kv` in `python/sglang/srt/speculative/dflash_worker_v2.py`
+   / `dflash_utils.py`) rather than recomputing them with the draft. Guessing this
+   silently degrades acceptance, so port it from the reference.
+3. **Draft KV from taps**: store the 5 per-position taps during every target
+   forward (20 KB/token at 5x2048 f16) so the draft can attend over the whole
+   context without running itself over the prompt.
+4. **Measure**: acceptance length vs the published 5.52 (greedy) and effective
+   tokens/s; the verify batch is currently ~5.5 ms/token at L=8, which must come
+   closer to the ~1.3x single-token cost for the full gain.
