@@ -221,6 +221,16 @@ The implementation was checked against independent references, not just by "it r
   wrong norm placement or layer-plan detail would still produce fluent, factual
   text. Rotate on that when the checkpoint or a reference runtime becomes
   available.
+- Speculation for GLM-5.3-Flash uses the checkpoint's MTP block (layer 45,
+  `--draft-mtp N`, loaded from the two public implementations of this
+  architecture since the HF reference ignores it): 78-100% proposal acceptance
+  and ~30-50% faster decode for 32-token generations, but the gain shrinks with
+  context length (fresh process, 128 tokens: 3.9 vs 3.8 tok/s) because the
+  per-row work grows. Greedy output is identical to non-speculative greedy for
+  32-token generations; over longer runs the trajectories can diverge after
+  ~40 tokens because partially accepted rounds rewind f16 recurrent state, so
+  the trajectories are numerically distinct even when every component is
+  correct.
 - GLM-5.3-Flash is trellis-resident only (no f16 fallback: materialising 100 GB
   of f16 beside the checkpoint is not feasible) and its speculative decoding has
   not been exercised; `model.visual.*` and the MTP layer 45 are skipped.
