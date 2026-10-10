@@ -57,6 +57,26 @@ Unquantized tensors (`model.embed_tokens.weight`, norms, or a fully unquantized
 checkpoint such as `openbmb/MiniCPM5-2B`) are also supported; `nn.Linear` weights are
 transposed to the engine's `(in, out)` layout on load.
 
+## GLM-5.3-Flash (GLM-5-Next)
+
+Native support, verified against the real 121 GB checkpoint
+(`MikeRoz/GLM-5.3-Flash-Uncensored-2.51bpw-h6-exl3`, 13 shards):
+
+| piece | what the engine implements |
+|---|---|
+| loader | 147039 of 151554 tensors, zero-copy mmap, ~10 s load (vision 1007 and the MTP layer 45 are skipped by design) |
+| layers | 45 = 34 KDA (gated delta rule with a short conv) + 11 DeepSeek-style sparse attention (MLA + lightning indexer) |
+| MoE | 288 experts, top-8, sigmoid routing with `e_score_correction_bias` used only for selection, shared expert, `swiglu_limit` 10, `routed_scaling_factor` 2.5; layers 0-2 dense |
+| hyper-connections | mhc with 4 residual streams, per-sublayer mixing, 20-iteration Sinkhorn normalisation |
+| tokenizer | vocabulary 154880 with the pre-tokenizer chain interpreted from `tokenizer.json` and the checkpoint's chat template reproduced byte-for-byte |
+
+`--model DIR` auto-detects the architecture; the CLI and the HTTP server both
+work with it. Notes on the layout discovered from the real weights: q/k/v are
+fused into one `self_attn.qkv_proj`, the KDA tensors live under `self_attn.*`,
+`conv1d` has no bias, plain weights are stored (in, out) after loading, the
+forget gate uses the config's `gate_lower_bound = -5`, and bitrates vary per
+tensor (e.g. `kv_a_proj_with_mqa` at K=5 while most are K=4).
+
 ## CLI
 
 ```sh
@@ -194,6 +214,23 @@ The implementation was checked against independent references, not just by "it r
   ~105 tokens/s decode (see Performance), ~2k tokens/s prefill.
 
 ## Limitations
+
+- **GLM-5.3-Flash is exact only against our own reference-derived oracles and
+  the prefill/decode invariant, not against an independent implementation**: the
+  source bf16 weights and a reference runtime are not available locally, so a
+  wrong norm placement or layer-plan detail would still produce fluent, factual
+  text. Rotate on that when the checkpoint or a reference runtime becomes
+  available.
+- GLM-5.3-Flash is trellis-resident only (no f16 fallback: materialising 100 GB
+  of f16 beside the checkpoint is not feasible) and its speculative decoding has
+  not been exercised; `model.visual.*` and the MTP layer 45 are skipped.
+- GLM-5.3-Flash decode is launch-bound at 3.0-3.6 tok/s (~317 ms/step, of which
+  KDA 47 ms, MLA+indexer 24 ms, MoE 77 ms over 42 layers, dense 3 ms; the rest
+  is per-layer periphery: two hyper-connection weight computations with a
+  20-iteration Sinkhorn on a 4x4 matrix each, two norms and host-side indexer
+  bookkeeping). Roughly 4000-5000 kernels per token at ~30-50 us. The weights
+  themselves would allow ~70 tok/s, so kernel fusion (fused Hadamards, grouped
+  expert GEMV, fused Sinkhorn) is the next step, not a bandwidth limit.
 
 - EXL3 + plain Llama-family architectures only (no MoE/MLA/custom architectures, no
   `rope_scaling`).
