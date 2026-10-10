@@ -11,32 +11,42 @@
 //     tests/glm5_trellis_bw.cpp $SRC -L$MLX/lib -lmlx -Wl,-rpath,$MLX/lib \
 //     -framework Foundation -framework Metal -framework Accelerate
 //
-//   usage: /tmp/glm5_trellis_bw [iterations_per_graph] [shapes|all]
+//   usage: /tmp/glm5_trellis_bw [iterations_per_graph] [shapes|all] [rounds]
 //
 // Three rows per (shape, rows) cell, all over the same packed buffer:
 //   qmv     yhat = xhat @ W_hat                      - the custom Metal kernel
-//   had     2x trellis_hadamard (in and out)          - the dispatch pair it
 //   lin     trellis_linear = qmv + both hadamards     - what a decode step calls
 // `qmv` is the kernel's own rate (the number that says whether the kernel is
-// fine); `lin` is what the model pays, so the difference is pure dispatch.
+// fine); `lin` is what the model pays, so the difference is pure dispatch. The
+// `xN` column is how many times the row blocking streams the weights (rows are
+// padded to mb = min(rows,4) per threadgroup block), i.e. a multi-row cell's
+// GB/s is not a DRAM rate unless it is multiplied by N.
 //
 // The iteration count matters: at 8 iterations per graph the host-side dispatch
 // of the 3 kernels per iteration is what gets measured (~123 GB/s for the
 // 4096x24576 tensor at rows=1). From ~64 iterations on, the number is the
-// kernel's. Measured on an M4 Max (128 GB), GB/s of packed weights read:
+// kernel's. The reported time is the median of `rounds` (default 5): the box
+// drifts 10-30% between runs of the same binary, so only interleaved
+// same-session runs of two builds are comparable at all. Measured on an M4 Max
+// (128 GB), raw QMV, GB/s of packed weights read, after the fourth pass's
+// geometry rule (docs/perf.md):
 //
-//   shape (real checkpoint geometry)      rows=1   rows=2   rows=4   rows=8
-//   qkv_proj      4096x24576   K4         305       247      137       71
-//   o_proj-aux    8192x4096    K4         225       176      124       67
-//   expert gate   4096x2048    K3         134       101       77       44
-//   expert down   2048x4096    K3         123        96       58       30
-//   kda f_a       4096x256     K4          45        29       28       16
-//   f16 matmul 4096x24576 (ref)           420 GB/s at rows=1, 200 GB/s at rows 2-8
+//   shape (real checkpoint geometry)   rows=1  rows=2  rows=4   rows=13  rows=26
+//   lm_head     4096x154880  K6         450     362     211(DRAM 201)    (x7 = 206)
+//   kda qkv     4096x24576   K4         308     252     138      (x4 139)   (x7 141)
+//   mla o_proj  16384x4096   K4         325     242     129      (x4 133)   (x7 136)
+//   exp8 gate|up 4096x2048   K3         202     (rows 2 149)
+//   exp8 gate|up 4096x2048   K2         134
+//   kda f_a     4096x256     K4          55
+//   f16 matmul 4096x24576 (ref)         327 GB/s at rows=1, 202 at rows 2-8
 //
-// so the trellis GEMV is 1.35x off a plain f16 GEMV in *time* at one row while
-// reading 4x fewer bytes, and the small per-layer tensors are launch-bound.
+// The tile rate behind those numbers is ~2.4e9 (16x16 output tiles)/s for every
+// K - the machine's SIMD issue width - so the GB/s a shape shows is its bytes
+// per tile (K/2 bytes per weight * 256) times that rate, and the small tensors
+// (f_a, kv_a, single-tensor expert shapes) are latency/dispatch-bound.
 #include <mlx/mlx.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -90,17 +100,23 @@ static mx::array f16_rows(int rows, int in, float fill) {
 // Build `reps` independent evaluations of `build()` into ONE graph, then
 // evaluate once - so the ~0.2 ms eval round-trip is amortised instead of being
 // charged to every sample. Every intermediate stays alive in `acc`.
+//
+// The reported number is the MEDIAN of `rounds` repeats: the box drifts by
+// 10-30% between runs of the same binary (clocks and page cache), the min is
+// biased by whichever repeat got lucky first, and only interleaved same-session
+// runs of the two builds are comparable at all.
 static double batch_ms(int reps, int rounds, auto&& build) {
   mx::array acc = mx::zeros({1}, mx::float32);
   mx::eval(acc);
-  double best = 1e9;
+  std::vector<double> t((size_t)rounds);
   for (int rr = 0; rr < rounds; ++rr) {
     const double t0 = now_ms2();
     for (int i = 0; i < reps; ++i) acc = mx::add(acc, build(i));
     mx::eval(acc);
-    best = std::min(best, (now_ms2() - t0) / reps);
+    t[(size_t)rr] = (now_ms2() - t0) / reps;
   }
-  return best;
+  std::sort(t.begin(), t.end());
+  return t[t.size() / 2];
 }
 
 // The real checkpoint's EXL3 shape classes (from the shard headers): in, out, K.
@@ -139,8 +155,9 @@ static int weight_passes(int rows) {
 int main(int argc, char** argv) {
   const int reps = argc > 1 ? std::atoi(argv[1]) : 64;
   const char* sel = argc > 2 ? argv[2] : "all";
-  std::printf("=== trellis GEMV effective weight-read bandwidth (eval excluded, %d iters/graph) ===\n",
-              reps);
+  const int rounds = argc > 3 ? std::atoi(argv[3]) : 5;
+  std::printf("=== trellis GEMV effective weight-read bandwidth (eval excluded, %d iters/graph, median of %d) ===\n",
+              reps, rounds);
   for (auto& sh : kShapes) {
     if (std::string(sel) != "all" && std::string(sh.name).find(sel) == std::string::npos) continue;
     exl3::G5Linear t = make_trellis(sh.in, sh.out, sh.K, 7u * sh.in + sh.out);
@@ -148,8 +165,8 @@ int main(int argc, char** argv) {
     for (int rows : {1, 2, 3, 4, 13, 26}) {
       mx::array x = f16_rows(rows, sh.in, 0.05f);
       mx::array xhat = f16_rows(rows, sh.in, 0.05f);
-      const double t_raw = batch_ms(reps, 3, [&](int) { return exl3::trellis_matmul_raw(t.tw, xhat); });
-      const double t_lin = batch_ms(reps, 3, [&](int) { return exl3::trellis_linear(t.tw, x); });
+      const double t_raw = batch_ms(reps, rounds, [&](int) { return exl3::trellis_matmul_raw(t.tw, xhat); });
+      const double t_lin = batch_ms(reps, rounds, [&](int) { return exl3::trellis_linear(t.tw, x); });
       const int passes = weight_passes(rows);
       std::printf("  %-32s rows %2d: qmv %8.4f ms %6.1f GB/s x%d (%6.1f DRAM) | lin %8.4f ms "
                   "%6.1f GB/s\n",
@@ -170,8 +187,8 @@ int main(int argc, char** argv) {
     for (int rows : {1, 2, 4}) {
       mx::array x = f16_rows(rows, 4096, 0.05f);
       mx::array xd = f16_rows(rows, 2048, 0.05f);
-      const double t_gu = batch_ms(reps, 3, [&](int) { return exl3::trellis_linear_group(gu, x); });
-      const double t_dn = batch_ms(reps, 3, [&](int) { return exl3::trellis_linear_group(dn, xd); });
+      const double t_gu = batch_ms(reps, rounds, [&](int) { return exl3::trellis_linear_group(gu, x); });
+      const double t_dn = batch_ms(reps, rounds, [&](int) { return exl3::trellis_linear_group(dn, xd); });
       std::printf("  exp8 gate|up+down K%d           rows %2d: gu %8.4f dn %8.4f ms %6.1f GB/s\n", K,
                   rows, t_gu, t_dn, bytes / ((t_gu + t_dn) * 1e-3) / 1e9);
     }
@@ -187,7 +204,7 @@ int main(int argc, char** argv) {
     mx::eval(w);
     for (int rows : {1, 2, 4, 8}) {
       mx::array x = f16_rows(rows, in, 1.0f);
-      const double ms = batch_ms(reps, 3, [&](int) { return mx::matmul(x, w); });
+      const double ms = batch_ms(reps, rounds, [&](int) { return mx::matmul(x, w); });
       std::printf("  %-32s rows %2d: %8.4f ms %6.1f GB/s\n", "f16 matmul 4096x24576 (ref)", rows,
                   ms, bytes / (ms * 1e-3) / 1e9);
     }

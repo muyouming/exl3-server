@@ -422,9 +422,11 @@ int split_count(int k_tiles, int n_tiles) {
 }
 
 // One geometry for every entry point of this file: rows per threadgroup (mb),
-// output tiles per threadgroup (nt), k-splits and the padded row count. Only nt
-// is free to change without moving a single output bit; mb and splits are part
-// of the arithmetic (see split_count).
+// output tiles per threadgroup (nt), k-splits and the padded row count. nt and
+// mb are pure scheduling and are proven inert by tests/glm5_gemv_nt_test.cpp
+// (every (nt, mb) pair produces the same bytes as any other, and the grouped
+// and both scale-stack forms equal the per-expert path); the k-split count is
+// part of the arithmetic and is not this function's to choose.
 //
 // The accumulator array is acc[mb][nt][8] floats and a product above 4 spills
 // it: measured 2.7x for {1,16} at 1 row - which is what the old
@@ -461,9 +463,9 @@ Geom pick_geom(int k_tiles, int n_tiles, int rows, int members = 1) {
   // ~2048 simdgroups in flight - nt amortises the per-iteration activation
   // path, but it is paid for in threadgroups, and on the 4096x24576 K4 tensor
   // nt=4 leaves 384 threadgroups (one wave) and measures 17% slower than
-  // nt=2's 768. nt is the only knob here that cannot move an output bit: the
-  // per-tile accumulation order, the split count and mb are all unchanged by
-  // which threadgroup covers which output tile.
+  // nt=2's 768. Like mb, nt cannot move an output bit: the per-tile
+  // accumulation order, the split count and the per-output k order are all
+  // unchanged by which threadgroup covers which output tile.
   const int splits = split_count(k_tiles, n_tiles);
   int nt = 1;
   const int cap = 4 / mb > 0 ? 4 / mb : 1;
