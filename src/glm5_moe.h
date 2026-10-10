@@ -36,25 +36,30 @@ mx::array moe_layer(const G5Layer& l, const ModelConfig& cfg, const mx::array& h
 // The routed-expert block of a DECODE BATCH: `h` is (B, 1, hidden), one row per
 // sequence, and every row routes on its own. The arithmetic is moe_layer's
 // general path per row - each row's K experts see that row's own activation -
-// but a rank's K-th choice of every row is applied in ONE grouped launch whose
-// members are the B rows, so a step pays the launch and host bookkeeping once
-// instead of B times.
+// and the step's B*K (row, expert) pairs are executed in EXPERT ORDER, which is
+// what makes the launch win and the bandwidth win the same operation.
 //
-// Why one launch per rank: a Metal kernel takes at most 31 buffers (x, the
-// member weights, the output), so a single grouped launch holds at most 29
-// members (measured; 32 fails to compile the Metal source). K*B work items do
-// not fit for a real batch, and the per-rank split needs only 2*B (the merged
-// gate|up launch) which is <= 29 for B <= 14.
+// Why expert order: on this checkpoint a real batch's rows barely share their
+// routing (57.6 distinct experts of 64 selections at B=8, top-8 of 288), so
+// reading each pair's weight tile in routing order streams the same expert's
+// tile once per row that picked it. Sorting the pairs by expert id makes every
+// pair of one expert run back to back, so its tile is read from cache for all
+// but the first of them (the mechanism oMLX's `moe_verify_gather` ports;
+// docs/research/omlx.md §B). It is a transcription, not an approximation: each
+// pair is still one rows=1 member of a grouped launch with its own weight
+// buffer and its own slice of the prepared scale stacks, so the kernel's tile
+// geometry, k-order and f32 split sum are untouched, and a `take` (a pure move)
+// puts the per-pair results back into the rank-major (K, B, 1, H) stack that the
+// weighted sum consumes exactly as before. tests/moe_test.cpp (g) hashes the
+// result against N single-row calls and against the general path, bit for bit.
 //
-// The rows of a batch do NOT share experts in general, so the bytes the routed
-// experts contribute per token are the same as serial decoding's - this is a
-// launch/bookkeeping win, not a bandwidth win. Duplicate experts inside one
-// launch (two rows picking the same expert for the same rank) are two members
-// reading the same weight buffer, which the cache absorbs.
-//
-// Falls back to moe_layer when the batch is wider than a launch allows, when
-// the layer has no prepared stacks, or when a rank's members cannot share one
-// launch geometry (mixed K/codebook/alignment).
+// Chunking: a Metal kernel takes at most 31 buffers (x, the member weights, the
+// output), so a launch holds at most 29 members - 14 pairs for the merged
+// gate|up launch (two members per pair) and 29 for down. Each chunk is
+// contiguous in the expert-sorted order, so only experts that straddle a chunk
+// boundary can re-read their tile. A batch of any width is handled; the layers
+// whose experts are not uniform in the way the grouped forms need fall back to
+// moe_layer (see moe_prep_of).
 mx::array moe_layer_rows(const G5Layer& l, const ModelConfig& cfg, const mx::array& h);
 
 // Dense SwiGLU MLP (Glm5NextTextMLP.forward, `first_k_dense_replace` layers):

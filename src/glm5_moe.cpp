@@ -88,17 +88,11 @@ const G5MoePrep* moe_prep_of(const G5Layer& l, const ModelConfig& cfg);
 // bounds: must be between 0 and 30").
 constexpr int kMaxGroupMembers = 29;
 
-// Everything matmul_group_impl requires of one launch's members.
-bool group_uniform(const std::vector<TrellisWeight>& ws) {
-  for (const auto& w : ws) {
-    if (!w.aligned || w.K != ws[0].K || w.codebook != ws[0].codebook ||
-        w.in_features != ws[0].in_features || w.out_features != ws[0].out_features) {
-      return false;
-    }
-  }
-  return true;
-}
-
+// Everything a grouped launch requires of one member. The *cross-member*
+// uniformity (same shape, K, codebook, alignment, no bias, for every expert of a
+// projection class) is established once per layer by moe_prep_of(), which
+// returns nullptr unless every one of the 288 experts of each class matches its
+// class' first one - so a chunk may mix any experts into one launch.
 bool groupable(const G5Linear& g) {
   return g.quantized && !g.has_bias && g.tw.aligned && g.tw.packed.size() > 1;
 }
@@ -111,10 +105,8 @@ mx::array moe_layer_rows(const G5Layer& l, const ModelConfig& cfg, const mx::arr
   const int K = cfg.num_experts_per_tok;
   const G5MoePrep* prep = moe_prep_of(l, cfg);
   // A one-row call IS the serial decode path (its fast path is the same
-  // arithmetic and one launch per class), and a wider-than-a-launch batch has
-  // to go through the general gather/scatter form.
-  if (B <= 1 || L != 1 || prep == nullptr || E <= 0 || K <= 0 || 2 * B > kMaxGroupMembers)
-    return moe_layer(l, cfg, h);
+  // arithmetic and one launch per class).
+  if (B <= 1 || L != 1 || prep == nullptr || E <= 0 || K <= 0) return moe_layer(l, cfg, h);
 
   // The shared expert does not depend on the router: dispatch it first so the
   // GPU has it queued while the host waits for the ids (as moe_layer does).
@@ -127,56 +119,120 @@ mx::array moe_layer_rows(const G5Layer& l, const ModelConfig& cfg, const mx::arr
   mx::eval(indices); // the step's one host round trip
   const int32_t* idx = indices.data<int32_t>();
 
-  std::vector<mx::array> outs;
-  outs.reserve((size_t)K);
-  const float limit = cfg.swiglu_limit;
-  mx::array hf = mx::reshape(h, {B, H});
-  for (int k = 0; k < K; ++k) {
-    // Member order, for all of wgu / xgu / gu_ids at once: the batch's rows with
-    // the rank's GATE experts first (0..B-1), then the same rows with the UP
-    // experts (B..2B-1) - which is also how the merged scale stack is laid out
-    // (gate rows 0..E-1, up rows E..2E-1; see moe_prep_of) and how the gu4 slice
-    // below splits gate from up.
-    std::vector<TrellisWeight> wgu((size_t)2 * B), wd;
-    std::vector<int32_t> gu_ids((size_t)2 * B), d_ids((size_t)B);
-    wd.reserve((size_t)B);
-    for (int b = 0; b < B; ++b) {
+  // ---- the step's work items, in EXPERT order -------------------------------
+  //
+  // The step has B*K (row, expert) pairs. Routing order visits them row by row,
+  // so the same expert's weight tile is read once per row that selected it -
+  // and on this checkpoint the rows of a real batch barely overlap (57.6
+  // distinct experts of 64 selections at B=8, top-8 of 288). Executing the
+  // pairs in EXPERT order makes every pair of one expert run back to back, so
+  // its tile is read from cache instead of DRAM for all but the first of them
+  // (the mechanism oMLX's `moe_verify_gather` ports; docs/research/omlx.md §B).
+  //
+  // Only the ORDER of the work items changes. Each pair is still one member of
+  // a grouped launch with rows=1, its own weight buffer and its own slice of the
+  // scale stacks, so every pair's arithmetic - the kernel's tile geometry, its
+  // k-order and its f32 split sum - is the one it had in routing order, and the
+  // per-pair results are reordered back with a `take` (a pure move) before the
+  // weighted sum, which sees the (K, B, 1, H) layout and the reduction order it
+  // always had. tests/moe_test.cpp (g) hashes this path against N single-row
+  // calls and against the general gather/scatter form, bit for bit.
+  const int P = B * K;
+  struct Pair {
+    int expert, row, rank;
+  };
+  std::vector<Pair> pairs;
+  pairs.reserve((size_t)P);
+  for (int b = 0; b < B; ++b) {
+    for (int k = 0; k < K; ++k) {
       const int e = (int)idx[(size_t)b * K + k];
       if (e < 0 || e >= E || (int)l.experts.size() != E * 3) return moe_layer(l, cfg, h);
       const G5Linear& g = l.experts[(size_t)(e * 3 + 0)];
       const G5Linear& u = l.experts[(size_t)(e * 3 + 1)];
       const G5Linear& d = l.experts[(size_t)(e * 3 + 2)];
       if (!groupable(g) || !groupable(u) || !groupable(d)) return moe_layer(l, cfg, h);
-      wgu[(size_t)b] = g.tw;
-      wgu[(size_t)(B + b)] = u.tw;
-      wd.push_back(d.tw);
-      gu_ids[(size_t)b] = e;
-      gu_ids[(size_t)(B + b)] = E + e;
-      d_ids[(size_t)b] = e;
+      pairs.push_back(Pair{e, b, k});
     }
-    if (!group_uniform(wgu) || !group_uniform(wd)) return moe_layer(l, cfg, h);
-    // The activation block is the batch itself, twice: member m<B is row m's
-    // gate expert, member B+m is row m's up expert (moe_prep_of's member order).
-    mx::array xgu = mx::reshape(mx::tile(mx::reshape(hf, {1, B, H}), {2, 1, 1}), {2 * B, 1, H});
+  }
+  std::stable_sort(pairs.begin(), pairs.end(),
+                   [](const Pair& a, const Pair& b) { return a.expert < b.expert; });
+  // The slot each sorted item belongs to: the rank-major layout (rank * B + row)
+  // the weighted sum at the end of this function has always consumed, and the
+  // inverse map that puts the sorted results back into it.
+  std::vector<int32_t> perm((size_t)P); // perm[rank * B + row] = sorted position
+  for (int p = 0; p < P; ++p) {
+    const Pair& q = pairs[(size_t)p];
+    perm[(size_t)(q.rank * B + q.row)] = p;
+  }
+
+  const float limit = cfg.swiglu_limit;
+  mx::array hf = mx::reshape(h, {B, H});
+  // One merged gate|up launch holds two members per pair (every gate member
+  // first, then every up member - the layout moe_prep_of's scale stack and the
+  // gu4 split below assume), so a chunk is at most kMaxGroupMembers/2 pairs; a
+  // down launch holds one member per pair.
+  const int gu_chunk = kMaxGroupMembers / 2;
+  std::vector<mx::array> act_chunks;
+  act_chunks.reserve((size_t)((P + gu_chunk - 1) / gu_chunk));
+  for (int s = 0; s < P; s += gu_chunk) {
+    const int c = std::min(gu_chunk, P - s);
+    std::vector<TrellisWeight> wgu((size_t)2 * c);
+    std::vector<int32_t> gu_ids((size_t)2 * c), rows((size_t)2 * c);
+    for (int i = 0; i < c; ++i) {
+      const Pair& q = pairs[(size_t)(s + i)];
+      const int e = q.expert;
+      wgu[(size_t)i] = l.experts[(size_t)(e * 3 + 0)].tw;
+      wgu[(size_t)(c + i)] = l.experts[(size_t)(e * 3 + 1)].tw;
+      gu_ids[(size_t)i] = e;
+      gu_ids[(size_t)(c + i)] = E + e;
+      rows[(size_t)i] = q.row;
+      rows[(size_t)(c + i)] = q.row;
+    }
+    // The activation block is one row per member: member i<c is pair i's row for
+    // its gate expert, member c+i the same row for its up expert (moe_prep_of's
+    // member order).
+    mx::array xgu = mx::reshape(
+        mx::take(hf, mx::array(rows.data(), {2 * c}, mx::int32), 0), {2 * c, 1, H});
     mx::array gu = trellis_linear_group_rows_scaled(
-        wgu, xgu, /*rows=*/1, mx::take(prep->suh_gu, mx::array(gu_ids.data(), {2 * B}, mx::int32), 0),
-        mx::take(prep->svh_gu, mx::array(gu_ids.data(), {2 * B}, mx::int32), 0));
+        wgu, xgu, /*rows=*/1,
+        mx::take(prep->suh_gu, mx::array(gu_ids.data(), {2 * c}, mx::int32), 0),
+        mx::take(prep->svh_gu, mx::array(gu_ids.data(), {2 * c}, mx::int32), 0));
     const int out_i = wgu[0].out_features;
-    mx::array gu4 = mx::reshape(gu, {2, B, 1, out_i});
-    mx::array gate = mx::reshape(mx::slice(gu4, {0, 0, 0, 0}, {1, B, 1, out_i}), {B, 1, out_i});
-    mx::array up = mx::reshape(mx::slice(gu4, {1, 0, 0, 0}, {2, B, 1, out_i}), {B, 1, out_i});
+    mx::array gu4 = mx::reshape(gu, {2, c, 1, out_i});
+    mx::array gate = mx::reshape(mx::slice(gu4, {0, 0, 0, 0}, {1, c, 1, out_i}), {c, 1, out_i});
+    mx::array up = mx::reshape(mx::slice(gu4, {1, 0, 0, 0}, {2, c, 1, out_i}), {c, 1, out_i});
     gate = mx::clip(gate, std::nullopt, mx::array(limit, gate.dtype()));
     up = mx::clip(up, mx::array(-limit, up.dtype()), mx::array(limit, up.dtype()));
     mx::array act = mx::multiply(gate, mx::sigmoid(gate));
-    mx::array actup = mx::multiply(act, up);
-    mx::array down = trellis_linear_group_rows_scaled(
-        wd, actup, /*rows=*/1, mx::take(prep->suh_d, mx::array(d_ids.data(), {B}, mx::int32), 0),
-        mx::take(prep->svh_d, mx::array(d_ids.data(), {B}, mx::int32), 0));
-    outs.push_back(down); // (B, 1, H)
+    act_chunks.push_back(mx::multiply(act, up)); // (c, 1, inn)
   }
-  // The general path's weighted sum, term by term in rank order: (K, B, 1, H)
-  // times the per-(row, rank) weight, rounded to h's dtype, summed over K.
-  mx::array stk = mx::stack(outs, 0);                              // (K, B, 1, H)
+  mx::array act_all = act_chunks.size() == 1 ? act_chunks[0] : mx::concatenate(act_chunks, 0);
+  const int inn = (int)act_all.shape(2);
+
+  std::vector<mx::array> down_chunks;
+  down_chunks.reserve((size_t)((P + kMaxGroupMembers - 1) / kMaxGroupMembers));
+  for (int s = 0; s < P; s += kMaxGroupMembers) {
+    const int c = std::min(kMaxGroupMembers, P - s);
+    std::vector<TrellisWeight> wd((size_t)c);
+    std::vector<int32_t> d_ids((size_t)c);
+    for (int i = 0; i < c; ++i) {
+      const Pair& q = pairs[(size_t)(s + i)];
+      wd[(size_t)i] = l.experts[(size_t)(q.expert * 3 + 2)].tw;
+      d_ids[(size_t)i] = q.expert;
+    }
+    mx::array xd = mx::reshape(mx::slice(act_all, {s, 0, 0}, {s + c, 1, inn}), {c, 1, inn});
+    down_chunks.push_back(trellis_linear_group_rows_scaled(
+        wd, xd, /*rows=*/1,
+        mx::take(prep->suh_d, mx::array(d_ids.data(), {c}, mx::int32), 0),
+        mx::take(prep->svh_d, mx::array(d_ids.data(), {c}, mx::int32), 0)));
+  }
+  mx::array down_all = down_chunks.size() == 1 ? down_chunks[0] : mx::concatenate(down_chunks, 0);
+
+  // Back to the rank-major (K, B, 1, H) stack this function has always built,
+  // then the general path's weighted sum, term by term in rank order: (K, B, 1,
+  // H) times the per-(row, rank) weight, rounded to h's dtype, summed over K.
+  mx::array stk =
+      mx::reshape(mx::take(down_all, mx::array(perm.data(), {P}, mx::int32), 0), {K, B, 1, H});
   mx::array wt = mx::reshape(mx::transpose(weights), {K, B, 1, 1}); // (B,K) f32 -> (K,B,1,1)
   mx::array routed = mx::reshape(mx::sum(mx::astype(mx::multiply(stk, wt), h.dtype()), 0),
                                  {B, L, H});

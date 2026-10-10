@@ -612,6 +612,45 @@ int main() {
                 scale, maxd, maxdg);
     eq("rows path == single-row calls", maxd == 0);
     eq("rows path == general path (a batch)", maxdg == 0);
+
+    // (h) the same rows path at a width that needs MORE THAN ONE launch per
+    // projection class, and with routing the rows genuinely share. The rows path
+    // sorts the B*K (row, expert) pairs by expert id and executes the sorted
+    // list in chunks (14 pairs per merged gate|up launch, 29 per down launch,
+    // the 31-buffer limit), so a result that ignores the sort - or that mixes up
+    // the `take` that puts the sorted results back - only shows up once a batch
+    // spans a chunk boundary and repeats experts. 11 rows x 3 ranks = 33 pairs
+    // over 4 experts: three gate|up chunks and two down chunks, with every
+    // expert selected several times.
+    std::printf("== (h) rows path, 33 pairs over 4 experts (chunked, duplicate experts) ==\n");
+    const int WR = 11;
+    std::vector<float> wv((size_t)WR * GQH);
+    for (size_t i = 0; i < wv.size(); ++i) wv[i] = 0.05f * (float)((i * 13 + 5) % 37) - 0.7f;
+    mx::array h11 = mx::astype(mx::array(wv.data(), {WR, 1, GQH}, mx::float32, [](void*) {}),
+                               mx::float16);
+    mx::eval(h11);
+    const std::vector<float> yw = host(exl3::moe_layer_rows(gl, gc, h11));
+    double wscale = 0;
+    for (float v : yw)
+      if (std::isfinite(v)) wscale = std::max(wscale, (double)std::fabs(v));
+    double wmax = 0;
+    for (int b = 0; b < WR; ++b) {
+      mx::array hb = mx::reshape(mx::slice(h11, {b, 0, 0}, {b + 1, 1, GQH}), {1, 1, GQH});
+      const std::vector<float> ys = host(exl3::moe_layer_rows(gl, gc, hb));
+      for (int j = 0; j < GQH; ++j)
+        wmax = std::max(wmax, (double)std::fabs(ys[(size_t)j] - yw[(size_t)b * GQH + j]));
+    }
+    setenv("EXL3_MOE_GENERAL", "1", 1);
+    const std::vector<float> wgen = host(exl3::moe_layer_rows(gl, gc, h11));
+    unsetenv("EXL3_MOE_GENERAL");
+    double wmaxg = 0;
+    for (size_t i = 0; i < (size_t)WR * GQH; ++i)
+      wmaxg = std::max(wmaxg, (double)std::fabs(wgen[i] - yw[i]));
+    std::printf("  |out|max = %.4g, max|row diff| vs single-row = %g, vs general path = %g\n",
+                wscale, wmax, wmaxg);
+    eq("11-row outputs finite and non-zero", wscale > 1e-3);
+    eq("11-row chunked path == single-row calls", wmax == 0);
+    eq("11-row chunked path == general path", wmaxg == 0);
   }
 
   std::printf("%s\n", g_ok ? "ALL OK" : "FAILURES");
