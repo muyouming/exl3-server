@@ -1,5 +1,6 @@
 #include "glm5_attn.h"
 
+#include <algorithm>
 #include <cmath>
 
 #include "glm5_kda.h"
@@ -88,6 +89,61 @@ IndexerPools indexer_pool_and_score(const mx::array& packed, const mx::array& q,
   out.scores = mx::matmul(mx::reshape(mx::astype(w, mx::float32), {L, 1, Nh}), sc); // (L,1,n)
   out.scores = mx::reshape(out.scores, {L, n});
   return out;
+}
+
+mx::array indexer_select(const IndexerPools& pl, const std::vector<char>& visible,
+                         const std::vector<char>& row_visible, int index_topk,
+                         bool always_select_tail) {
+  mx::eval(pl.scores);
+  const int L = (int)pl.scores.shape(0);
+  const int n = pl.n_pools;
+  const int kp = pl.kpool;
+  const int Ltot = (int)(visible.size() / (size_t)std::max(1, L));
+  const int select_k = std::min(index_topk / std::max(1, kp), n);
+  const int tail_w = always_select_tail ? kp - 1 : 0;
+  const int width = index_topk + tail_w;
+  const float* sc = pl.scores.data<float>();
+  // pools holding a complete, visible key set
+  std::vector<char> ok((size_t)L * n, 0);
+  for (int l = 0; l < L; ++l)
+    for (int p = 0; p < n; ++p) {
+      if (l >= (int)row_visible.size() || !row_visible[(size_t)l]) continue;
+      if (!pl.valid[(size_t)p]) continue;
+      const int end = pl.indices[(size_t)p * kp + kp - 1];
+      if (end < 0 || end >= Ltot) continue;
+      ok[(size_t)l * n + p] = visible[(size_t)l * Ltot + end] ? 1 : 0;
+    }
+  std::vector<int32_t> out((size_t)L * width, -1);
+  std::vector<std::pair<float, int>> ranked;
+  for (int l = 0; l < L; ++l) {
+    ranked.clear();
+    for (int p = 0; p < n; ++p)
+      if (ok[(size_t)l * n + p]) ranked.push_back({sc[(size_t)l * n + p], p});
+    std::stable_sort(ranked.begin(), ranked.end(),
+                     [](const auto& a, const auto& b) { return a.first > b.first; });
+    if ((int)ranked.size() > select_k) ranked.resize((size_t)select_k);
+    int w = 0;
+    for (auto& [_, p] : ranked) {
+      for (int s = 0; s < kp && w < index_topk; ++s) {
+        const int t = pl.indices[(size_t)p * kp + s];
+        if (t >= 0 && t < Ltot && visible[(size_t)l * Ltot + t]) out[(size_t)l * width + w++] = t;
+      }
+    }
+    if (!tail_w) continue;
+    // the current incomplete pool: visible tokens past the last COMPLETE pool
+    // (the pool count includes the partial one, but only complete pools can be
+    // selected, so the tail is what remains after floor((Ltot-first)/kp)*kp)
+    const int first = pl.indices.empty() ? 0 : std::max(0, pl.indices[0]);
+    const int n_full = std::max(0, (Ltot - first) / kp);
+    const int covered = first + n_full * kp;
+    for (int t = covered; t < Ltot && w < width; ++t) {
+      if (!visible[(size_t)l * Ltot + t]) continue;
+      out[(size_t)l * width + w++] = t;
+    }
+  }
+  auto* h = new std::vector<int32_t>(std::move(out));
+  return mx::array((void*)h->data(), mx::Shape{L, width}, mx::int32,
+                   [h](void*) { delete h; });
 }
 
 mx::array mla_layer(const G5Layer& l, const ModelConfig& cfg, const mx::array& h,

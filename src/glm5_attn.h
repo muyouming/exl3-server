@@ -42,6 +42,16 @@ struct IndexerPools {
 IndexerPools indexer_pool_and_score(const mx::array& packed, const mx::array& q,
                                     const mx::array& w, const mx::array& ape);
 
+// Selection half of the DSA indexer (880-900 + append_visible_tail at 1010):
+// pick the top `select_k` pools per query row, expand them to token ids, append
+// the still-incomplete tail pool (at most kpool-1 raw ids) and pad to the fixed
+// output width used by the sparse attention mask. `visible` is (L, L_total)
+// row-major causal+validity, `row_visible` is (L) for the padding rows of Q.
+// Returns (L, output_width) int32 with -1 for absent entries.
+mx::array indexer_select(const IndexerPools& pl, const std::vector<char>& visible,
+                         const std::vector<char>& row_visible, int index_topk,
+                         bool always_select_tail);
+
 // One MLA layer. `h` is (B, L, hidden); `start_pos` is the absolute position of
 // the first query token. `topk` (B, L, K) holds absolute key positions selected
 // by the DSA indexer (-1 = none); pass an empty array for dense causal attention.
