@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <stdexcept>
 
 #include "glm5_kda.h"
 #include "util.h"
@@ -146,16 +147,55 @@ mx::array indexer_select(const IndexerPools& pl, const std::vector<char>& visibl
                    [h](void*) { delete h; });
 }
 
+mx::array mla_q_resid(const G5Layer& l, const mx::array& h) {
+  return rms_norm(g5_linear(l.q_a, h), l.q_a_norm);
+}
+
+mx::array indexer_topk(const G5Layer& l, const ModelConfig& cfg, const mx::array& h,
+                       const mx::array& q_resid, IndexerState& st, int start_pos) {
+  const int B = (int)h.shape(0), L = (int)h.shape(1);
+  if (B != 1) throw std::runtime_error("GLM indexer implemented for batch 1");
+  const int Nh = cfg.index_n_heads;                                  // 32
+  const int D = (int)l.idx_wk.shape(0);                              // 128
+  const int kp = cfg.index_kpool;                                    // 4
+  // raw indexer weights are stored (out, in) on disk
+  auto proj = [](const mx::array& w, const mx::array& x) {
+    return mx::matmul(x, mx::transpose(w));
+  };
+  mx::array q = mx::reshape(g5_linear(l.idx_wq_b, q_resid), {L, Nh, D});
+  mx::array key = layer_norm(proj(l.idx_wk, h), l.idx_k_norm_w, l.idx_k_norm_b);
+  mx::array gate = proj(l.idx_gate, h);
+  mx::array valid = mx::ones(mx::Shape{B, L, 1}, mx::float32); // single sequence: no padding
+  mx::array packed_new = mx::concatenate({mx::astype(key, mx::float32),
+                                          mx::astype(gate, mx::float32), valid}, -1);
+  mx::array all = st.len > 0 ? mx::concatenate({st.packed, packed_new}, 1) : packed_new;
+  st.packed = all;
+  st.len += L;
+  const int Ltot = st.len;
+  mx::array weights = mx::multiply(
+      proj(l.idx_weights_proj, h), mx::array(1.0f / std::sqrt((float)Nh), mx::float32));
+  auto pools = indexer_pool_and_score(mx::reshape(all, {Ltot, 2 * D + 1}), q, weights, l.idx_ape);
+  // visibility: causal (absolute positions) and valid, per (query row, key)
+  std::vector<char> visible((size_t)L * Ltot, 0), row_visible((size_t)L, 1);
+  for (int i = 0; i < L; ++i)
+    for (int j = 0; j <= start_pos + i && j < Ltot; ++j) visible[(size_t)i * Ltot + j] = 1;
+  mx::array sel = indexer_select(pools, visible, row_visible, cfg.index_topk,
+                                 cfg.index_kpool_always_select_tail);
+  return mx::reshape(sel, {1, L, (int)sel.shape(1)});
+}
+
 mx::array mla_layer(const G5Layer& l, const ModelConfig& cfg, const mx::array& h,
-                    MlaState& state, int start_pos, const mx::array& topk) {
+                    MlaState& state, int start_pos, const mx::array& topk,
+                    const mx::array& q_resid_in) {
   const int B = (int)h.shape(0), L = (int)h.shape(1);
   const int H = cfg.num_heads;
   const int kvr = (int)l.kv_b.in_features;              // kv_lora_rank (512)
   const int qk = (int)l.q_b.out_features / H;           // qk_head_dim (nope only: rope = 0)
   const int vd = (int)l.kv_b.out_features / H - qk;     // v_head_dim (256)
 
-  // q path: q_a_proj -> q_a_layernorm -> q_b_proj
-  mx::array q_resid = rms_norm(g5_linear(l.q_a, h), l.q_a_norm);
+  // q path: q_a_proj -> q_a_layernorm -> q_b_proj (q_resid is shared with the
+  // indexer, so the caller may pass the one it already used)
+  mx::array q_resid = q_resid_in.size() > 1 ? q_resid_in : mla_q_resid(l, h);
   mx::array q = mx::reshape(g5_linear(l.q_b, q_resid), {B, L, H, qk});
   // kv path: kv_a_proj_with_mqa -> (kv_lora_rank | qk_rope_head_dim=0) -> kv_a_layernorm
   mx::array kv_raw = g5_linear(l.kv_a, h); // (B, L, kvr + 0)

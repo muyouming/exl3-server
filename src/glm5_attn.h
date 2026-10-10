@@ -52,10 +52,28 @@ mx::array indexer_select(const IndexerPools& pl, const std::vector<char>& visibl
                          const std::vector<char>& row_visible, int index_topk,
                          bool always_select_tail);
 
+// q_residual shared between MLA and its indexer: q_a_layernorm(q_a_proj(h)).
+mx::array mla_q_resid(const G5Layer& l, const mx::array& h);
+
+// Per-layer indexer state: the packed per-token cache
+// (key | gate_scores | valid_flag), grown by one row per step.
+struct IndexerState {
+  mx::array packed = mx::array(0.0f); // (1, L_total, 2*head_dim + 1) f32
+  int len = 0;
+};
+
+// DSA indexer top-k token selection for the current chunk (B = 1). `start_pos`
+// is the absolute position of the chunk's first query token. Returns
+// (1, L, index_topk + index_kpool - 1) int32 with -1 for absent entries -
+// exactly what mla_layer's `topk` argument consumes.
+mx::array indexer_topk(const G5Layer& l, const ModelConfig& cfg, const mx::array& h,
+                       const mx::array& q_resid, IndexerState& st, int start_pos);
+
 // One MLA layer. `h` is (B, L, hidden); `start_pos` is the absolute position of
 // the first query token. `topk` (B, L, K) holds absolute key positions selected
 // by the DSA indexer (-1 = none); pass an empty array for dense causal attention.
 mx::array mla_layer(const G5Layer& l, const ModelConfig& cfg, const mx::array& h,
-                    MlaState& state, int start_pos, const mx::array& topk = mx::array(0.0f));
+                    MlaState& state, int start_pos, const mx::array& topk = mx::array(0.0f),
+                    const mx::array& q_resid_in = mx::array(0.0f));
 
 } // namespace exl3
