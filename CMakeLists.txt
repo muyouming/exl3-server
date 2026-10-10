@@ -37,6 +37,7 @@ add_executable(exl3-server
   src/trellis_gemm.cpp
   src/dspark.cpp
   src/glm5.cpp
+  src/glm5_kda.cpp
   src/model.cpp
   src/tokenizer.cpp
   src/engine.cpp

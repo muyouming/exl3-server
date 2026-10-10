@@ -228,6 +228,12 @@ out       = RMSNormGated(out)             # o_norm.weight, gated
 out       = o_proj(out)                   # output gate: g_a_proj -> SiLU -> g_b_proj -> sigmoid
 ```
 
+Status: the recurrence itself (`kda_recurrence`, `kda_l2norm`, `kda_decay`,
+`kda_conv1d` in `src/glm5_kda.cpp`) is implemented and verified against the
+reference formula evaluated as a scalar fp64 oracle - `tests/kda_recurrence_test.cpp`
+reports max|diff| ~4e-8 with 0/56 mismatches. Still to wire: the per-layer
+projections, the conv1d rolling state and the gated output norm.
+
 Recurrent-state details for the engine: the conv keeps a 3-position rolling
 window (kernel 4) and the delta rule keeps one (heads, k_head_dim, v_head_dim)
 state per layer; both must be part of the KV/state cache for incremental decode.
