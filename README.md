@@ -89,10 +89,22 @@ its own state (KDA conv window + delta-rule matrix, the compressed MLA latent
 cache, the packed DSA indexer cache). A joining request is prefilled through the
 ordinary single-sequence path and its state copied in, so a batch of one is
 bit-identical to serial decoding, and four concurrent greedy runs produce exactly
-the tokens four serial runs do (`tests/glm5_batch_test.cpp`). What batching does
-**not** buy is the routed experts: 8 rows over top-8 of 288 experts select ~58
-distinct experts, so those 2.4 GB/token are read either way; the ~3.3 GB of dense
-weight reads per token are shared. See `docs/perf.md`, "request-level batching".
+the tokens four serial runs do (`tests/glm5_batch_test.cpp`). Every request is
+built and evaluated on the scheduler's own thread - MLX streams are thread-local,
+so serving from an HTTP worker thread cannot work - and `--batch 0` is that
+thread's serial mode.
+
+The routed experts are the part batching cannot amortize by itself: 8 rows over
+top-8 of 288 experts select ~58 distinct experts, so those ~2.4 GB/token are read
+either way, while the ~3.3 GB of dense weight reads per token are shared. The
+step's B*K (row, expert) pairs are therefore executed in *expert order* (sorted by
+expert id, in chunks of 14/29 pairs per launch) so pairs sharing an expert run
+back to back and its tile is read from cache: bit-identical per pair (only the
+order changes) and worth 0-28% depending on the cell, but the mixed-prompt rate
+still sits on a line set by the number of distinct experts - 19.3 tok/s aggregate
+at B=8 with 4 distinct prompts against 29.7 tok/s with one. Measured gradients,
+tables and the honest reading: `docs/perf.md`, "expert-order pair execution" and
+"request-level batching".
 
 ## CLI
 
@@ -116,7 +128,7 @@ exl3-server --model /models/MiniCPM5-2B-EXL3-Quantized --serve --host 127.0.0.1 
 | `-p, --prompt TEXT` | generate from a prompt (repeatable) |
 | `-i, --interactive` | chat REPL (`/exit`, `/reset`, `/think`, `/nothink`, `/system TEXT`, `/raw TEXT`) |
 | `--serve`, `--host`, `--port` | HTTP server (default `127.0.0.1:8080`) |
-| `--batch N` | serve up to N concurrent requests through one fused decode step (GLM-5-Next only; default 8, `0` = serial) |
+| `--batch N` | serve up to N concurrent requests through one fused decode step (GLM-5-Next only; default 8, `0` = one request at a time through the serial path on the same scheduler thread) |
 | `--raw` | treat `--prompt` as a raw completion (no chat template) |
 | `--system TEXT` | system prompt for chat modes |
 | `--think` / `--no-think` | start the reply inside / outside a `<think>` block (default: empty think block) |

@@ -399,6 +399,74 @@ Two traps this pass walked into, both worth keeping:
 * the *test* of the batch was off by one row (a step's logits follow the token it
   was fed), which reads exactly like a wrong kernel.
 
+### Measured
+
+`tests/glm5_batch_test.cpp <model> 4 --bench`, two interleaved runs of the
+pre-dedup binary (best of 3 rounds inside each run; the same binary's two runs
+differ by up to 10% in the light cells and by 4x in the mixed-8 cell, which is
+the page-cache state - see the noise note below):
+
+| case | run A ms/step | run B ms/step | best | aggregate tok/s |
+|---|---|---|---|---|
+| B=1 serial (one stream, reference path) | 229.99 | 244.60 | 229.99 | 4.35 |
+| B=1 batch | 118.85 | 117.36 | 117.36 | 8.52 |
+| B=2 | 218.84 | 184.14 | 184.14 | 10.86 |
+| B=4 | 314.09 | 302.84 | 302.84 | 13.21 |
+| B=8 | 495.11 | 453.05 | 453.05 | 17.66 |
+| B=4, 1 prompt (shared routing) | 178.69 | 214.59 | 178.69 | 22.38 |
+| B=8, 1 prompt | 284.52 | 276.47 | 276.47 | 28.94 |
+| B=8, 2 prompts | 466.58 | 350.53 | 350.53 | 22.82 |
+| B=8, 8 prompts | 2270.35 | 589.52 | 589.52 | 13.57 |
+| B=16, 1 prompt | 538.83 | 442.95 | 442.95 | 36.12 |
+| B=16, 4 prompts | 560.91 | 498.25 | 498.25 | 32.11 |
+
+The four correctness gates in the same runs: one-slot batch vs serial
+max|logit diff| = **0**; four identical slots vs serial 0.0166-0.0176
+(0.065% of max|logit|) with rows bit-identical to each other; four different
+prompts vs four serial runs 0.3945-0.4453 (1.29-1.52%), token identity exact.
+The `<= 2%` identical-slots gate is green at 0.065% in both runs (and at both
+`steps 4` and `steps 6`) - the 1.99% this file recorded earlier is not
+reproducible on today's build, so both numbers are reported and the gate is
+left exactly as it was.
+
+The "prompts" column is the number of *distinct* prompts the rows are drawn
+from, i.e. how many distinct routings (and so experts) the step touches: see
+the sixth pass for what that gradient means.
+
+### The ceiling, from the byte model
+
+Split the per-token bytes of the budget above by whether a row shares the read:
+
+* **shared by every row** - qkv 1.7 GB, o_proj 0.6, the shared expert 0.53, the
+  lm_head 0.32, MLA + indexer ~0.3 - is **~3.4 GB per STEP**, not per token;
+* **routed experts** are ~0.34 GB per expert-set (2.7 GB / 8) times the number of
+  **distinct** experts the B x 8 selections touch. For B independent sequences
+  that is `288 * (1 - (1 - 8/288)^B)`: 8 at B=1, 15 at B=2, 28 at B=4, 57.6 at
+  B=8. The expert bytes per *token* therefore fall from 2.7 GB to only ~2.4 GB at
+  B=8 - the batch does not amortise them.
+
+So a step costs `3.4 + 0.34*D(B)` GB and the aggregate is `B / step_time`. At the
+trellis GEMV's own measured rate (150-170 GB/s on these shapes) and with the
+machinery cost ignored, that is:
+
+| B | distinct experts D(B) | GB/step | ms/step at 160 GB/s | aggregate tok/s |
+|---|---|---|---|---|
+| 1 | 8.0 | 6.1 | 38 | 26 |
+| 2 | 15.2 | 8.6 | 54 | 37 |
+| 4 | 28.0 | 12.9 | 81 | 49 |
+| 8 | 57.6 | 23.0 | 144 | 56 |
+| 16 | 104.8 | 39.0 | 244 | 66 |
+| 32 | 171.5 | 61.7 | 386 | 83 |
+
+Those are ceilings with *zero* machinery: 70 tok/s aggregate needs ~20 concurrent
+sequences **and** a step whose non-weight work is free. If the rows shared their
+routing (identical prompts, or experts deduplicated across rows), the expert term
+collapses to 2.7 GB and the same table reads 4.3/5.0/6.1/6.1/6.1/6.1 GB per step
+- 210 tok/s aggregate at B=8. That is why "expert dedup / expert-order pair
+execution" is the mechanism both reference engines lean on
+(`docs/research/mlx-serve.md` §5, `docs/research/omlx.md` T3), and why the
+measured numbers below are reported for both prompt regimes.
+
 ### What did NOT pay off
 
 * **A single grouped MoE launch per projection class**: blocked by Metal's
@@ -412,3 +480,398 @@ Two traps this pass walked into, both worth keeping:
 * **Speculative decoding inside the batch**: it is deliberately not enabled -
   `submit_batch` falls back to the serial path when a request asks for the MTP
   drafter, because the draft rows (and the rewind bookkeeping) are per sequence.
+
+## Fourth pass (2026-10-10): the GEMV's geometry, checked against the same-format reference
+
+`ddalcu/sushi`'s `exl3-module` (branch `exl3-module`, commit 4431513) runs the
+same EXL3 trellis format on the same class of machine and its docs quote **pair
+GEMV ~313 GB/s, down fused ~275 GB/s** against a 538 GB/s streaming peak, with
+the decode GEMVs described as *index-ALU bound, not DRAM bound*. This pass
+checked what of that applies to us. The instrument is `tests/glm5_trellis_bw.cpp`,
+which now measures the checkpoint's **real** shape classes (read from the shard
+headers, visual tower excluded), reports the raw QMV kernel separately from the
+two Hadamard dispatches, prints the row-block weight-pass count (so a multi-row
+cell's GB/s is not read as a DRAM rate) and reports the median of 5 repeats.
+
+### What the kernel actually is
+
+Per (16x16 output tile, k-tile) simdgroup-iteration the kernel retires ~110
+warp-instructions: 8 codeword decodes per lane (a 16-bit sliding-window extract,
+the mul1 multiply-hash and a half-precision fma), their 8 FMAs, 4 packed-word
+loads (2 per group of four weights), the 64-bit window shift and the loop's
+address math. On the 4096x24576 K4 tensor 393216 of those iterations run in
+0.168 ms, i.e. **256e9 warp-instructions/s - the machine's entire issue width**.
+The kernel's tile rate is therefore ~2.4e9 tiles/s (300 GB/s of 128-byte K4
+tiles, and 2.4e9*K/2 bytes/s for any K), which is the reference's 313 GB/s of K4
+tiles at 2.44e9 tiles/s to within 2%. **The GB/s difference between shapes is
+bytes per tile, not a kernel defect:** at the same tile rate a K2 tensor reads
+64 bytes/tile and delivers ~150 GB/s, and 22 of this model's 43 MoE layers are K2.
+
+### The fix: the tile/threadgroup geometry rule
+
+`pick_geom` (src/trellis_gemm.cpp) replaces the old auto rule, which picked
+`nt=16` for the lm_head's 9680 output tiles (mb*nt = 16 -> 128 accumulator
+registers, a spill) and `nt=1` for every tensor with <=1024 output tiles (where
+the per-iteration activation load, its two shuffles and the loop's address math
+are a third of the work). The new rule takes the largest power of two that stays
+inside the register budget (mb*nt <= 4) and leaves ~2048 simdgroups in flight.
+**Only nt and mb moved. The k-split count remains a function of (k_tiles,
+n_tiles) and nothing else, because it is part of the f32 association the caller
+sums with `mx::sum` - changing it would not be bit-identical.**
+
+Raw QMV, same session, interleaved builds (old rule vs new), 64 iterations per
+graph, median of 5, best of 2 rounds:
+
+| shape (real checkpoint geometry) | rows | before ms | after ms | speedup | before GB/s | after GB/s |
+|---|---|---|---|---|---|---|
+| lm_head 4096x154880 K6 | 1 | 2.44 | 1.05 | **2.32x** | 193 | 450 |
+| lm_head 4096x154880 K6 | 2 | 13.28 | 1.27 | **10.5x** | 34 | 362 |
+| exp8 gate\|up+down (8 members, one launch each) | 1 | 0.308 | 0.241 | **1.28x** | 160 | 202 |
+| exp8 gate\|up+down K2 | 1 | 0.297 | 0.228 | **1.31x** | 109 | 134 |
+| exp8 gate\|up+down K3 | 2 | 0.400 | 0.315 | **1.27x** | 119 | 149 |
+| dense gate/up 4096x12288 K3 (nt 1 -> 2) | 1 | 0.1193 | 0.1130 | 1.06x | 150 | 163 |
+| mla q_b 1536x16384 K4 (nt 1 -> 2) | 1 | 0.0565 | 0.0485 | 1.16x | 210 | 239 |
+| kda qkv_proj 4096x24576 K4 (nt was already 2) | 1 | 0.1690 | 0.1726 | 1.00 | 283 | 289 |
+| mla o_proj 16384x4096 K4 (nt unchanged) | 1 | 0.1424 | 0.1424 | 1.00 | 215 | 215 |
+| exp gate 4096x2048 K3, single tensor (nt unchanged) | 1 | 0.0237 | 0.0237 | 1.00 | 133 | 133 |
+| f16 matmul 4096x24576 (MLX's own GEMV, same bytes) | 1 | 0.60 | 0.60 | - | 327 | 327 |
+
+The cells marked 1.00 are shapes whose geometry the new rule leaves alone; their
+apparent 1.08-1.19x in the first cut of this table was box drift.
+
+### The component-level end-to-end effect (tests/moe_bench.cpp, real checkpoint)
+
+Two interleaved rounds of `moe_bench 20 1 <model>`, best and median ms per call,
+minus the `null` row (one elementwise op + sync: 0.126/0.140 before,
+0.114/0.124 after, i.e. the "after" runs were ~10% faster on the box, so the
+raw ratios overstate every win by about that much):
+
+| component | before (best/median) | after | after, null-adjusted |
+|---|---|---|---|
+| lm_head (trellis, real vocab) | 2.792 / 2.882 | 1.494 / 1.510 | **1.98x** |
+| 3 grouped linears gate/up/down (one MoE layer's GEMVs) | 0.601 / 0.662 | 0.535 / 0.560 | 1.20x |
+| full moe_layer (shipped path, + ids eval) | 0.876 / 0.949 | 0.813 / 0.853 | 1.11x |
+| 2nd MoE layer (layer 12, its own K) | 0.992 / 1.090 | 0.926 / 0.964 | 1.13x |
+| 8x grouped QMV over 8 layers (real bytes) | 1.347 / 1.421 | 1.231 / 1.264 | 1.12x |
+| 8x raw QMV in one eval (independent) | 1.226 / 1.285 | 1.009 / 1.043 | 1.25x |
+| shared expert (K4; geometry unchanged) | 0.234 / 0.283 | 0.231 / 0.250 | ~1.1x (noise) |
+| kda_layer (geometry unchanged) | 0.813 / 0.890 | 0.796 / 0.835 | 1.05x (noise) |
+| mla_layer (geometry unchanged) | 1.581 / 1.690 | 1.545 / 1.589 | 1.06x (noise) |
+
+That is **~5 ms/token** (lm_head 1.4 ms + 42 MoE layers x ~0.08 ms), i.e. ~3-4%
+of the 116-160 ms step - and the whole-step instrument cannot resolve it: the
+four interleaved `glm5_bench` runs of this window read 237.7/147.6 ms/step for
+the old build and 208.8/202.7 for the new one (serial BEST 4.21/6.78 vs
+4.79/4.93 tok/s; `--draft-mtp 4` 104.6/168.4 vs 120.1/144.7 ms/step), i.e. the
+same binary's two rounds differ by 1.6x. Report the component rows, not the
+step, for a change of this size. `moe_bench`'s real-layer identity line stays
+BIT-IDENTICAL (`prepared == old-grouped == general` on layer 4's 2.7 GB).
+
+### Bit-identity gates (all green this pass)
+
+| gate | command | result |
+|---|---|---|
+| decode vs the reference decoder + the byte-alignment contract, real tensors (lm_head K6 634M elements, qkv K4, q_b K4, expert gate K3) | `/tmp/glm5_exl3_decode_test <model>` | `trellis decode: PASS`, 0 mismatches everywhere, rc=0 |
+| forward / prefill-vs-decode invariant + greedy text | `/tmp/glm5_forward_test <model>` | rc=0, first token 785 (the recorded one) |
+| grouped == per-expert == general, hashes | `/tmp/moe_test` | rc=0, all three `eebe4e4e51c6c683` |
+| real-layer MoE identity on 2.7 GB | `moe_bench 20 1 <model>` | `60ad94aefeb44530` for prepared / old-grouped / general |
+| greedy text across the old and new builds | 4 interleaved `glm5_bench` runs | 1 distinct text (identical) |
+| kernel output hashes over the 25 real tensor classes x rows {1,2,3,13,26} (raw QMV + trellis_linear, 250 hashes) | `/tmp/glm5_gemv_nt_test` | byte-identical to the pre-change kernel (HEAD~1) |
+| nt/mb scheduling inertness (8 shapes x 6 row counts x 12 configs + grouped/scale-stack forms) | `/tmp/glm5_gemv_nt_test` | PASS |
+
+### Honest distance to the reference, and what is left
+
+- The reference's 275-313 GB/s is a K4-class figure and we now match it: qkv 308,
+  lm_head 450-476, mla/kda o_proj 300-325 GB/s. On the K2/K3 tensors that
+  dominate this model the same 2.4e9 tiles/s yields 134-202 GB/s, and that is
+  arithmetic, not memory: 8 decodes x ~11 instructions per 8 weights at rows=1,
+  plus one FMA each. Halving that would be needed to approach DRAM peak, and the
+  reference's own notes rule out "ALU trims in the MUL1 decode".
+- Rows > 1 amortise the decode over mb rows and are the only lever on bytes per
+  weight at fixed format: at rows 13/26 the kernel runs at ~200-215 GB/s of
+  actual DRAM traffic (the printed x4/x7 pass count), which is what a verify
+  batch pays per row block.
+- The remaining gap is not in this kernel: a 0.83-0.95 ms MoE layer is ~0.5 ms of
+  GEMV and the rest is the Hadamard + dispatch + reduce tail. Folding the input
+  Hadamard into the QMV (the reference's `pair GEMV prepare`: the same 128-thread
+  butterfly, so bit-identical by construction) is the next kernel-side step,
+  worth ~1 of 3 dispatches per linear, i.e. ~2 us x ~1450 linears/token.
+
+### Did not pay off (measured this pass; do not retry blind)
+
+- **Raising the k-split count together with nt** (to buy parallelism for small
+  tensors): not bit-identical, because it changes the split-sum association, and
+  it measured no faster.
+- **nt=8/16** (mb*nt = 64/128 accumulator registers): grouped K2 148 -> 105 GB/s,
+  lm_head 476 -> 342/218 GB/s.
+- **nt=4 on the big single tensors**: 4096x24576 loses 17% (266 against 317 GB/s)
+  - 384 threadgroups is one wave.
+- **Forcing nt>1 on the small single tensors** (f_a 4096x256, mla kv_a 4096x512,
+  a *single* 4096x2048 expert shape): within +-1% of nt=1. Those grids are
+  latency/dispatch bound (`f_a` is 0.5 MB and its kernel is ~9 us, of which the
+  tile loop is ~2 us), so they need the `multi_qmv` treatment - several small
+  projections of the same layer in one launch - which is plumbing, not kernel
+  work.
+- **The codebook as a device table** (`EXL3_QMV_LUT=1`, tried and removed in this
+  pass): a 65536-entry fp16 table of `codebook_value` (src/exl3.cpp's own
+  builder) with the mul1 multiply-hash replaced by one gather, the one
+  codebook-level lever that had a measurable ceiling (the whole codebook is 23%
+  of the kernel under the `EXL3_QMV_NODECODE` control). It is **bit-exact** -
+  `tests/glm5_gemv_nt_test.cpp` compares both paths in-process over the 25 real
+  classes x rows (250 hashes, ok) and `glm5_exl3_decode_test` with the knob on
+  reports 0 mismatches over the real checkpoint's lm_head (634,388,480 elements)
+  and three more tensors - and **1.5-3.4x slower** at rows 1: lm_head 1.03 ->
+  3.46 ms, qkv 0.167 -> 0.527, exp8 gate|up+down K3 0.238 -> 0.759, single exp
+  gate K3 0.0240 -> 0.0525, dense 0.104 -> 0.277, f_a 0.0087 -> 0.0131. The tell
+  is the tile rate: 2.2-2.4e9 tiles/s for the arithmetic becomes a flat
+  ~0.6-0.75e9 for every K, i.e. the kernel turns latency-bound on the table. A
+  128 KiB table cannot be cached where ~10 ALU ops live, and each of the eight
+  gathers per lane-tile is an L2 round trip on the critical path, so no table can
+  pay for itself against this codebook's arithmetic.
+- Prior passes' negatives still stand and were not revisited: the simdgroup
+  shuffle word fetch, the per-lane window layout, mb=8/nt=4 variants.
+
+## Sixth pass (2026-10-10): expert-order pair execution, and the serving thread
+
+Two independent pieces of work: the MoE batch's work items now execute in expert
+order (the mechanism oMLX's `moe_verify_gather` transcribes, `docs/research/
+omlx.md` §B), and the HTTP serving path - which served *nothing* - was
+reproduced, explained and fixed.
+
+### 1. Expert-order pair execution (`src/glm5_moe.cpp`)
+
+A step has B*K (row, expert) pairs. `moe_layer_rows` used to walk them in routing
+order, one grouped launch per rank, so an expert that two rows selected had its
+weights streamed once per row. It now sorts the pairs by expert id and executes
+that list: pairs sharing an expert run back to back and its tile is read from
+cache for all but the first of them.
+
+Only the ORDER changes, which is what keeps it in the bit-exact layer: each pair
+is still one `rows=1` member of a grouped launch with its own weight buffer and
+its own slice of the prepared scale stacks, so the kernel's tile geometry,
+k-order and f32 split sum are the ones that pair had before, and a `take` (a pure
+move) puts the per-pair results back into the rank-major `(K, B, 1, H)` stack the
+weighted sum consumes exactly as it did. The chunking is over the *pair list*
+(14 pairs per merged gate|up launch, 29 per down launch - the 31-buffer limit),
+not over B, so the old `2*B <= 29` bound is gone and the path now covers any
+batch width, including the 13-16 rows a matrix-unit kernel would need.
+
+Measured on the real checkpoint, `tests/glm5_batch_test.cpp <model> 4 --bench`,
+four interleaved processes (old, new, new, old; best of 3 rounds inside each
+process - the reported number - and both processes shown because the box's
+page-cache state moves the heavy cells by up to 10% and one old cell by 4x):
+
+| case (distinct prompts) | before ms/step | after ms/step | before tok/s | after tok/s | change |
+|---|---|---|---|---|---|
+| B=1 serial (reference path) | 230.0 / 244.6 | 225.6 / 272.2 | 4.35 | 4.43 | - |
+| B=1 batch (4) | 118.9 / 117.4 | 118.3 / 113.7 | 8.52 | 8.80 | +3% |
+| B=2 (4) | 218.8 / 184.1 | 197.8 / 179.3 | 10.86 | 11.15 | +2.7% |
+| B=4 (4) | 314.1 / 302.8 | 303.1 / 310.6 | 13.21 | 13.20 | ~0 |
+| B=8 (4) | 495.1 / 453.1 | 468.6 / 414.9 | 17.66 | **19.28** | **+9.2%** |
+| B=4 (1, shared routing) | 178.7 / 214.6 | 180.6 / 176.6 | 22.38 | 22.65 | +1.2% |
+| B=8 (1, shared routing) | 284.5 / 276.5 | 405.6 / 269.5 | 28.94 | 29.69 | +2.6% (cell noisy: 405.6) |
+| B=8 (2) | 466.6 / 350.5 | 434.3 / 321.4 | 22.82 | 24.89 | +8.3% |
+| B=8 (8) | 2270.4 / 589.5 | 510.8 / 461.9 | 13.57 | **17.32** | **+27.6%** |
+| B=16 (1, shared routing) | 538.8 / 443.0 | 567.3 / 472.4 | 36.12 | 33.87 | -6.7% |
+| B=16 (4) | 560.9 / 498.3 | 558.5 / 507.3 | 32.11 | 31.54 | -1.8% |
+
+**The honest reading of that table.** The mechanism can only remove *duplicated*
+expert reads, and at B=8 with 8 distinct routings there are 64 pairs over 57.6
+distinct experts: 10% of the expert reads, i.e. at most ~4% of the step. The
+measured +27.6% in that cell is therefore NOT the ordering - it is the launch
+change that came with it (16 launches per layer in the old per-rank split, 8 in
+the sorted chunks, with 28 members instead of 16 per gate|up launch), and the
+cell is the noisiest one in the table (the page-cache state at the highest expert
+count). The B=16 cells, where the launch count did not change as much, are within
+noise or slightly worse. So: expert-order execution is neutral-to-better and
+cheap, but it is not what closes the mixed/same-prompt gap - and the gradient
+below says what is.
+
+**The sizing measurement: what the mixed/same-prompt gap actually is.** The
+added "distinct prompts" axis separates expert-set size from everything else. At
+B=8, after the change (best of two processes):
+
+| distinct prompts | expected distinct experts | ms/step | aggregate tok/s |
+|---|---|---|---|
+| 1 (all rows share one routing) | 8 | 269.5 | 29.69 |
+| 2 | 15 | 321.4 | 24.89 |
+| 4 | 30 | 414.9 | 19.28 |
+| 8 (one per row) | 58 | 461.9 | 17.32 |
+
+Each extra ~15 distinct experts costs 65-95 ms/step at B=8: that is the expert
+term, and it is *linear in the number of distinct experts*, not in the number of
+pairs. Row blocking of a duplicated expert (one member with `rows=r` per expert,
+ceil(r/4) weight passes instead of r - `mb = min(rows, 4)` - so 16 rows of one
+expert are 4 passes instead of 16) is the only thing that can cut it, and it pays
+off exactly in the shared-routing regime. Ordering cannot: it removes reads, not
+distinct experts.
+
+Row count: at a fixed routing (1 prompt) the aggregate is 22.4 (B=4) -> 29.7
+(B=8) -> 33.9 (B=16) tok/s, i.e. the marginal row costs ~23-25 ms and the
+marginal gain is falling. The best aggregate measured anywhere in this pass is
+**33.9 tok/s (B=16, one prompt)** and 31.5 tok/s (B=16, 4 prompts).
+
+### 2. The serving thread: the server served nothing
+
+Reproduction, on the tree before the fix, on the real checkpoint (engine-level,
+no httplib, so nothing but the engine can explain it):
+
+* `start_batch(0)` + 4 concurrent `submit_batch`: **4/4 requests threw**
+  `There is no Stream(gpu, 0) in current thread.` after 22-30 ms - stream 0 is
+  the thread that loaded the model.
+* `start_batch(4)` + 4 concurrent `submit_batch`: the scheduler thread died on
+  its first `batch_join` (`engine: batch worker stopped: There is no Stream(gpu,
+  2) in current thread.`), its catch returned without answering anything, and all
+  4 submitters waited forever - the probe's watchdog had to kill the process
+  after reporting 4/9 requests completed. This is the deadlock the ticket's run
+  hit: the next request after a failed one blocks in `submit_batch`'s `p->cv.wait`
+  on a scheduler that no longer exists.
+* the same failure through HTTP was the 500 body in
+  `/tmp/exl3_batch_server/w_0.json` (arriving in 0.029 s).
+* and the run produced *nothing* even after the requests were answered: the
+  bench script's `wave()` ended in a bare `wait`, which in bash waits for every
+  child of the shell - the server included, since `start_server` launches it in
+  the background from the same shell. The server never exits, so the first wave's
+  `wait` blocked forever with its response files already complete (reproduced:
+  `/tmp/exl3_sweep/w_0.json` finished, 24 tokens, `w_0.time` 34.08s, no wave
+  summary ever printed). Two independent bugs, one symptom.
+
+Mechanism:
+
+* MLX binds a `Stream` to the thread that created it (`mlx/backend/
+  metal/device.cpp`: `get_command_encoder` looks the stream up in a thread-local
+  encoder map and throws if it is not there). The loader's trellis weights were a
+  lazy `slice -> view -> reshape` chain over each shard's page-aligned mapping,
+  deliberately left unevaluated - every step of it is metadata-only
+  (`slice()` is `shared_buffer_slice`, `View`/`Reshape` `copy_shared_buffer`, no
+  allocation, the words stay a zero-copy view) - so the weights carried the
+  loading thread's stream into every request served on an httplib worker.
+* the hang: the scheduler thread died on its first request (the exception
+  escaped `batch_join`), and `Engine::batch_worker`'s catch set `batch_stop_` and
+  returned without answering the live requests or the queue, so every later
+  `submit_batch()` waited forever on `p->cv` that nobody would notify.
+
+After the fix, the same probe: **9/9 requests** complete (4 through `--batch 0`'s
+serial mode, 4 fused through `--batch 4`, one stopped mid-flight), rc=0 - and the
+fused four take 4.5-4.7 s where the serial mode's four take 13.6-27.9 s.
+
+Fix:
+
+* `mx::eval()` the trellis view where it is built: resolves it on the loading
+  thread, zero-copy and zero-cost (MLX active memory after load is 101 GB for
+  104.7 GB of used weights, before and after).
+* one inference thread: the scheduler thread serves every request now, including
+  `--batch 0` (its serial mode, one request at a time through `generate()`) and
+  the requests that cannot be batched (MTP draft rows, empty prompts), instead of
+  whichever HTTP worker picked the request up.
+* the scheduler's exit path answers everything it holds, releases the live batch
+  slots (without that reset the next user of `batch_step()` sees a stale slot
+  count - this pass's own test caught it) and clears its liveness flag under the
+  queue lock, so a submit that races the exit either enqueues into a live
+  scheduler or is served on its own thread; a failed cycle answers live + queued
+  requests and keeps the worker alive.
+
+After: 4 concurrent requests from fresh threads all complete; 9/9 requests across
+`--batch 0/4/8` complete; `stop_batch()` with a request in flight returns in
+0.02-1.1 s. `tests/glm5_batch_test.cpp` section 4 is the permanent gate: two
+concurrent requests through the scheduler must equal their serial runs, and
+stopping the scheduler with a request in flight must return.
+
+### 3. The N-sweep through HTTP
+
+`MAXTOK=8 REPS=1 CONC_LIST="1 4 8" WARM=1 tools/batch_server_bench.sh`, two
+interleaved rounds (the sweep FINALLY produced numbers - the bare `wait` in
+`wave()` was the reason it never had):
+
+| round / setting | conc | wall s | completion | aggregate tok/s | per-request latencies s |
+|---|---|---|---|---|---|
+| 1, `--batch 0` | 1 | 22.76 (warm-up) | 8 | 0.35 | 22.72 |
+| 1, `--batch 0` | 1 | 1.61 | 8 | 4.96 | 1.58 |
+| 1, `--batch 0` | 4 | 24.65 | 32 | 1.30 | 1.60 8.72 15.79 24.60 |
+| 1, `--batch 0` | 8 | 49.68 | 64 | 1.29 | 5.79 ... 49.62 |
+| 1, `--batch 8` | 1 | 20.40 (warm-up) | 8 | 0.39 | 20.36 |
+| 1, `--batch 8` | 1 | 1.56 | 8 | 5.12 | 1.53 |
+| 1, `--batch 8` | 4 | 28.19 | 32 | 1.13 | 25.82 28.14 28.14 28.14 |
+| 1, `--batch 8` | 8 | 54.26 | 64 | 1.18 | 50.44 ... 54.19 |
+| 2, `--batch 0` | 1 | 20.76 (warm-up) | 8 | 0.39 | 20.72 |
+| 2, `--batch 0` | 1 | 1.75 | 8 | 4.57 | 1.72 |
+| 2, `--batch 0` | 4 | 26.21 | 32 | 1.22 | 1.69 8.98 16.90 26.15 |
+| 2, `--batch 0` | 8 | 50.31 | 64 | 1.27 | 3.87 ... 50.24 |
+| 2, `--batch 8` | 1 | 21.15 (warm-up) | 8 | 0.38 | 21.11 |
+| 2, `--batch 8` | 1 | 1.60 | 8 | 5.00 | 1.57 |
+| 2, `--batch 8` | 4 | 21.71 | 32 | 1.47 | 20.96 21.65 21.66 21.66 |
+| 2, `--batch 8` | 8 | 50.14 | 64 | 1.28 | 46.00 ... 50.08 |
+
+Three things in that table, and only the first is about batching:
+
+* **the server works now**: every wave returns a real completion, and `--batch
+  8` fuses - the 8 requests of a conc-8 wave finish *together* (46-54 s, six of
+  them exactly equal) where `--batch 0` serializes them (3.9 -> 50.2 s, strictly
+  increasing). The engine-level numbers match the in-process instrument
+  per-request: a warm single request is 1.56-1.75 s for a 26-token prefill plus 8
+  decode tokens, i.e. ~0.2 s/step, which is this box's serial decode rate;
+* **the box, not the server, sets the level**: the same request costs 20-23 s as
+  the wave's warm-up (first pass over the step's weight pages) and 1.6 s
+  immediately afterwards - a 13x spread on identical work. With a 105 GB
+  checkpoint on a 128 GB machine the step's expert pages are evicted between
+  waves, so a served step whose experts are cold runs at the external SSD's
+  2.6 GB/s instead of the GPU's 130-200 GB/s (docs/perf.md's own warning, and the
+  reason `WARM=1` exists). The conc-4/8 aggregates (1.1-1.5 tok/s) are
+  therefore *SSD-bound end-to-end latencies*, not the fused step's rate: they are
+  not comparable with the in-process table above, which measures a warm step with
+  the prefill excluded and takes the best of 3 rounds;
+* **the prefill is a real part of the served latency and was never in the
+  in-process numbers**: 26 prompt tokens + 8 decode tokens = 1.6 s warm, and the
+  prefill of a joining request is run on the scheduler thread (one chunked
+  forward per join), so a wave of N requests pays N prefills end to end. Nothing
+  in this pass changed that; it is the next thing the served path would need if
+  the HTTP rate rather than the step rate is the target.
+
+An honest note on the sweep's precision: with one wave per cell and a page-cache
+state that the 4 server starts keep changing, the conc-4/8 cells move by ~30%
+between rounds; the conc-1 cells (1.56-1.75 s) and the warm-up/steady ratio are
+the parts that reproduce.
+
+### Gates (real checkpoint, one session)
+
+| gate | where | result |
+|---|---|---|
+| one-slot batch == serial decode | `glm5_batch_test` §1 | max abs logit diff = **0** |
+| four identical slots == serial | §2 | 0.0166-0.0176 = **0.065%** of max\|logit\|, rows bit-identical to each other; the `<= 2%` gate is GREEN (the 1.99% recorded in the fifth pass is not reproducible at `steps 4` or `steps 6`; the gate itself is untouched) |
+| four different prompts == four serial runs | §3 | token identity at every step and argmax identity every step; max abs logit diff 0.3945-0.4453 = 1.29-1.52% (gate 5%) |
+| serving thread | §4 | see above |
+| grouped == per-expert == general (hash) | `moe_test` (f) | `eebe4e4e51c6c683` for all three, as recorded |
+| rows path == N single-row calls, and == the general path | `moe_test` (g) 4 rows, (h) 11 rows = 33 pairs over 4 experts (three gate\|up chunks, two down chunks, every expert selected several times) | max \|row diff\| = **0** in both, vs single-row and vs general |
+| nt/mb scheduling + 25 real shapes x rows {1,2,3,13,26} (250 hashes) | `glm5_gemv_nt_test` | `nt/mb invariance: PASS` rc=0; `src/trellis_gemm.cpp` and the harness are byte-identical to the run the hashes were recorded from (`git diff a6b8d51 -- src/trellis_gemm.cpp tests/glm5_gemv_nt_test.cpp` is empty), so the table cannot have moved |
+| prefill vs incremental decode | `glm5_forward_test <model>` | max\|diff\| = 0.0352 on max\|logit\| 23 (relative 0.00153), argmax 785 vs 785, top-5 overlap 5/5 |
+| greedy text + first token | `glm5_forward_test` | first token 785, greedy 32-token text identical to the recorded run; rc=0 |
+| trellis decode vs the reference decoder + byte alignment (lm_head K6 634M elements, qkv K4, q_b K4, expert gate K3) | `glm5_exl3_decode_test <model>` | `trellis decode: PASS`, 0 mismatches |
+| the light suite (routing, grouped MoE, KDA rewind/recurrence, MLA incremental, indexer, hc, chat template, pretokenizer) | `tools/run_tests.sh --fast` | all PASS, `== done (rc=0) ==` |
+
+### Honest distance to 70 tok/s
+
+The best aggregate measured in this pass is 33.9 tok/s (B=16, shared routing) and
+31.5 tok/s (B=16, 4 prompts) - 45-48% of the target, and B=8 mixed-prompt moved
+17.7 -> 19.3 tok/s. Two things stand in the way, and the first is not about
+bandwidth:
+
+1. **Per-weight ALU.** The trellis GEMV spends 0.43 issued warp-instructions per
+   weight, which is the machine's entire issue width (fourth pass) - the mixed
+   case is bound by *work*, not by the weight bytes (a mixed B=8 step's ~5.8 GB
+   at the kernel's own 134-202 GB/s would be ~30-45 ms of its ~460).
+   `docs/research/mlxfast-bonsai2.md`
+   measures the escape (packed stream -> int8 threadgroup tiles -> simdgroup
+   matrices, or a native packed tensor op), and it needs 13-16 rows: that is why
+   this pass made the pair layout free of any B bound and measured B=16. It is
+   the order-of-magnitude lever.
+2. **A real dedup, not an ordering.** One member with `rows=r` per expert turns
+   r duplicate pairs into ceil(r/4) weight passes - the only way to cut the ALU
+   work a duplicated expert costs, and the exact regime where the shared-routing
+   row is 1.7x the mixed one. It has no gate yet:
+   `trellis_linear_group_rows(rows=R)` has never been checked per row against R
+   single-row calls, and the MoE path must not use it before that gate exists
+   (its per-row k-order is presumably the same, but "presumably" is not the
+   standard here).
+3. **The per-row machinery.** At a fixed routing the marginal row costs ~23-25 ms
+   (B=4 -> B=16: 176.6 -> 472.4 ms), so the aggregate saturates near 34 tok/s
+   long before the expert term (or 70 tok/s) is reached.
