@@ -24,6 +24,10 @@ class Tokenizer {
   // ids; everything else goes through the pre-tokenizer and BPE.
   std::vector<int> encode(const std::string& text, bool add_bos = false) const;
 
+  // Pre-tokenizer output only (diagnostics/tests): the pieces BPE then works
+  // on, which must not cross any piece boundary.
+  std::vector<std::string> pretokenize(const std::string& text) const;
+
   // Full decode (invalid UTF-8 becomes U+FFFD). Special tokens are skipped when
   // skip_special is set.
   std::string decode(const std::vector<int>& ids, bool skip_special = true) const;

@@ -142,10 +142,16 @@ Pre-tokenizer chain (single stage, unlike the MiniCPM5 checkpoint):
 **Required engine change**: `Tokenizer::encode` currently hardcodes the two-stage
 split used by MiniCPM5 (a separate `\p{N}{1,3}` stage followed by the word regex).
 GLM collapses that into one alternation in a single Split stage, so the tokenizer
-must interpret the `pre_tokenizer` chain from `tokenizer.json` (Split with the
-given regex + ByteLevel, in order) instead of hardcoding the stage layout. The
-GPT-4 alternation itself - including the `\p{N}{1,3}` branch - is already
-implemented in the matcher, so this is a plumbing change, not new regex work.
+**DONE** - `Tokenizer::load` now interprets the chain: each `Split` stage's
+regex is classified (a pure digit rule vs the word regex) and its digit cap is
+read from `\p{N}{1,N}` (uncapped `\p{N}+` = 0), so GLM's single-Split chain
+(with `\p{N}{1,3}` embedded in the word alternation) and MiniCPM5's
+`\p{N}{1,3}` + word-regex pair both produce the same boundaries. Verified by
+`tests/pretokenizer_test.cpp` against both models' real `tokenizer.json`:
+`x1234567890y` -> `[x][123][456][789][0][y]` for both, plus encode/decode
+round-trips. (Note: the *post-BPE* tokens differ between the two vocabularies -
+GLM merges `456` as `45`+`6` - which is why the test asserts on pre-token
+boundaries via the new `Tokenizer::pretokenize`, not on token strings.)
 
 ## Chat template (from the checkpoint's `chat_template.jinja`)
 

@@ -181,6 +181,24 @@ static const std::unordered_map<uint32_t, uint8_t>& cp_to_byte_table() {
 }
 
 // ---------------------------------------------------------------------------
+// Pre-tokenizer chain, interpreted from tokenizer.json's `pre_tokenizer`
+// (Sequence of Split + ByteLevel). Configs differ in how the digit branch is
+// expressed, so the chain is read rather than hardcoded:
+//   MiniCPM5: Split(\p{N}{1,3}) then Split(word regex with \p{N}+)
+//   GLM-5.3:  one Split whose word regex embeds \p{N}{1,3}
+// A process holds one tokenizer, so the parsed chain is file-local.
+struct PreTokStage {
+  bool digits; // true: the stage's whole pattern is the digit rule
+  int limit;   // max digits per match; 0 = unbounded (\p{N}+)
+};
+static std::vector<PreTokStage> g_pretok_stages;
+
+static const std::vector<PreTokStage>& pretok_stages() {
+  static const std::vector<PreTokStage> kDefault = {{true, 3}, {false, 0}};
+  return g_pretok_stages.empty() ? kDefault : g_pretok_stages;
+}
+
+// ---------------------------------------------------------------------------
 // Pre-tokenizer: Split(\p{N}{1,3}) then the GPT-4 style word regex
 //   (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}+|
 //    ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
@@ -333,13 +351,37 @@ void split_digits(const std::string& s, std::vector<std::pair<size_t, size_t>>& 
   if (run_start < n) out.emplace_back(run_start, n);
 }
 
-void split_word_regex(const std::string& s, std::vector<std::pair<size_t, size_t>>& out) {
+void split_word_regex(const std::string& s, std::vector<std::pair<size_t, size_t>>& out,
+                      int digit_limit);
+
+// Run the parsed pre-tokenizer chain over one chunk, yielding byte ranges.
+void pretok_chain(const std::string& chunk, std::vector<std::pair<size_t, size_t>>& out) {
+  out.assign(1, {0, chunk.size()});
+  std::vector<std::pair<size_t, size_t>> next;
+  for (const auto& st : pretok_stages()) {
+    next.clear();
+    for (auto& [a, b] : out) {
+      if (b <= a) continue;
+      const std::string sub = chunk.substr(a, b - a);
+      std::vector<std::pair<size_t, size_t>> parts;
+      if (st.digits) split_digits(sub, parts);
+      else split_word_regex(sub, parts, st.limit);
+      for (auto& pr : parts) next.push_back({a + pr.first, a + pr.second});
+    }
+    out.swap(next);
+  }
+}
+
+void split_word_regex(const std::string& s, std::vector<std::pair<size_t, size_t>>& out,
+                      int digit_limit = 0) {
   const size_t n = s.size();
   size_t p = 0;
   while (p < n) {
     size_t e = match_contraction(s, p);
     if (e == kNPos) e = match_letters(s, p);
     if (e == kNPos) e = match_numbers(s, p);
+    // the regex's digit branch may be capped (\p{N}{1,N}) instead of unbounded
+    if (e != kNPos && digit_limit > 0 && e - p > (size_t)digit_limit) e = p + (size_t)digit_limit;
     if (e == kNPos) e = match_punct(s, p);
     if (e == kNPos) e = match_space_crlf(s, p);
     if (e == kNPos) e = match_space_no_nonspace(s, p);
@@ -429,6 +471,43 @@ bool Tokenizer::load(const std::string& dir, std::string& err) {
       return false;
     }
   }
+  // Interpret the pre-tokenizer chain; on any problem keep the built-in
+  // (MiniCPM5-style) defaults.
+  try {
+    std::ifstream f(dir + "/tokenizer.json");
+    if (f) {
+      auto tj = nlohmann::json::parse(f, nullptr, false);
+      auto pt = tj.contains("pre_tokenizer") ? tj["pre_tokenizer"] : nlohmann::json();
+      if (pt.is_object() && pt.value("type", "") == "Sequence") pt = pt["pretokenizers"];
+      if (pt.is_array()) {
+        std::vector<PreTokStage> stages;
+        for (const auto& st : pt) {
+          if (st.value("type", "") != "Split") continue; // ByteLevel: already unconditional
+          std::string re = st.contains("pattern") && st["pattern"].is_object()
+                               ? st["pattern"].value("Regex", "")
+                               : "";
+          if (re.empty()) { stages.clear(); break; }
+          PreTokStage out{false, 0};
+          auto pos = re.find("\\p{N}");
+          if (pos != std::string::npos) {
+            auto brace = re.find("{1,", pos);
+            if (brace != std::string::npos) {
+              out.limit = std::atoi(re.c_str() + brace + 3);
+            } else {
+              out.limit = 0; // \p{N}+
+            }
+            out.digits = re.find("\\p{L}") == std::string::npos;
+          } else {
+            out.limit = 3;
+          }
+          stages.push_back(out);
+        }
+        if (!stages.empty()) g_pretok_stages = stages;
+      }
+    }
+  } catch (const std::exception&) {
+    g_pretok_stages.clear();
+  }
   return true;
 }
 
@@ -504,6 +583,14 @@ void Tokenizer::bpe(const std::string& segment, std::vector<int>& out) const {
 // Encoding
 // ---------------------------------------------------------------------------
 
+std::vector<std::string> Tokenizer::pretokenize(const std::string& text) const {
+  std::vector<std::pair<size_t, size_t>> segs;
+  std::vector<std::string> out;
+  pretok_chain(text, segs);
+  for (auto& [a, b] : segs) out.push_back(text.substr(a, b - a));
+  return out;
+}
+
 std::vector<int> Tokenizer::encode(const std::string& text, bool add_bos) const {
   std::vector<int> ids;
   if (add_bos) {
@@ -513,21 +600,10 @@ std::vector<int> Tokenizer::encode(const std::string& text, bool add_bos) const 
   if (text.empty()) return ids;
 
   const auto& b2c = byte_to_cp_table();
-  std::vector<std::pair<size_t, size_t>> segs, words;
+  std::vector<std::pair<size_t, size_t>> words;
 
   auto emit_plain = [&](const std::string& chunk) {
-    segs.clear();
-    words.clear();
-    split_digits(chunk, segs);
-    for (auto& [a, b] : segs) {
-      size_t before = words.size();
-      split_word_regex(chunk.substr(a, b - a), words);
-      // remap to absolute offsets
-      for (size_t i = before; i < words.size(); ++i) {
-        words[i].first += a;
-        words[i].second += a;
-      }
-    }
+    pretok_chain(chunk, words);
     for (auto& [a, b] : words) {
       std::string encoded;
       encoded.reserve(b - a);
