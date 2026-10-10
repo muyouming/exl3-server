@@ -116,6 +116,7 @@ on an M3 Ultra)" (`README.md:84-88`).
 | MTP prompt priming | Feed the head the committed-history `(hidden[t], token[t+1])` pairs computed by the prefill forwards so its first drafts are not context-starved | `patches/mlx_lm_mtp/prompt_priming.py:3-10` | "MTPLX measured committed-history priming at 0.90 acceptance vs 0.26 unprimed on depth-1 real-code prompts" |
 | Depth control that parks | Adaptive depth uses the measured cost of the whole active batch; depth 0 runs the cycle as a plain 1-token step | `batch_generator.py:2509-2515`, `:2445-2446` | "the whole depth menu can be worse than standard decoding — measured 0.67x on gemma4 26B story/16k" |
 | Rollback bound as a depth cap | GLM-5.3 native MTP clamps at `_MAX_CHAIN_DEPTH = 7` because the indexer `PoolingCache` undo log only covers 8-row updates; DFlash blocks are capped at 16 | `patches/mlx_vlm_mtp/glm5_next_vlm_runtime.py:50-52`; `patches/deepseek_v4/cache_extras.py:21-22`; `patches/dflash_glm5.py:543-548` | structural, not a perf number |
+| Marginal cost of one verify row on a sparse-MoE target | The adaptive depth controller's prior measures what an extra verify row costs when routing is 8-of-256: "each extra verify row pulls an almost disjoint expert set (~55% of step bytes)" | `patches/mlx_lm_mtp/glm_moe_dsa_model.py:361-365` (`self._omlx_mtp_marginal_ms = 35.0`) | "**measured ~35 ms per row on GLM-5.2** vs the dense-backbone 7 ms default" — i.e. 5x the dense row cost, which is exactly the ceiling that expert-dedup/verify-shape kernels exist to lower |
 
 ### C. Attention / sparse / linear-attention layouts
 
@@ -222,7 +223,11 @@ portable as designs: a tiled kernel that dequantizes a weight tile once per thre
 against it; and — for MoE — **expert-ordered pair execution** so that at rows×top_k pairs the same expert's tile is
 read once instead of once per pair (`moe_verify_gather.py:4-15`), plus `MAX_ROWS=16` row-blocked tiles
 (`row_exact_qmv.py:36`). Their row-exactness trick (`one_row_qmv` per row inside a multi-row tile) is also the
-cheapest way to keep our verify bit-identical to serial decode.
+cheapest way to keep our verify bit-identical to serial decode. The GLM-specific number to keep in view: on
+GLM-5.2 (8-of-256 routing, same geometry as our 288-expert top-8) one extra verify row costs **~35 ms** — 5x the
+dense-backbone 7 ms default — because each extra row "pulls an almost disjoint expert set (~55% of step bytes)"
+(`patches/mlx_lm_mtp/glm_moe_dsa_model.py:361-365`). That measurement is the budget statement for this whole item:
+a verify batch only becomes cheap once the extra rows stop re-streaming expert weights.
 *Cost/risk:* medium; we already have `mb=min(rows,4)` blocking, so this is an extension of existing structure. The
 expert-ordering change is the one with a real bytes/token payoff (fewer expert weight re-reads per verify step).
 
