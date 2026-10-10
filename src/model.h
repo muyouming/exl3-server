@@ -55,6 +55,23 @@ class Model {
   // float32 logits of the last position.
   std::vector<float> forward(const std::vector<int>& tokens, KVCache& cache);
 
+  // Hidden-state taps used by speculative drafters (DSpark reads layers
+  // 1, 10, 20, 30, 39 of the target).
+  static constexpr int kNumTaps = 5;
+  static const int kTapLayers[kNumTaps];
+
+  struct ForwardResult {
+    std::vector<float> logits_last;      // (vocab) at the last position
+    std::vector<int> greedy;             // argmax token at every position
+    std::vector<std::vector<float>> taps; // (positions, 5 * hidden) when requested
+  };
+
+  // Like forward(), but also returns the greedy token at every position (needed
+  // to verify speculative proposals) and, optionally, the per-position hidden
+  // taps of kTapLayers.
+  ForwardResult forward_multi(const std::vector<int>& tokens, KVCache& cache,
+                              bool capture_taps = false);
+
   // Reset the KV cache (keeps allocations).
   void reset_cache(KVCache& cache) const { cache.init((int)cfg_.num_layers); }
 

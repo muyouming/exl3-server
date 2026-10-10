@@ -84,6 +84,32 @@ class ThinkSplitter {
 } // namespace
 
 // ---------------------------------------------------------------------------
+// N-gram draft
+// ---------------------------------------------------------------------------
+
+std::vector<int> NgramDrafter::draft(const std::vector<int>& context, int k,
+                                     const std::vector<float>& /*taps*/) {
+  std::vector<int> out;
+  if (k <= 0 || context.size() < (size_t)min_suffix_ + 1) return out;
+  const int n = (int)context.size();
+  for (int m = std::min(max_suffix_, n - 1); m >= min_suffix_; --m) {
+    // find the latest earlier occurrence of context[n-m .. n) that is followed
+    // by at least one token
+    for (int start = n - m - 1; start >= 0; --start) {
+      bool match = true;
+      for (int j = 0; j < m; ++j) {
+        if (context[(size_t)(start + j)] != context[(size_t)(n - m + j)]) { match = false; break; }
+      }
+      if (!match) continue;
+      const int cont_start = start + m;
+      for (int j = cont_start; j < n && (int)out.size() < k; ++j) out.push_back(context[(size_t)j]);
+      if (!out.empty()) return out;
+    }
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 // Engine
 // ---------------------------------------------------------------------------
 
@@ -115,24 +141,27 @@ GenerateResult Engine::generate(const std::vector<int>& prompt, const GenerateOp
     return res;
   }
 
+  const bool speculative = drafter_ && opt.draft_tokens > 1 && opt.sample.temperature <= 0.0f;
+
   // Reuse the longest common prefix already in the KV cache.
   size_t common = 0;
   while (common < prefix_.size() && common < prompt.size() && prefix_[common] == prompt[common])
     common++;
   int restart = (int)common;
-  if (restart >= (int)prompt.size()) restart = (int)prompt.size() - 1; // need logits for the last token
+  if (restart >= (int)prompt.size()) restart = (int)prompt.size() - 1;
   if (restart != cache_.offset) cache_.trim(restart);
   prefix_.resize((size_t)restart);
 
   std::vector<int> pending_tokens(prompt.begin() + restart, prompt.end());
   int64_t t0 = now_ms();
-  std::vector<float> logits = model_.forward(pending_tokens, cache_);
+  Model::ForwardResult fr = model_.forward_multi(pending_tokens, cache_, speculative);
   res.prefill_seconds = (double)(now_ms() - t0) / 1000.0;
   prefix_.insert(prefix_.end(), pending_tokens.begin(), pending_tokens.end());
 
   const auto& cfg = model_.config();
-  std::vector<int> context = prompt;
+  std::vector<int> history = prompt;
 
+  // ---- shared emission machinery -------------------------------------------
   ThinkSplitter think;
   if (opt.start_in_think) think.start_in_think();
   Tokenizer::Stream stream(&tok_);
@@ -141,11 +170,47 @@ GenerateResult Engine::generate(const std::vector<int>& prompt, const GenerateOp
     if (opt.split_think) think.feed(s, on_delta);
     else if (on_delta) on_delta(s, std::string());
   };
-  std::string hold;            // text held back for stop-string matching
-  std::string full;
+  std::string hold, full;
   size_t max_stop = 0;
-  for (auto& s : opt.stop) max_stop = std::max(max_stop, s.size());
+  for (auto& st : opt.stop) max_stop = std::max(max_stop, st.size());
   const size_t holdback = max_stop > 0 ? max_stop - 1 : 0;
+
+  // Returns false when generation must stop (EOS or a stop string was hit).
+  auto emit = [&](int tok) -> bool {
+    res.completion_tokens++;
+    res.tokens.push_back(tok);
+    if (!opt.ignore_eos &&
+        std::find(cfg.eos_token_ids.begin(), cfg.eos_token_ids.end(), tok) !=
+            cfg.eos_token_ids.end()) {
+      res.finish_reason = "stop";
+      return false;
+    }
+    std::string delta = stream.push(tok);
+    if (!delta.empty()) {
+      hold += delta;
+      size_t stop_at = std::string::npos;
+      for (auto& st : opt.stop) {
+        if (st.empty()) continue;
+        size_t k = hold.find(st);
+        if (k != std::string::npos) stop_at = std::min(stop_at, k);
+      }
+      if (stop_at != std::string::npos) {
+        std::string out = hold.substr(0, stop_at);
+        feed(out);
+        full += out;
+        hold.clear();
+        res.finish_reason = "stop";
+        return false;
+      }
+      if (hold.size() > holdback) {
+        std::string out = hold.substr(0, hold.size() - holdback);
+        feed(out);
+        full += out;
+        hold.erase(0, hold.size() - holdback);
+      }
+    }
+    return true;
+  };
 
   uint64_t rng = opt.sample.seed;
   if (rng == 0) {
@@ -154,61 +219,62 @@ GenerateResult Engine::generate(const std::vector<int>& prompt, const GenerateOp
     if (rng == 0) rng = 0x9E3779B97F4A7C15ull;
   }
 
-  bool stopped = false;
   const int64_t d0 = now_ms();
-  for (int step = 0; step < opt.max_tokens; ++step) {
-    if (cancelled && cancelled()) {
-      res.finish_reason = "cancelled";
-      stopped = true;
-      break;
-    }
-    int tok = sample_token(logits, opt.sample, context, rng);
-    context.push_back(tok);
-    prefix_.push_back(tok);
-    res.completion_tokens++;
+  bool stopped = false;
 
-    if (!opt.ignore_eos && std::find(cfg.eos_token_ids.begin(), cfg.eos_token_ids.end(), tok) !=
-                               cfg.eos_token_ids.end()) {
-      res.finish_reason = "stop";
-      stopped = true;
-      break;
-    }
-
-    std::string delta = stream.push(tok);
-    if (!delta.empty()) {
-      hold += delta;
-      size_t stop_at = std::string::npos;
-      for (auto& s : opt.stop) {
-        if (s.empty()) continue;
-        size_t k = hold.find(s);
-        if (k != std::string::npos) stop_at = std::min(stop_at, k);
-      }
-      if (stop_at != std::string::npos) {
-        std::string emit = hold.substr(0, stop_at);
-        feed(emit);
-        full += emit;
-        hold.clear();
-        res.finish_reason = "stop";
-        stopped = true;
-        break;
-      }
-      if (hold.size() > holdback) {
-        std::string emit = hold.substr(0, hold.size() - holdback);
-        feed(emit);
-        full += emit;
-        hold.erase(0, hold.size() - holdback);
+  if (speculative) {
+    // Speculative loop: the cache holds everything except the token waiting to
+    // be fed (`cur`); the drafter proposes k-1 tokens after it, the target
+    // verifies the whole batch in one pass, and the longest matching prefix is
+    // committed. Greedy-only, and exactly equivalent to plain greedy decoding.
+    int cur = fr.greedy.back();
+    std::vector<float> taps = fr.taps.empty() ? std::vector<float>() : fr.taps.back();
+    if (!emit(cur)) {
+      res.finish_reason = res.finish_reason.empty() ? "stop" : res.finish_reason;
+    } else {
+      for (;;) {
+        if (cancelled && cancelled()) { res.finish_reason = "cancelled"; stopped = true; break; }
+        if (res.completion_tokens >= opt.max_tokens) { res.finish_reason = "length"; break; }
+        std::vector<int> props = drafter_->draft(history, opt.draft_tokens - 1, taps);
+        std::vector<int> batch;
+        batch.reserve(props.size() + 1);
+        batch.push_back(cur);
+        batch.insert(batch.end(), props.begin(), props.end());
+        const int offset_before = cache_.offset;
+        Model::ForwardResult vr = model_.forward_multi(batch, cache_, true);
+        int accept = 0;
+        while (accept < (int)props.size() && props[(size_t)accept] == vr.greedy[(size_t)accept + 1])
+          accept++;
+        // Commit: keep the feed token plus the accepted proposals.
+        if (offset_before + 1 + accept < cache_.offset) cache_.trim(offset_before + 1 + accept);
+        bool stop_now = false;
+        for (int j = 0; j < accept && !stop_now; ++j) {
+          history.push_back(props[(size_t)j]);
+          if (cache_.offset > (int)prefix_.size()) prefix_.push_back(props[(size_t)j]);
+          stop_now = !emit(props[(size_t)j]);
+        }
+        taps = vr.taps.empty() ? std::vector<float>() : vr.taps[(size_t)accept];
+        cur = vr.greedy[(size_t)accept];
+        if (stop_now) { stopped = true; break; }
+        history.push_back(cur);
+        if (!emit(cur)) { stopped = true; break; }
       }
     }
-    if (step + 1 >= opt.max_tokens) res.finish_reason = "length";
-
-    // Advance the model for the next step.
-    logits = model_.forward({tok}, cache_);
-    if (logits.empty()) {
-      res.finish_reason = "stop";
-      break;
+  } else {
+    std::vector<float> logits = fr.logits_last;
+    for (int step = 0; step < opt.max_tokens; ++step) {
+      if (cancelled && cancelled()) { res.finish_reason = "cancelled"; stopped = true; break; }
+      int tok = sample_token(logits, opt.sample, history, rng);
+      history.push_back(tok);
+      prefix_.push_back(tok);
+      if (!emit(tok)) { stopped = true; break; }
+      if (step + 1 >= opt.max_tokens) res.finish_reason = "length";
+      logits = model_.forward({tok}, cache_);
+      if (logits.empty()) { res.finish_reason = "stop"; break; }
     }
   }
-  if (!stopped && res.finish_reason.empty()) res.finish_reason = "length";
+  (void)stopped;
+  if (res.finish_reason.empty()) res.finish_reason = "length";
 
   if (!hold.empty()) {
     feed(hold);

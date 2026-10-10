@@ -3,6 +3,7 @@
 // reuse, streaming detokenization, stop strings, and <think>/</think> routing.
 
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -12,9 +13,35 @@
 
 namespace exl3 {
 
+// Speculative drafters propose tokens that the target model verifies in one
+// pass. Greedy-only: proposal acceptance compares against the target's argmax.
+class Drafter {
+ public:
+  virtual ~Drafter() = default;
+  // Propose up to `k` tokens following `context`. `taps` holds the target's
+  // hidden taps for the last processed position (kNumTaps * hidden floats) or
+  // is empty when the model was not asked to capture them.
+  virtual std::vector<int> draft(const std::vector<int>& context, int k,
+                                 const std::vector<float>& taps) = 0;
+};
+
+// Model-free drafter: continues the longest context suffix that occurred
+// earlier in the sequence (prompt lookup / n-gram). Lossless with verification.
+class NgramDrafter : public Drafter {
+ public:
+  explicit NgramDrafter(int max_suffix = 12, int min_suffix = 3)
+      : max_suffix_(max_suffix), min_suffix_(min_suffix) {}
+  std::vector<int> draft(const std::vector<int>& context, int k,
+                         const std::vector<float>& taps) override;
+
+ private:
+  int max_suffix_, min_suffix_;
+};
+
 struct GenerateOptions {
   SampleOptions sample;
   int max_tokens = 512;
+  int draft_tokens = 0; // >0 enables speculative decoding (greedy only)
   std::vector<std::string> stop; // stop strings, matched against decoded text
   bool ignore_eos = false;
   bool split_think = true;      // route <think>...</think> into a separate stream
@@ -22,6 +49,7 @@ struct GenerateOptions {
 };
 
 struct GenerateResult {
+  std::vector<int> tokens; // generated token ids (includes EOS/stop token)
   std::string text;      // full generated text, thinking markers included
   std::string content;   // text outside <think>...</think>
   std::string reasoning; // text inside <think>...</think>
@@ -50,8 +78,11 @@ class Engine {
                           const CancelFn& cancelled = nullptr);
 
   void reset();
+  void set_drafter(std::shared_ptr<Drafter> d) { drafter_ = std::move(d); }
+  const std::shared_ptr<Drafter>& drafter() const { return drafter_; }
 
  private:
+  std::shared_ptr<Drafter> drafter_;
   Model model_;
   Tokenizer tok_;
   KVCache cache_;

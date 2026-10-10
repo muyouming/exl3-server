@@ -358,7 +358,14 @@ bool Model::load(const std::string& path, std::string& err, int threads, bool fp
 // Forward pass
 // ---------------------------------------------------------------------------
 
+const int Model::kTapLayers[Model::kNumTaps] = {1, 10, 20, 30, 39};
+
 std::vector<float> Model::forward(const std::vector<int>& tokens, KVCache& cache) {
+  return forward_multi(tokens, cache, false).logits_last;
+}
+
+Model::ForwardResult Model::forward_multi(const std::vector<int>& tokens, KVCache& cache,
+                                          bool capture_taps) {
   const int L = (int)tokens.size();
   const int hidden = cfg_.hidden_size;
   const int n_heads = cfg_.num_heads, n_kv = cfg_.num_kv_heads, hd = cfg_.head_dim;
@@ -369,6 +376,14 @@ std::vector<float> Model::forward(const std::vector<int>& tokens, KVCache& cache
 
   mx::array ids(tokens.data(), mx::Shape{1, L}, mx::int32);
   mx::array h = mx::take(embed_, ids, 0); // (1, L, hidden)
+
+  std::vector<mx::array> taps;
+  auto tap_index = [&](int layer) {
+    for (int t = 0; t < kNumTaps; ++t) {
+      if (kTapLayers[t] == layer) return t;
+    }
+    return -1;
+  };
 
   const bool need_mask = L > 1;
   mx::array mask(0.0f);
@@ -421,21 +436,44 @@ std::vector<float> Model::forward(const std::vector<int>& tokens, KVCache& cache
   }
 
   h = mx::fast::rms_norm(h, final_norm_, cfg_.rms_norm_eps);
-  auto last = mx::slice(h, {0, L - 1, 0}, {1, L, hidden});
-  mx::array logits = linear(lm_head_, last);
-  logits = mx::reshape(mx::astype(logits, mx::float32), {cfg_.vocab_size});
+  mx::array all_logits = linear(lm_head_, h);                      // (1, L, vocab)
+  mx::array logits2d = mx::reshape(mx::astype(all_logits, mx::float32),
+                                   {(int)L, cfg_.vocab_size});
 
   std::vector<mx::array> to_eval;
-  to_eval.reserve(2 * layers_.size() + 1);
-  to_eval.push_back(logits);
+  to_eval.reserve(2 * layers_.size() + 1 + taps.size());
+  to_eval.push_back(logits2d);
+  for (auto& a : taps) to_eval.push_back(a);
   for (auto& a : cache.keys) to_eval.push_back(a);
   for (auto& a : cache.values) to_eval.push_back(a);
   mx::eval(to_eval);
 
   cache.offset = S;
-  std::vector<float> out((size_t)cfg_.vocab_size);
-  std::memcpy(out.data(), logits.data<float>(), out.size() * sizeof(float));
-  return out;
+  ForwardResult res;
+  const float* lp = logits2d.data<float>();
+  res.greedy.resize((size_t)L);
+  for (int i = 0; i < L; ++i) {
+    const float* row = lp + (size_t)i * cfg_.vocab_size;
+    int best = 0;
+    for (int v = 1; v < cfg_.vocab_size; ++v) {
+      if (row[v] > row[best]) best = v;
+    }
+    res.greedy[(size_t)i] = best;
+  }
+  res.logits_last.assign(lp + (size_t)(L - 1) * cfg_.vocab_size,
+                         lp + (size_t)L * cfg_.vocab_size);
+  if (capture_taps) {
+    res.taps.resize((size_t)L);
+    for (size_t t = 0; t < taps.size(); ++t) {
+      const float* tp = taps[t].data<float>();
+      const int64_t stride = (int64_t)hidden;
+      for (int i = 0; i < L; ++i) {
+        res.taps[(size_t)i].insert(res.taps[(size_t)i].end(), tp + (int64_t)i * stride,
+                                   tp + (int64_t)(i + 1) * stride);
+      }
+    }
+  }
+  return res;
 }
 
 void KVCache::trim(int pos) {

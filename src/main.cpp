@@ -44,6 +44,7 @@ void usage() {
       "      --frequency-penalty F    (default 0)\n"
       "      --seed N                 RNG seed (default random)\n"
       "      --stop TEXT              stop string, repeatable\n"
+      "      --draft-ngram N          speculative decoding with an n-gram drafter (N proposals)\n"
       "      --ignore-eos             do not stop on EOS\n"
       "\n"
       "chat:\n"
@@ -72,6 +73,7 @@ int main(int argc, char** argv) {
   std::string model, host = "127.0.0.1", model_name, system;
   int port = 8080;
   int threads = 0;
+  int draft_ngram = 0;
   bool serve = false;
   bool fp16_weights = false;
   exl3::CliOptions cli;
@@ -109,6 +111,8 @@ int main(int argc, char** argv) {
       model_name = arg(i, "--model-name");
     } else if (a == "--system" || a.rfind("--system=", 0) == 0) {
       system = arg(i, "--system");
+    } else if (a == "--draft-ngram" || a.rfind("--draft-ngram=", 0) == 0) {
+      draft_ngram = std::atoi(arg(i, "--draft-ngram").c_str());
     } else if (a == "--fp16-weights") {
       fp16_weights = true;
     } else if (a == "--think") {
@@ -162,6 +166,10 @@ int main(int argc, char** argv) {
     return 1;
   }
   if (!model_name.empty()) engine.set_model_name(model_name);
+  if (draft_ngram > 0) {
+    engine.set_drafter(std::make_shared<exl3::NgramDrafter>());
+    cli.gen.draft_tokens = draft_ngram;
+  }
   cli.system = system;
   cli.stats = verbose;
 
