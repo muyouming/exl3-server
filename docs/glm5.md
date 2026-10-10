@@ -112,6 +112,39 @@ template's tool markers.
 7. **MTP block** wired into the existing speculative loop (`Drafter` interface).
 8. Tokenizer/chat template (vocab 154880, its own merges + template).
 
+## KDA recurrence (verbatim semantics from the reference)
+
+`recurrent_kimi_delta_attention` (modeling_glm5_next.py:463) is the per-position
+form; the implementation to port is exactly this (all state math in fp32):
+
+```
+# per layer: 16 heads, k_head_dim = v_head_dim = 128, state S = zeros(16,128,128) fp32
+q, k = l2norm(q), l2norm(k)            # l2norm(x) = x / sqrt(sum(x^2) + 1e-6)
+q = q * (1 / sqrt(k_head_dim))         # 1/sqrt(128)
+for i in range(sequence_length):
+    g_i = exp(g[:, i])                 # per-head scalar decay, shape (H,1)
+    b_i = beta[:, i]                   # per-head scalar, shape (H,1)
+    S = S * g_i
+    kv_mem = (S * k_i[..., None]).sum(-2)         # (H, v_head_dim)
+    delta = (v_i - kv_mem) * b_i                  # (H, v_head_dim)
+    S = S + k_i.unsqueeze(-1) * delta.unsqueeze(-2)
+    out[i] = (S * q_i.unsqueeze(-1)).sum(-2)      # (H, v_head_dim)
+```
+
+Notes that matter for a faithful port:
+
+- `l2norm` uses `sqrt(sum(x*x) + eps)` then a plain divide (deliberately not
+  `F.normalize`, to match the FLA kernels the model was trained with).
+- The decay `g` is applied *before* the delta update, and the read-out uses the
+  post-update state.
+- `Glm5NextTextLinearAttention.forward` (620) supplies q/k/v (with the conv1d
+  over the depthwise sliding window, kernel 4), `beta` (from `b_proj`) and `g`
+  (from `forget_gate`: `f_a_proj`/`f_b_proj` + `dt_bias` + `A_log`, see
+  `Glm5NextTextForgetGate` at 339), then applies `RMSNormGated` (`o_norm`) and
+  `o_proj`.
+- MLX exposes `fast::gated_delta_update`, but the reference above is the exact
+  formula to validate against before trusting the primitive.
+
 ## Expected performance envelope
 
 Rough sizing: the MoE holds ~300 B expert parameters at 2.51 bpw (~95 GB on
