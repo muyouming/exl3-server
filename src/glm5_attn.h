@@ -20,6 +20,28 @@ struct MlaState {
   int len = 0;
 };
 
+// LayerNorm with bias (the indexer's k_norm is a LayerNorm, not an RMSNorm).
+mx::array layer_norm(const mx::array& x, const mx::array& weight, const mx::array& bias,
+                     float eps = 1e-6f);
+
+// DSA indexer pooling + scoring (Glm5NextTextIndexer.get_pooled_states + scoring,
+// 850-885). Pure function over the per-token packed indexer state so it can be
+// checked against the reference independently of the projections.
+//   packed (L_total, 2*head_dim + 1) = cat(key | gate_scores | valid_flag)
+//   q      (L, n_heads, head_dim)
+//   w      (L, n_heads)  per-head weights (weights_proj(h) * n_heads**-0.5)
+//   ape    (index_kpool, head_dim)
+struct IndexerPools {
+  mx::array keys = mx::array(0.0f);   // (n_pools, head_dim) pooled keys
+  mx::array scores = mx::array(0.0f); // (L, n_pools) index scores
+  std::vector<int> indices;  // (n_pools * index_kpool) absolute token ids, -1 invalid
+  std::vector<char> valid;   // (n_pools)
+  int n_pools = 0;
+  int kpool = 0;
+};
+IndexerPools indexer_pool_and_score(const mx::array& packed, const mx::array& q,
+                                    const mx::array& w, const mx::array& ape);
+
 // One MLA layer. `h` is (B, L, hidden); `start_pos` is the absolute position of
 // the first query token. `topk` (B, L, K) holds absolute key positions selected
 // by the DSA indexer (-1 = none); pass an empty array for dense causal attention.

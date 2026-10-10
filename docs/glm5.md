@@ -363,10 +363,20 @@ topk_indices = masked_fill(~attention_mask[..., None], -1)         # padding row
 return topk_indices.to(torch.int32)
 ```
 
-Still to read: the exact `select_k` expression just above 885, and
-`append_visible_tail` (how the incomplete tail pool's visible tokens are
-appended without duplicates). `update_indexer` is not a method of the indexer
-class - grep it by name in the cache classes when implementing. The returned indices are int32 (B, S, topk)
+`select_k = min(index_topk // index_kpool, n_pools)` (880) and
+`append_visible_tail` (1010) appends the current *incomplete* pool as raw token
+ids, at most `index_kpool - 1` of them, widening output_width accordingly
+(`[P P A B C D E F]` -> pools `[A B C D]` + tail `[E F]`). `update_indexer` is
+not a method of the indexer class - grep it by name in the cache classes when
+wiring the cache.
+
+Status: `indexer_pool_and_score()` (src/glm5_attn.cpp) implements the pooling
+and scoring half - first-valid anchoring, per-dim softmax(gate + ape)
+weighting, pool validity, relu scoring with per-head weights - verified against
+a scalar CPU oracle in `tests/indexer_pooling_test.cpp` (5.5e-08 / 1.1e-08,
+0 mismatches, with invalid leading tokens to exercise the anchoring). Still to
+write: the projection caller (wq_b/k_norm/gate packing + the packed cache),
+the top-k selection with `select_k`, the tail append and the output padding. The returned indices are int32 (B, S, topk)
 with `-1` meaning invalid, which is exactly what `mla_layer`'s mask builder consumes.
 
 ## MoE (verified from Glm5NextTextMLP / Experts / TopkRouter)
