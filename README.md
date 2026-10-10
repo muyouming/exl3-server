@@ -106,6 +106,36 @@ at B=8 with 4 distinct prompts against 29.7 tok/s with one. Measured gradients,
 tables and the honest reading: `docs/perf.md`, "expert-order pair execution" and
 "request-level batching".
 
+
+### Where this stands (external calibration, 2026-10-10)
+
+Measured by us, same-session, warmed, second process: **8.66 tok/s single stream**
+(115 ms/step) and **33.9 tok/s aggregate at B=16 with a shared prompt** (B=8
+mixed 19.3, B=16 four-prompts 31.5). Research into the wild numbers
+(`docs/research/glm53-flash-mac-reports.md`) says:
+
+- **On an M4 Max at 2-3 bits, nobody has published a faster run of this model**
+  than the numbers above. The M4 field is 6.21 t/s on ds4 (Q4_K GGUF streamed
+  from SSD, where host-side expert-cache bookkeeping dominates a 161 ms token and
+  MTP measured 15% *slower*) and 2.7 t/s on oMLX (oQ4e with 0.42 expert offload),
+  plus one unbenchmarked claim of low-to-mid tens of tok/s.
+- **But the same M4 Max does 31.7-34.5 tok/s single-stream on adjacent 2-bit
+  MoEs** (DeepSeek V4 Flash 13B-active with DSpark 31.7; Bonsai 2 27B ternary
+  34.5; Qwen3.8-125B-A6B 4-bit affine 33.2 serial, 73.8 with MTP). The gap is not
+  hardware and not the model class: it is the issued-instruction count per
+  weight. Their kernels sit at 4-6 instructions per weight (one lane per 16x16
+  tile, compile-time bit windows, `v_dot2_f32_f16`) or 0.25 mma/weight against
+  our measured 13.75 in the same accounting, because with K bits per weight this
+  machine's issue wall is 74.5*K GB/s (K2 149, K3 224, K4 298) against a 546 GB/s
+  DRAM wall - the two only meet near K=7.3, so at 2.5 bpw the trellis GEMV is
+  roughly 2.9x on the instruction side. Specialising the kernel per bit width is
+  the named next lever.
+- **M5 Max numbers must not be transferred**: 42.0 tok/s at 2-bit with MTP is
+  reported there, but Apple's own M5-vs-M4 MLX measurement puts decode at
+  1.19-1.27x, M5 tensor units are ~nil on memory-bound decode, and the bandwidth
+  difference is +12% (614 vs 546 GB/s). That is machinery plus affine-vs-trellis
+  format plus M5-only tensor paths, not silicon.
+
 ## CLI
 
 ```sh
@@ -223,7 +253,12 @@ could not exceed ~350 tok/s without speculative decoding.
 
 Tuning knobs (environment, mainly for experiments): `EXL3_QMV_NT` (output tiles per
 threadgroup), `EXL3_QMV_SG` (simdgroups per threadgroup), `EXL3_QMV_MB` (rows per
-threadgroup block), `EXL3_QMV_SPLITS` (split-K factor).
+threadgroup block), `EXL3_QMV_SPLITS` (split-K factor). The staged fp16 +
+simdgroup_matrix path for the batched rows (docs/perf.md, "Seventh pass") has its
+own: `EXL3_QMV_MAT_MIN_ROWS` (row threshold, default 16; 0 disables),
+`EXL3_QMV_MAT_MAX_ROWS` (upper bound, 0 = none), `EXL3_QMV_MAT_MB` / `EXL3_QMV_MAT_NT`
+(its row block and tiles per threadgroup), and `EXL3_QMV_MAT_DEBUG=1` traces every
+dispatch with the activation shape that chose the path.
 
 ## Verification
 
