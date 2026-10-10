@@ -386,6 +386,15 @@ mx::array hadamard_run(const mx::array& x, const mx::array& s, int blocks_per_ro
   return outs[0];
 }
 
+} // namespace
+
+mx::array trellis_hadamard(const mx::array& x, const mx::array& s, int blocks_per_row, bool pre,
+                           int rows, bool stacked) {
+  return hadamard_run(x, s, blocks_per_row, pre, x.shape(), rows, stacked);
+}
+
+namespace {
+
 int split_count(int k_tiles, int n_tiles) {
   int forced = env_int("EXL3_QMV_SPLITS");
   if (forced > 0) {
@@ -487,7 +496,18 @@ mx::array trellis_matmul_raw(const TrellisWeight& w, const mx::array& xhat) {
 // Everything in between is batched: one Hadamard over the stacked input with a
 // per-member scale vector, one QMV kernel whose grid.z enumerates
 // (split, member), and one Hadamard over the stacked output.
+namespace {
+mx::array matmul_group_impl(const std::vector<TrellisWeight>& ws, const mx::array& x, int rows,
+                            const mx::array& svh_stack);
+}
+
 mx::array trellis_matmul_group(const std::vector<TrellisWeight>& ws, const mx::array& x, int rows) {
+  return matmul_group_impl(ws, x, rows, mx::array(0.0f));
+}
+
+namespace {
+mx::array matmul_group_impl(const std::vector<TrellisWeight>& ws, const mx::array& x, int rows,
+                            const mx::array& svh_stack) {
   const int n = (int)ws.size();
   if (n <= 0) return mx::array(0.0f);
   const int in = ws[0].in_features, out = ws[0].out_features;
@@ -538,10 +558,13 @@ mx::array trellis_matmul_group(const std::vector<TrellisWeight>& ws, const mx::a
   if (splits > 1) y = mx::sum(y, std::vector<int>{1}, false); // (n, pad_rows, out)
   // One batched output Hadamard: the members' svh vectors concatenated give the
   // per-member scale (the kernel's block index runs member-major over rows).
-  std::vector<mx::array> svh;
-  svh.reserve((size_t)n);
-  for (const auto& w : ws) svh.push_back(w.svh);
-  mx::array sstack = mx::concatenate(svh, 0);
+  mx::array sstack = svh_stack;
+  if ((int64_t)sstack.size() != (int64_t)n * out) {
+    std::vector<mx::array> svh;
+    svh.reserve((size_t)n);
+    for (const auto& w : ws) svh.push_back(w.svh);
+    sstack = mx::concatenate(svh, 0);
+  }
   y = hadamard_run(mx::reshape(y, {n * pad_rows, out}), sstack, out / 128, /*pre=*/false,
                    mx::Shape{n * pad_rows, out}, pad_rows, /*stacked=*/true);
   y = mx::reshape(y, {n, pad_rows, out});
@@ -549,19 +572,23 @@ mx::array trellis_matmul_group(const std::vector<TrellisWeight>& ws, const mx::a
   return y;
 }
 
-namespace {
 // xhat = ((x . suh_m) H128 / sqrt(128)) for all members in one launch, then the
-// grouped QMV and one batched output Hadamard.
-mx::array group_impl(const std::vector<TrellisWeight>& ws, const mx::array& xr, int rows) {
+// grouped QMV and one batched output Hadamard. `suh_stack` empty means "use the
+// members' own scale vectors".
+mx::array group_impl(const std::vector<TrellisWeight>& ws, const mx::array& xr, int rows,
+                     const mx::array& suh_stack) {
   const int n = (int)ws.size();
   const int in = ws[0].in_features;
-  std::vector<mx::array> suh;
-  suh.reserve((size_t)n);
-  for (const auto& w : ws) suh.push_back(w.suh);
-  mx::array sstack = mx::concatenate(suh, 0);
+  mx::array sstack = suh_stack;
+  if ((int64_t)sstack.size() != (int64_t)n * in) {
+    std::vector<mx::array> suh;
+    suh.reserve((size_t)n);
+    for (const auto& w : ws) suh.push_back(w.suh);
+    sstack = mx::concatenate(suh, 0);
+  }
   mx::array xhat = hadamard_run(xr, sstack, in / 128, /*pre=*/true, mx::Shape{n, rows, in}, rows,
                                 /*stacked=*/true);
-  return trellis_matmul_group(ws, xhat, rows);
+  return matmul_group_impl(ws, xhat, rows, mx::array(0.0f));
 }
 } // namespace
 
@@ -574,7 +601,7 @@ mx::array trellis_linear_group(const std::vector<TrellisWeight>& ws, const mx::a
   const int rows = (int)(x.size() / in);
   mx::array xr = mx::reshape(x, {1, rows, in});
   if (n > 1) xr = mx::reshape(mx::tile(xr, {n, 1, 1}), {n, rows, in});
-  return group_impl(ws, xr, rows);
+  return group_impl(ws, xr, rows, mx::array(0.0f));
 }
 
 mx::array trellis_linear_group_rows(const std::vector<TrellisWeight>& ws, const mx::array& x,
@@ -585,7 +612,41 @@ mx::array trellis_linear_group_rows(const std::vector<TrellisWeight>& ws, const 
   if ((int64_t)x.size() != (int64_t)n * rows * in) {
     throw std::invalid_argument("trellis_linear_group_rows: activation size mismatch");
   }
-  return group_impl(ws, x, rows);
+  return group_impl(ws, x, rows, mx::array(0.0f));
+}
+
+// The scale-stack forms: the caller holds one (n, in) input-scale and one
+// (n, out) output-scale stack (already flat in member order), which is what a
+// device-side gather of the routed experts' scale vectors produces.
+mx::array trellis_linear_group_scaled(const std::vector<TrellisWeight>& ws, const mx::array& x,
+                                      const mx::array& suh_stack, const mx::array& svh_stack) {
+  const int n = (int)ws.size();
+  if (n <= 0) return mx::array(0.0f);
+  const int in = ws[0].in_features;
+  const int out = ws[0].out_features;
+  const int rows = (int)(x.size() / in);
+  mx::array xr = mx::reshape(x, {1, rows, in});
+  if (n > 1) xr = mx::reshape(mx::tile(xr, {n, 1, 1}), {n, rows, in});
+  mx::array sstack = mx::reshape(suh_stack, {n * in});
+  mx::array xhat = hadamard_run(xr, sstack, in / 128, /*pre=*/true, mx::Shape{n, rows, in}, rows,
+                                /*stacked=*/true);
+  return matmul_group_impl(ws, xhat, rows, mx::reshape(svh_stack, {n * out}));
+}
+
+mx::array trellis_linear_group_rows_scaled(const std::vector<TrellisWeight>& ws, const mx::array& x,
+                                           int rows, const mx::array& suh_stack,
+                                           const mx::array& svh_stack) {
+  const int n = (int)ws.size();
+  if (n <= 0) return mx::array(0.0f);
+  const int in = ws[0].in_features;
+  const int out = ws[0].out_features;
+  if ((int64_t)x.size() != (int64_t)n * rows * in) {
+    throw std::invalid_argument("trellis_linear_group_rows_scaled: activation size mismatch");
+  }
+  mx::array sstack = mx::reshape(suh_stack, {n * in});
+  mx::array xhat = hadamard_run(x, sstack, in / 128, /*pre=*/true, mx::Shape{n, rows, in}, rows,
+                                /*stacked=*/true);
+  return matmul_group_impl(ws, xhat, rows, mx::reshape(svh_stack, {n * out}));
 }
 
 mx::array trellis_pack(const uint16_t* words16, int k_tiles, int n_tiles, int K) {

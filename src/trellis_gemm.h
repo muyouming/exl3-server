@@ -67,6 +67,16 @@ mx::array trellis_pack(const uint16_t* words16, int k_tiles, int n_tiles, int K)
 // xhat must already contain ((x . suh) H128 / sqrt(128)). Used by tests.
 mx::array trellis_matmul_raw(const TrellisWeight& w, const mx::array& xhat);
 
+// One fused Hadamard step of the trellis path, exposed for the tests and for
+// callers that build a grouped launch's stacked input themselves:
+//   pre  = true : y = (H128 (x * s)) / sqrt(128)          [f16 in, f16 out]
+//   pre  = false: y = (H128 f16(x)) / sqrt(128) * s       [f32 in, f16 out]
+// `stacked` packs one scale vector per member (rows rows each, x's 128-blocks
+// in (member, row, block) order). Same kernel, same order of operations as the
+// trellis path, so calling it directly is bit-identical to the fused call.
+mx::array trellis_hadamard(const mx::array& x, const mx::array& s, int blocks_per_row, bool pre,
+                           int rows = 1, bool stacked = false);
+
 // n linears in ONE launch, for tensors that share their shape (the 8 routed
 // experts of a decode step, the per-layer projections of one layer...). The
 // result is bit-identical to n calls to trellis_linear: each member keeps its
@@ -81,6 +91,19 @@ mx::array trellis_linear_group(const std::vector<TrellisWeight>& ws, const mx::a
 mx::array trellis_linear_group_rows(const std::vector<TrellisWeight>& ws, const mx::array& x,
                                     int rows);
 mx::array trellis_matmul_group(const std::vector<TrellisWeight>& ws, const mx::array& xhat, int rows);
+
+// The same two calls with the members' scale vectors supplied by the caller as
+// (n, in) / (n, out) f16 stacks instead of being concatenated from `ws`. The
+// scale values are the only thing that changes, so a caller that holds the
+// whole expert set's scale vectors in one array (G5MoePrep) can gather the
+// step's members with one device-side `mx::take(stack, ids)` - and the scales
+// no longer have to be rebuilt per token. Bit-identical to the forms above when
+// the stacks hold `ws`' own values.
+mx::array trellis_linear_group_scaled(const std::vector<TrellisWeight>& ws, const mx::array& x,
+                                      const mx::array& suh_stack, const mx::array& svh_stack);
+mx::array trellis_linear_group_rows_scaled(const std::vector<TrellisWeight>& ws, const mx::array& x,
+                                           int rows, const mx::array& suh_stack,
+                                           const mx::array& svh_stack);
 
 // Tuning knobs (also used by the CLI/benchmark): output tiles and simdgroups per
 // threadgroup, and rows per threadgroup block for batched prefill.

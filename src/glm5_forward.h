@@ -160,6 +160,9 @@ class Glm5Model {
     IndexerState idx;  // ditto
   };
 
+  // The loaded weights (read-only access for the tests and benchmarks).
+  const Glm5Weights& weights() const { return w_; }
+
   ModelConfig cfg_;
   Glm5Weights w_;
   G5HcConfig hc_;
