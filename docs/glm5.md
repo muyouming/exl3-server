@@ -346,8 +346,27 @@ q_pos    = current_length - q_length + arange(q_length)     # absolute query pos
 visible  = (kv_positions[None,None,:] <= q_pos[None,:,None]) & valid_keys[:,None,:]
 ```
 
-Remaining to read before implementing: the top-k + tail-pool expansion
-(`index_kpool_always_select_tail`) and the cache update `update_indexer`. The returned indices are int32 (B, S, topk)
+Selection and expansion (885-900, verified):
+
+```
+select_k = <pools to keep> = index_topk / index_kpool
+selected       = index_scores.topk(select_k, dim=-1).indices        # over POOLS
+selected_valid = valid_candidates.gather(-1, selected)
+selected_indices = pool_indices[b, selected]                       # (B,S,select_k,index_kpool)
+topk_indices   = selected_indices.flatten(-2)                      # pools -> token ids
+topk_indices   = masked_fill(~selected_valid.expand_as(...), -1)
+if index_kpool_always_select_tail:
+    topk_indices = append_visible_tail(topk_indices, visible_tokens, valid_keys)
+    output_width += index_kpool - 1        # the tail pool adds at most kpool-1 ids
+topk_indices = pad(..., -1)[..., :output_width]
+topk_indices = masked_fill(~attention_mask[..., None], -1)         # padding rows
+return topk_indices.to(torch.int32)
+```
+
+Still to read: the exact `select_k` expression just above 885, and
+`append_visible_tail` (how the incomplete tail pool's visible tokens are
+appended without duplicates). `update_indexer` is not a method of the indexer
+class - grep it by name in the cache classes when implementing. The returned indices are int32 (B, S, topk)
 with `-1` meaning invalid, which is exactly what `mla_layer`'s mask builder consumes.
 
 ## MoE (verified from Glm5NextTextMLP / Experts / TopkRouter)
