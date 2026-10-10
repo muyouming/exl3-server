@@ -53,6 +53,20 @@ reference for every new mechanism - fetch from
 | Layer / model wiring | `Glm5NextTextDecoderLayer` (1278), `Glm5NextTextModel` (1425), `Glm5NextForConditionalGeneration` (2133) |
 | Norms | `Glm5NextTextRMSNorm` (65), `Glm5NextTextUnweightedRMSNorm` (209) |
 
+## Tensor map (from the reference's `__init__` methods)
+
+Per-layer parameter names to load (prefix `model.language_model.layers.{i}.`):
+
+| Layer kind | Tensors |
+|---|---|
+| KDA (`linear_attn.*`) | `q_proj`, `k_proj`, `v_proj`, `conv1d` (kernel 4), `b_proj`, `g_a_proj`, `g_b_proj`, `o_norm`, `o_proj`, and `forget_gate.*` = `f_a_proj`, `f_b_proj`, `dt_bias`, `A_log` |
+| MLA (`self_attn.*`) | `q_a_proj`, `q_a_layernorm`, `q_b_proj`, `kv_a_proj_with_mqa`, `kv_a_layernorm`, `kv_b_proj`, `o_proj` (DeepSeek MLA shape, nope-only) |
+| Indexer (`self_attn.indexer.*`) | `wq_b`, `wk`, `k_norm`, `weights_proj`, `index_kpool_compress_ape`, `index_kpool_compress_gate` |
+| Hyper-connection | `input_norm`, `fn`, `base`, `scale` (the sinkhorn iterations are computed from these, not stored) |
+| MoE | `experts.gate_up_proj` (fused), `experts.down_proj`, `gate.weight`, `gate.e_score_correction_bias`, `shared_experts.*` |
+| Gated norm | `RMSNormGated.weight` |
+| Model-level | `model.language_model.embed_tokens.weight`, `model.language_model.norm.weight`, `lm_head.{trellis,suh,svh,mul1}`, plus the `mtp.*` block (1 next-token layer) |
+
 ## Chat template (from the checkpoint's `chat_template.jinja`)
 
 `[gMASK]<sop>` prompt prefix, `<|system|>Reasoning Effort: {Low|High|Max}` for a
