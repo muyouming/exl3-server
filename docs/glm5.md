@@ -273,6 +273,50 @@ prefill/incremental invariant is verified by `tests/mla_incremental_test.cpp`
 (decode after a n-1 prefill reproduces the n-token prefill's last row to
 6e-08). Numeric agreement with HF is still pending real weights.
 
+## DSA indexer (Glm5NextTextIndexer, 795-885+) - verified core
+
+```
+q      = wq_b(q_resid).view(B, S, 32, 128)        # q_resid is SHARED with MLA:
+                                                  # q_a_layernorm(q_a_proj(h))
+k      = k_norm(wk(h)).view(B, S, 128)            # k_norm is a *LayerNorm* (mean+var,
+                                                  # eps 1e-6, with bias), not RMSNorm
+gate_s = index_kpool_compress_gate @ h            # (B, S, 128); the param is (128, hidden)
+packed = cat([k, gate_s, valid_channel], -1)      # (B, S, 257) - the per-token indexer
+                                                  # cache entry (k | gate | padding flag)
+valid  = packed[..., -1].bool()
+visible = get_visible_tokens(valid, q_len, current_len)     # causal AND padding
+pool_keys, pool_indices, pool_valid = get_pooled_states(packed)  # pools of index_kpool=4
+scores  = relu(matmul(q, pool_keys^T) * head_dim**-0.5)     # (B, S, 32, n_pools), relu not softmax
+w       = weights_proj(h).float() * 32**-0.5                # per-head weights (B, S, 32)
+index_scores = matmul(w[..., None, :], scores)              # (B, S, n_pools)
+pool_end     = pool_indices[..., -1]
+valid_candidates = visible.gather(pool_end) & pool_valid[:, None]
+index_scores.masked_fill(~valid_candidates, min)            # then top-k over pools,
+                                                            # expanded back to token ids
+```
+
+Still to read in the reference before implementing: `get_pooled_states` (how
+`index_kpool_compress_ape` (4, 128) and the gate enter the in-pool reduction),
+`get_visible_tokens`, the top-k + tail-pool expansion (`index_kpool_always_select_tail`),
+and the cache update `update_indexer`. The returned indices are int32 (B, S, topk)
+with `-1` meaning invalid, which is exactly what `mla_layer`'s mask builder consumes.
+
+## MoE (verified from Glm5NextTextMLP / Experts / TopkRouter)
+
+```
+# dense MLP (first_k_dense_replace layers) and experts share the same SwiGLU:
+gate = gate_proj(x).clamp(max=swiglu_limit)      # swiglu_limit = 10
+up   = up_proj(x).clamp(-swiglu_limit, swiglu_limit)
+out  = down_proj(silu(gate) * up)
+
+# experts: gate_up_proj is FUSED as [num_experts, 2*inter, hidden] with
+# gate in the first half (chunk(2, dim=-1) -> gate, up); output is scaled by
+# the token's router weight: out * top_k_weights[token, pos] and index_add'ed.
+
+# router: weight (num_experts, hidden), e_score_correction_bias buffer,
+# n_group/topk_group, norm_topk_prob, routed_scaling_factor (2.5).
+```
+
 ## Expected performance envelope
 
 Rough sizing: the MoE holds ~300 B expert parameters at 2.51 bpw (~95 GB on
