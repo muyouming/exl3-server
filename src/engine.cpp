@@ -242,22 +242,36 @@ GenerateResult Engine::generate(const std::vector<int>& prompt, const GenerateOp
         batch.insert(batch.end(), props.begin(), props.end());
         const int offset_before = cache_.offset;
         Model::ForwardResult vr = model_.forward_multi(batch, cache_, true);
+        // greedy[i] predicts the token after (cur, props[0..i-1]), so props[i]
+        // is accepted exactly when it equals greedy[i].
         int accept = 0;
-        while (accept < (int)props.size() && props[(size_t)accept] == vr.greedy[(size_t)accept + 1])
+        while (accept < (int)props.size() && props[(size_t)accept] == vr.greedy[(size_t)accept])
           accept++;
-        // Commit: keep the feed token plus the accepted proposals.
-        if (offset_before + 1 + accept < cache_.offset) cache_.trim(offset_before + 1 + accept);
+        // Emit at most what the token budget allows, and keep the KV cache in
+        // step with exactly what was emitted.
+        const int budget = opt.max_tokens - (int)res.completion_tokens;
+        if (budget <= 0) { res.finish_reason = "length"; break; }
+        const int wanted = accept + 1; // accepted proposals plus the target's own token
+        const int n = std::min(wanted, budget);
+        // The cache must keep `cur` plus the accepted proposals; the last
+        // emitted token always stays out of the cache (it is fed next round).
+        const int keep = offset_before + std::min(1 + accept, n);
+        if (keep < cache_.offset) cache_.trim(keep);
         bool stop_now = false;
-        for (int j = 0; j < accept && !stop_now; ++j) {
+        for (int j = 0; j < accept && j < n && !stop_now; ++j) {
           history.push_back(props[(size_t)j]);
           if (cache_.offset > (int)prefix_.size()) prefix_.push_back(props[(size_t)j]);
           stop_now = !emit(props[(size_t)j]);
         }
-        taps = vr.taps.empty() ? std::vector<float>() : vr.taps[(size_t)accept];
-        cur = vr.greedy[(size_t)accept];
+        const int bonus = vr.greedy[(size_t)accept];
+        if (!stop_now && n > accept) {
+          history.push_back(bonus);
+          stop_now = !emit(bonus);
+        }
         if (stop_now) { stopped = true; break; }
-        history.push_back(cur);
-        if (!emit(cur)) { stopped = true; break; }
+        if (n < wanted) { res.finish_reason = "length"; break; }
+        taps = vr.taps.empty() ? std::vector<float>() : vr.taps[(size_t)accept];
+        cur = bonus;
       }
     }
   } else {
