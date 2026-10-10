@@ -305,24 +305,44 @@ G5Linear load_linear(const Store& st, const std::string& key, std::string& err) 
     lin.out_features = (int)(nt * 16);
     lin.tw.in_features = lin.in_features;
     lin.tw.out_features = lin.out_features;
-    // The packed words are kept as raw bytes: MLX's `view()` divides a buffer
-    // offset when reinterpreting it as a wider dtype, so a uint32 view of the
-    // file bytes would silently start up to 3 bytes early (a shard's header
-    // length is arbitrary, so a tensor need not begin on a 4-byte boundary).
+    // The packed words stay a zero-copy view of the shard when the tensor's
+    // byte offset allows it: a page-aligned mmap plus the tensor's own offset
+    // is 4-byte aligned whenever that offset is, which is what lets the GEMV
+    // read each tile word with one aligned 32-bit load. A shard's JSON header
+    // has an arbitrary length, so some tensors (the lm_head here) start 2 bytes
+    // in: those get an aligned materialised copy instead (trellis_pack), so the
+    // kernel's word loads are aligned for every tensor and its value is the
+    // file's bytes either way.
+    // The words stay a zero-copy view of the shard, and `aligned` says whether
+    // the tensor's byte offset lets the GEMV read a tile word as one aligned
+    // 32-bit load. A shard's JSON header has an arbitrary length and 11 of this
+    // checkpoint's 13 shards have header_len % 4 != 0, i.e. 96 of its 102 GB of
+    // trellis weights, so most tensors take the four-byte spelling of the word
+    // (~20% slower on the 4096x24576 K4 shape, measured).
+    //
+    // Materialising those tensors with trellis_pack() instead - a byte-exact
+    // copy into an aligned, engine-owned buffer - makes every word load aligned
+    // but was measured a 2x *loss* end to end on this 128 GB machine (the MoE
+    // stage: 123 -> 257 ms per step): 96 GB of anonymous weight memory is
+    // subject to the compressor, where the file mapping's clean pages are
+    // simply reclaimable. The pack is therefore used only where the view is not
+    // possible; trellis_pack() remains the way to obtain an aligned buffer (and
+    // is what the tests and the benchmark build their weights with).
     mx::array packed = mx::array(0.0f);
     std::string view_err;
-    if (!tensor_view(st, key + ".trellis", mx::uint8,
+    if (tensor_view(st, key + ".trellis", mx::uint8,
                      mx::Shape{(int)kt, (int)nt, (int)(words16 * 2)}, packed, view_err)) {
-      // fall back to a copy of the packed weights
+      lin.tw.aligned = ((f->header_len + info.offset) % 4) == 0;
+    } else {
       const uint8_t* src = f->data(key + ".trellis", err);
       if (!src) return lin;
-      auto* holder = new std::vector<uint8_t>((size_t)(kt * nt * words16 * 2));
-      std::memcpy(holder->data(), src, holder->size());
-      packed = mx::array((void*)holder->data(),
-                         mx::Shape{(int)kt, (int)nt, (int)(words16 * 2)}, mx::uint8,
-                         [holder](void*) { delete holder; });
+      packed = trellis_pack((const uint16_t*)src, (int)kt, (int)nt, lin.tw.K);
+      lin.tw.aligned = true; // trellis_pack's buffer is 16-byte aligned
     }
-    mx::eval(packed);
+    if (packed.size() == 0) {
+      err = key + ": empty trellis";
+      return lin;
+    }
     lin.tw.packed = packed;
     lin.tw.suh = load_any(st, key + ".suh", false, false, err);
     lin.tw.svh = load_any(st, key + ".svh", false, false, err);

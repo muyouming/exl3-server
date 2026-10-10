@@ -2,16 +2,18 @@
 // against the independent reference decoder in src/exl3.cpp, element by element,
 // on tensors of the real checkpoint.
 //
-// This is the regression test for the packed-word alignment: the trellis words
-// are addressed as raw little-endian BYTES (TrellisWeight::packed) because a
+// This is the regression test for the packed-word layout: the trellis words are
+// little-endian BYTES (TrellisWeight::packed, built by trellis_pack) and a
 // safetensors tensor does not have to start on a 4-byte boundary - a shard's
-// header length is arbitrary - and MLX truncates a buffer offset when an array
-// is viewed as a wider dtype. Every trellis tensor in this checkpoint whose
-// shard header length is not a multiple of 4 used to decode from a byte-shifted
-// word stream, which silently produced a "plausible" but wrong weight matrix for
-// the whole model (including the lm_head). Comparing the two decoders element
-// by element catches that immediately: with a shifted stream, essentially every
-// weight differs.
+// header length is arbitrary - so a zero-copy view of the shard used to decode
+// from a byte-shifted word stream, silently producing a "plausible" but wrong
+// weight matrix for the whole model (including the lm_head). The loader now
+// materialises the words into an aligned, engine-owned buffer, which is what
+// lets the kernel read each word as one aligned 32-bit load; this test keeps
+// comparing the kernel's decode against the reference decoder element by
+// element, so a mis-set pack (or any future layout change) still shows up as
+// essentially every weight differing. The `shard_off%4` column records the file
+// alignments this checkpoint actually exhibits.
 //
 // Build (repo root):
 //   clang++ -std=c++20 -O2 -Ivendor -Isrc -I$(brew --prefix mlx)/include \

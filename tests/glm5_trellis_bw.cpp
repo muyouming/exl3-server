@@ -15,20 +15,25 @@
 //
 //   usage: /tmp/glm5_trellis_bw [iterations_per_graph]
 //
-// Measured on an M4 Max (128 GB), MB/s of packed weights read:
-//   shape                        rows=1  rows=2  rows=4  rows=8
-//   qkv_proj  4096x24576 K4        123     121      69      24
-//   o_proj    8192x4096  K4        141      95      96      32
-//   expert    4096x2048  K3         56      39      44      19
-//   expert    2048x4096  K3         54      40      44      19
-//   f_a       4096x256   K4         15       5       5       8
-//   f16 matmul 4096x24576 (ref)    367     196     201     199
+// The iteration count matters: at 8 iterations per graph the host-side dispatch
+// of the 3 kernels per iteration is what gets measured (~123 GB/s for the
+// 4096x24576 tensor at rows=1). From ~64 iterations on, the number is the
+// kernel's. Measured on an M4 Max (128 GB), GB/s of packed weights read, raw
+// QMV (no Hadamards), 64 iterations per graph, before -> after the aligned-word
+// / row-blocking pass in trellis_gemm.cpp:
 //
-// i.e. the trellis GEMV is ~3x off a plain f16 GEMV on the same output shape at
-// one row (memory access, not arithmetic: replacing the codebook decode with a
-// trivial op only makes it 25% faster), it is latency-bound on the small
-// per-layer tensors, and it gets *worse* with rows (register/issue pressure
-// rather than weight reuse), unlike the f16 matmul which stays flat.
+//   shape                        rows=1        rows=2       rows=4      rows=8
+//   qkv_proj  4096x24576 K4   254 -> 305    139 -> 244   71 -> 138   26 -> 72
+//   o_proj    8192x4096  K4   199 -> 225    115 -> 176  112 -> 124   32 -> 67
+//   expert    4096x2048  K3   110 -> 134     64 -> 101   74 ->  77   24 -> 44
+//   expert    2048x4096  K3   105 -> 123     60 ->  96   55 ->  58   22 -> 30
+//   f_a       4096x256   K4    51 ->  45     29 ->  29   26 ->  28    9 -> 16
+//   f16 matmul 4096x24576(ref)       420 GB/s at rows=1, 200 GB/s at rows 2-8
+//
+// so the trellis GEMV is 1.35x off a plain f16 GEMV in *time* at one row (it
+// reads 4x fewer bytes), the rows collapse was accumulator spills rather than
+// weight re-reads, and the small per-layer tensors (f_a) are launch-bound:
+// batching them, not a better kernel, is what they need.
 // Effective weight-read bandwidth of the trellis GEMV per shape and row count,
 // with the mx::eval overhead excluded (a batch of iterations is built into one
 // graph and evaluated once; a no-op baseline shows what dispatch alone costs).
@@ -52,18 +57,9 @@ static double now_ms2() {
   return std::chrono::duration<double, std::milli>(c::now().time_since_epoch()).count();
 }
 
-static mx::array page_bytes(size_t n, unsigned seed) {
-  const size_t page = 16384, len = ((n + page - 1) / page) * page;
-  void* p = nullptr;
-  if (posix_memalign(&p, page, len) != 0) std::abort();
-  std::mt19937 rng(seed);
-  uint8_t* b = (uint8_t*)p;
-  for (size_t i = 0; i < n; ++i) b[i] = (uint8_t)rng();
-  static std::vector<void*> keep;
-  keep.push_back(p);
-  return mx::array(p, mx::Shape{(int)len}, mx::uint8, [](void*) {});
-}
-
+// The packed words are built through the engine's own trellis_pack, so the
+// benchmark measures the buffer layout the model actually runs on (aligned,
+// engine-owned; a zero-copy shard view would be the only alternative).
 static exl3::G5Linear make_trellis(int in, int out, int K, unsigned seed) {
   exl3::G5Linear l;
   l.quantized = true;
@@ -73,9 +69,11 @@ static exl3::G5Linear make_trellis(int in, int out, int K, unsigned seed) {
   l.tw.codebook = 2;
   l.tw.in_features = in;
   l.tw.out_features = out;
-  const int64_t nb = (int64_t)(in / 16) * (out / 16) * (16 * K) * 2;
-  l.tw.packed = mx::reshape(mx::slice(page_bytes((size_t)nb, seed), {0}, {(int)nb}),
-                            {in / 16, out / 16, 16 * K * 2});
+  const int64_t nwords = (int64_t)(in / 16) * (out / 16) * (8 * K);
+  std::vector<uint16_t> src((size_t)nwords);
+  std::mt19937 rng(seed);
+  for (auto& v : src) v = (uint16_t)rng();
+  l.tw.packed = exl3::trellis_pack(src.data(), in / 16, out / 16, K);
   l.tw.suh = mx::ones({in}, mx::float16);
   l.tw.svh = mx::ones({out}, mx::float16);
   mx::eval(l.tw.packed, l.tw.suh, l.tw.svh);
@@ -99,7 +97,7 @@ static double batch_ms(int reps, int rounds, auto&& build) {
 }
 
 int main(int argc, char** argv) {
-  const int reps = argc > 1 ? std::atoi(argv[1]) : 8;
+  const int reps = argc > 1 ? std::atoi(argv[1]) : 64;
   struct Shape {
     const char* name;
     int in, out, K;

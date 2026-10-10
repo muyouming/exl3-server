@@ -234,13 +234,23 @@ The implementation was checked against independent references, not just by "it r
 - GLM-5.3-Flash is trellis-resident only (no f16 fallback: materialising 100 GB
   of f16 beside the checkpoint is not feasible) and its speculative decoding has
   not been exercised; `model.visual.*` and the MTP layer 45 are skipped.
-- GLM-5.3-Flash decode is launch-bound at 3.0-3.6 tok/s (~317 ms/step, of which
-  KDA 47 ms, MLA+indexer 24 ms, MoE 77 ms over 42 layers, dense 3 ms; the rest
-  is per-layer periphery: two hyper-connection weight computations with a
-  20-iteration Sinkhorn on a 4x4 matrix each, two norms and host-side indexer
-  bookkeeping). Roughly 4000-5000 kernels per token at ~30-50 us. The weights
-  themselves would allow ~70 tok/s, so kernel fusion (fused Hadamards, grouped
-  expert GEMV, fused Sinkhorn) is the next step, not a bandwidth limit.
+- GLM-5.3-Flash decode runs at **6.5 tok/s (153 ms/step) serial and 8.6 tok/s
+  effective with `--draft-mtp 4` (117 ms/step)** on an M4 Max, measured
+  back-to-back on the real checkpoint (best of 3 repeats of a 16-token greedy
+  run; the box drifts ~30% between sessions, so only same-session numbers are
+  comparable - the same binary measured 234 ms/step before the aligned-word and
+  row-blocking pass below). The step is no longer GEMV-bound: the MoE stage is
+  123 of the 153 ms over 42 layers while the 8 routed experts' weights cost only
+  ~0.6 ms of GEMV per layer, so what is left is per-layer machinery - the
+  router's ~25 small ops plus one `mx::eval` per layer (the selected expert ids
+  are read on the host to build the grouped GEMV's buffer list), the
+  per-expert gather/scatter of the prefill path, and two hyper-connection
+  Sinkhorn sites per layer. The weight reads themselves run at 250-300 GB/s
+  (a plain f16 GEMV of the same output shape reaches 420 GB/s while reading 4x
+  more bytes), and the small per-layer projections (0.5 MB) are launch-bound.
+  See `docs/perf.md` for the measured attribution; the 14.3 ms/step that 70
+  tok/s would need is not reachable without removing the per-layer host syncs
+  and fusing the two Hadamards into the GEMV.
 
 - EXL3 + plain Llama-family architectures only (no MoE/MLA/custom architectures, no
   `rope_scaling`).

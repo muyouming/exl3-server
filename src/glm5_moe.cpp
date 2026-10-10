@@ -104,16 +104,70 @@ mx::array moe_layer(const G5Layer& l, const ModelConfig& cfg, const mx::array& h
     // weighted sum. The arithmetic is the general path's: each expert output is
     // scaled in f32, rounded to the streams' dtype, and the K terms are summed
     // k = 0, 1, ... in the same order the general path accumulates them.
-    std::vector<mx::array> outs;
-    outs.reserve((size_t)K);
-    for (int k = 0; k < K; ++k) {
-      const int e = (int)idx[k];
-      outs.push_back(swiglu(l.experts[(size_t)(e * 3 + 0)], l.experts[(size_t)(e * 3 + 1)],
-                            l.experts[(size_t)(e * 3 + 2)], h, cfg.swiglu_limit));
+    //
+    // Grouped form (EXL3_MOE_NONGROUPED disables it): the 8 routed experts are
+    // applied as three multi-buffer launches - gate, up and down - instead of
+    // 3*K single-tensor linears, each launch keeping every member's own scale
+    // vectors, split geometry and accumulation order (see
+    // trellis_linear_group). The elementwise swiglu then runs on the stacked
+    // (K, 1, out) arrays, which is the same arithmetic on the same values.
+    bool grouped = std::getenv("EXL3_MOE_NONGROUPED") == nullptr;
+    std::vector<G5Linear const*> gsel;
+    if (grouped) {
+      for (int k = 0; k < K; ++k) {
+        const int e = (int)idx[k];
+        const G5Linear& g0 = l.experts[(size_t)(e * 3 + 0)];
+        const G5Linear& u0 = l.experts[(size_t)(e * 3 + 1)];
+        const G5Linear& d0 = l.experts[(size_t)(e * 3 + 2)];
+        if (!g0.quantized || !u0.quantized || !d0.quantized || g0.has_bias || u0.has_bias ||
+            d0.has_bias || g0.tw.in_features != u0.tw.in_features ||
+            g0.tw.out_features != u0.tw.out_features || d0.tw.in_features != u0.tw.out_features ||
+            d0.tw.out_features != g0.tw.in_features ||
+            d0.tw.codebook != g0.tw.codebook || g0.tw.codebook != u0.tw.codebook ||
+            d0.tw.K != g0.tw.K || g0.tw.K != u0.tw.K) {
+          grouped = false; // fall back to the per-expert path below
+          break;
+        }
+        gsel.push_back(&g0);
+        gsel.push_back(&u0);
+        gsel.push_back(&d0);
+      }
     }
-    mx::array st = mx::stack(outs, 0);                       // (K, 1, 1, H)
-    mx::array wt = mx::reshape(weights, {K, 1, 1, 1});       // (K, 1, 1, 1), f32
-    routed = mx::reshape(mx::sum(mx::astype(mx::multiply(st, wt), h.dtype()), 0), {B, L, H});
+    if (grouped) {
+      std::vector<TrellisWeight> ws_gate, ws_up, ws_down;
+      for (int k = 0; k < K; ++k) {
+        ws_gate.push_back(gsel[(size_t)(k * 3 + 0)]->tw);
+        ws_up.push_back(gsel[(size_t)(k * 3 + 1)]->tw);
+        ws_down.push_back(gsel[(size_t)(k * 3 + 2)]->tw);
+      }
+      mx::array flat = mx::reshape(h, {N, H});
+      const float limit = cfg.swiglu_limit;
+      // gate / up: (K, rows, out), one launch each, then swiglu on the stacks.
+      mx::array gate = trellis_linear_group(ws_gate, flat);
+      mx::array up = trellis_linear_group(ws_up, flat);
+      gate = mx::clip(gate, std::nullopt, mx::array(limit, gate.dtype()));
+      up = mx::clip(up, mx::array(-limit, up.dtype()), mx::array(limit, up.dtype()));
+      mx::array act = mx::multiply(gate, mx::sigmoid(gate));
+      mx::array actup = mx::multiply(act, up);
+      const int inn = ws_down[0].in_features;
+      const int rows_per = (int)(actup.size() / ((int64_t)K * inn));
+      mx::array down = trellis_linear_group_rows(ws_down, actup, rows_per);
+      // (K, rows, H) -> (K, rows, 1, H) and the general path's weighted sum.
+      mx::array st = mx::reshape(down, {K, N, 1, H});
+      mx::array wt = mx::reshape(weights, {K, 1, 1, 1});
+      routed = mx::reshape(mx::sum(mx::astype(mx::multiply(st, wt), h.dtype()), 0), {B, L, H});
+    } else {
+      std::vector<mx::array> outs;
+      outs.reserve((size_t)K);
+      for (int k = 0; k < K; ++k) {
+        const int e = (int)idx[k];
+        outs.push_back(swiglu(l.experts[(size_t)(e * 3 + 0)], l.experts[(size_t)(e * 3 + 1)],
+                              l.experts[(size_t)(e * 3 + 2)], h, cfg.swiglu_limit));
+      }
+      mx::array st = mx::stack(outs, 0);                       // (K, 1, 1, H)
+      mx::array wt = mx::reshape(weights, {K, 1, 1, 1});       // (K, 1, 1, 1), f32
+      routed = mx::reshape(mx::sum(mx::astype(mx::multiply(st, wt), h.dtype()), 0), {B, L, H});
+    }
   } else {
     std::vector<std::vector<int>> work(E);
     for (int t = 0; t < N; ++t)

@@ -420,6 +420,89 @@ int main() {
     check("dense_mlp(f16) vs oracle", dout, dexp, 3e-2);
   }
 
+  // -------------------------------------------------------------------------
+  // (d) quantized experts: the grouped decode fast path (all routed experts in
+  // one launch per projection) must be bit-identical to the per-expert fast
+  // path and to the general gather/scatter path.
+  // -------------------------------------------------------------------------
+  std::printf("== (f) grouped vs per-expert vs general (quantized, bit-equality) ==\n");
+  {
+    const int QH = 32, QI = 32, QE = 4, QK = 3;
+    auto mkq = [&](int in, int out, int kk, unsigned seed) {
+      exl3::G5Linear g;
+      g.quantized = true;
+      g.in_features = in;
+      g.out_features = out;
+      g.tw.in_features = in;
+      g.tw.out_features = out;
+      g.tw.K = kk;
+      g.tw.codebook = 2;
+      std::vector<uint16_t> src((size_t)(in / 16) * (out / 16) * (16 * kk));
+      std::mt19937 r2(seed);
+      for (auto& v : src) v = (uint16_t)r2();
+      g.tw.packed = exl3::trellis_pack(src.data(), in / 16, out / 16, kk);
+      std::vector<float> sc((size_t)in), sv((size_t)out);
+      for (size_t i = 0; i < sc.size(); ++i) sc[i] = 0.5f + 0.01f * (float)((i * 13u + seed) % 17u);
+      for (size_t i = 0; i < sv.size(); ++i) sv[i] = 0.25f + 0.01f * (float)((i * 7u + seed) % 13u);
+      g.tw.suh = mx::astype(mx::array(sc.data(), {in}, mx::float32, [](void*) {}), mx::float16);
+      g.tw.svh = mx::astype(mx::array(sv.data(), {out}, mx::float32, [](void*) {}), mx::float16);
+      mx::eval(g.tw.packed, g.tw.suh, g.tw.svh);
+      return g;
+    };
+    exl3::G5Layer ql;
+    ql.moe = true;
+    ql.experts.resize((size_t)QE * 3);
+    for (int e = 0; e < QE; ++e) {
+      ql.experts[(size_t)(e * 3 + 0)] = mkq(QH, QI, 3, 101u + (unsigned)e);
+      ql.experts[(size_t)(e * 3 + 1)] = mkq(QH, QI, 3, 201u + (unsigned)e);
+      ql.experts[(size_t)(e * 3 + 2)] = mkq(QI, QH, 3, 301u + (unsigned)e);
+    }
+    std::mt19937 qr(5);
+    std::vector<float> qw2((size_t)QE * QH), qb2((size_t)QE);
+    for (auto& v : qw2) v = 0.2f * (float)(qr() % 100) / 100.0f - 0.1f;
+    for (auto& v : qb2) v = 0.05f * (float)(qr() % 100) / 100.0f;
+    ql.router_w = mk2(qw2, QE, QH);
+    ql.router_bias = mk1(qb2);
+    ql.shared_gate = mkq(QH, QI, 3, 401);
+    ql.shared_up = mkq(QH, QI, 3, 402);
+    ql.shared_down = mkq(QI, QH, 3, 403);
+
+    exl3::ModelConfig qc;
+    qc.hidden_size = QH;
+    qc.n_routed_experts = QE;
+    qc.num_experts_per_tok = QK;
+    qc.moe_intermediate_size = QI;
+    qc.n_shared_experts = 1;
+    qc.routed_scaling_factor = 1.5f;
+    qc.swiglu_limit = 10.0f;
+    qc.norm_topk_prob = true;
+
+    std::vector<float> qh((size_t)QH);
+    for (int i = 0; i < QH; ++i) qh[(size_t)i] = 0.05f * (float)((i * 17) % 23) - 0.5f;
+    mx::array qx = mx::astype(mx::array(qh.data(), {1, 1, QH}, mx::float32, [](void*) {}),
+                              mx::float16);
+    mx::eval(qx);
+    auto run = [&](const char* nongrouped, const char* general) {
+      unsetenv("EXL3_MOE_GENERAL");
+      unsetenv("EXL3_MOE_NONGROUPED");
+      if (nongrouped) setenv("EXL3_MOE_NONGROUPED", "1", 1);
+      if (general) setenv("EXL3_MOE_GENERAL", "1", 1);
+      mx::array y = exl3::moe_layer(ql, qc, qx);
+      mx::eval(y);
+      const uint8_t* p = (const uint8_t*)y.data<uint16_t>();
+      uint64_t h = 1469598103934665603ull;
+      for (size_t i = 0; i < (size_t)y.size() * 2; ++i) h = (h ^ p[i]) * 1099511628211ull;
+      return h;
+    };
+    const uint64_t hg = run(nullptr, nullptr);
+    const uint64_t hp = run("1", nullptr);
+    const uint64_t hr = run(nullptr, "1");
+    std::printf("  grouped %016llx  per-expert %016llx  general %016llx\n",
+                (unsigned long long)hg, (unsigned long long)hp, (unsigned long long)hr);
+    eq("grouped == per-expert", hg == hp);
+    eq("grouped == general", hg == hr);
+  }
+
   std::printf("%s\n", g_ok ? "ALL OK" : "FAILURES");
   return g_ok ? 0 : 1;
 }

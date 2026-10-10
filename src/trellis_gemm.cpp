@@ -32,7 +32,7 @@ const char* kQmvSource = R"METAL(
   uint simd = simdgroup_index_in_threadgroup;
   uint tile_n = threadgroup_position_in_grid.x * uint(QMV_NT);
   uint row_base = threadgroup_position_in_grid.y * uint(QMV_MB);
-  uint split = threadgroup_position_in_grid.z;
+@GROUPHEAD@
 
   uint word0[2];
   uint word1[2];
@@ -45,10 +45,6 @@ const char* kQmvSource = R"METAL(
     word0[g] = uint(last_word - 1) % uint(PACKED_U32);
     shift[g] = uint((last_word + 1) * 32 - end);
   }
-  // The lane's eight positions span at most four 32-bit words, so one aligned
-  // 4-word load (a single instruction instead of four) feeds every group.
-  // Lanes whose span wraps the ring end fall back to per-group loads.
-
   float acc[QMV_MB][QMV_NT][8];
   for (uint b = 0u; b < uint(QMV_MB); ++b) {
     for (uint ot = 0u; ot < uint(QMV_NT); ++ot) {
@@ -65,7 +61,8 @@ const char* kQmvSource = R"METAL(
     for (uint b = 0u; b < uint(QMV_MB); ++b) {
       uint row = row_base + b;
       const device half2* xpairs =
-          reinterpret_cast<const device half2*>(xhat + row * uint(INPUT_DIMS) + tk * 16u);
+          reinterpret_cast<const device half2*>(xhat + @XOFF@ row * uint(INPUT_DIMS) +
+                                                tk * 16u);
       half2 xp = xpairs[lane & 7u];
       half2 xa = simd_shuffle(xp, ushort(lane & 3u));
       half2 xb = simd_shuffle(xp, ushort((lane & 3u) + 4u));
@@ -75,11 +72,17 @@ const char* kQmvSource = R"METAL(
       xv[b][3] = float(xb.y);
     }
     for (uint ot = 0u; ot < uint(QMV_NT); ++ot) {
-      // `trellis` is the raw little-endian byte stream of the tile's packed
-      // words; word j is 4 bytes starting at 4*j.
+      // `wsel` addresses this member's raw little-endian byte stream; word j of
+      // a tile is 4 bytes starting at 4*j.
       const device uchar* tile =
-          trellis + (tk * uint(TILES_N) + tile_n + ot) * uint(PACKED_BYTES);
+          wsel + (tk * uint(TILES_N) + tile_n + ot) * uint(PACKED_BYTES);
       for (uint g = 0u; g < 2u; ++g) {
+        // Two aligned 32-bit loads of the ring words that bracket this lane's
+        // eight positions (the ring's wrap is why they are not one 8-byte
+        // load). Byte-granular loads of the same two words measured 20% slower
+        // on the 4096x24576 K4 shape, and fetching the neighbour word with a
+        // simdgroup shuffle instead of the second load 19% slower still - the
+        // second load is an L1 hit in the same cache line.
         ulong merged = (ulong(qmv_word(tile, word0[g])) << 32) | ulong(qmv_word(tile, word1[g]));
         uint sh = shift[g];
         uint win = uint(merged >> sh);
@@ -132,25 +135,36 @@ const char* kQmvSource = R"METAL(
 #if N_SPLITS > 1
     index += split * uint(PAD_ROWS) * uint(OUTPUT_DIMS);
 #endif
-    yhat[index] = sum;
+    yhat[@YOFF@index] = sum;
   }
 )METAL";
 
 // Fixed helper prologue (codebook + reduction helpers) generated per codebook.
-std::string codebook_prologue(int cb) {
+std::string codebook_prologue(int cb, int aligned) {
   static const char* kSel4 =
       "inline uint sel4(uint4 v, uint i) {\n"
       "  return i == 0u ? v.x : (i == 1u ? v.y : (i == 2u ? v.z : v.w));\n"
       "}\n";
-  // The packed trellis words are addressed as raw little-endian bytes: an MLX
-  // buffer offset is an element offset, and the file bytes of a tensor are not
-  // guaranteed to be 4-byte aligned.
-  static const char* kWord =
+  // The packed trellis words are addressed as raw little-endian bytes. When the
+  // buffer's base is 4-byte aligned (which trellis_pack guarantees, and which a
+  // zero-copy view of a shard can promise only when its header length happens
+  // to be a multiple of 4) word j is one aligned 32-bit load; otherwise it is
+  // assembled from the same four bytes, which is ~20% slower on the 4096x24576
+  // K4 shape but keeps the byte-stream contract exact.
+  static const char* kWordAligned =
+      "inline uint qmv_word(const device uchar* p, uint j) {\n"
+      "  return *reinterpret_cast<const device uint*>(p + j * 4u);\n"
+      "}\n";
+  static const char* kWordBytes =
       "inline uint qmv_word(const device uchar* p, uint j) {\n"
       "  uint b = j * 4u;\n"
       "  return uint(p[b]) | (uint(p[b + 1u]) << 8) | (uint(p[b + 2u]) << 16) |\n"
       "         (uint(p[b + 3u]) << 24);\n"
       "}\n";
+  const char* kWord = aligned ? kWordAligned : kWordBytes;
+  // EXL3_QMV_NODECODE swaps the codebook decode for `x & 0xff`: the bandwidth
+  // numbers then show what the memory path alone costs (the arithmetic is not
+  // what limits this kernel - see docs/perf.md).
   if (std::getenv("EXL3_QMV_NODECODE")) {
     return std::string("#include <metal_stdlib>\nusing namespace metal;\n") + kWord +
            "inline float quad_sum(float v) { v += simd_shuffle_xor(v, ushort(1));"
@@ -196,7 +210,13 @@ std::string codebook_prologue(int cb) {
 const char* kHadSource = R"METAL(
   uint tid = thread_position_in_threadgroup.x;
   uint block = threadgroup_position_in_grid.x;
-  const device half* sp = scale_vec + (block % uint(BLOCKS_PER_ROW)) * 128u;
+  // With a stacked scale vector (one in_features-long vector per member, the
+  // grid covering n x rows x blocks_per_row blocks in that order) the block's
+  // member selects its slice. S_STRIDE is 0 otherwise, which folds the whole
+  // term away.
+  const device half* sp = scale_vec + (block / uint(ROWS_PER_MEMBER * BLOCKS_PER_ROW)) *
+                                           uint(S_STRIDE) +
+                           (block % uint(BLOCKS_PER_ROW)) * 128u;
   threadgroup float buf[128];
   threadgroup float buf2[128];
   // The input is rounded to f16 before the transform, which is where the
@@ -225,29 +245,34 @@ const char* kHadSource = R"METAL(
 struct HadConfig {
   int blocks_per_row; // in_features / 128
   bool pre;           // scale before the transform (input side) or after
+  bool stacked;       // the scale vector is packed per member (n blocks of it)
+  int rows;           // rows per member (only needed when stacked)
   bool operator==(const HadConfig& o) const {
-    return blocks_per_row == o.blocks_per_row && pre == o.pre;
+    return blocks_per_row == o.blocks_per_row && pre == o.pre && stacked == o.stacked &&
+           rows == o.rows;
   }
 };
 
 std::string had_key(const HadConfig& c) {
   char buf[96];
-  std::snprintf(buf, sizeof(buf), "had_%d_%d", c.blocks_per_row, (int)c.pre);
+  std::snprintf(buf, sizeof(buf), "had_%d_%d_%d_%d", c.blocks_per_row, (int)c.pre, (int)c.stacked,
+                c.rows);
   return buf;
 }
 
 struct Config {
-  int in, out, K, cb, nt, sg, mb, splits, pad_rows;
+  int in, out, K, cb, nt, sg, mb, splits, pad_rows, group, aligned;
   bool operator==(const Config& o) const {
     return in == o.in && out == o.out && K == o.K && cb == o.cb && nt == o.nt && sg == o.sg &&
-           mb == o.mb && splits == o.splits && pad_rows == o.pad_rows;
+           mb == o.mb && splits == o.splits && pad_rows == o.pad_rows && group == o.group &&
+           aligned == o.aligned;
   }
 };
 
 std::string config_key(const Config& c) {
   char buf[128];
-  std::snprintf(buf, sizeof(buf), "%d_%d_%d_%d_%d_%d_%d_%d_%d", c.in, c.out, c.K, c.cb, c.nt,
-                c.sg, c.mb, c.splits, c.pad_rows);
+  std::snprintf(buf, sizeof(buf), "%d_%d_%d_%d_%d_%d_%d_%d_%d_%d_%d", c.in, c.out, c.K, c.cb, c.nt,
+                c.sg, c.mb, c.splits, c.pad_rows, c.group, c.aligned);
   return buf;
 }
 
@@ -264,22 +289,55 @@ const mx::fast::CustomKernelFunction& kernel_for(const Config& c) {
   auto it = g_kernels.find(key);
   if (it != g_kernels.end()) return it->second;
 
-  std::string header = codebook_prologue(c.cb);
-  char buf[640];
+  std::string header = codebook_prologue(c.cb, c.aligned);
+  char buf[704];
   std::snprintf(buf, sizeof(buf),
                 "#define K %d\n#define CBK %d\n#define INPUT_DIMS %d\n#define TILES_K %d\n"
                 "#define TILES_N %d\n#define OUTPUT_DIMS %d\n#define PACKED_U32 %d\n"
                 "#define PACKED_BYTES %d\n"
                 "#define QMV_NT %d\n#define QMV_MB %d\n#define QMV_SG %d\n#define N_SPLITS %d\n"
-                "#define PAD_ROWS %d\n",
+                "#define PAD_ROWS %d\n#define N_GROUP %d\n"
+                "#define X_STRIDE (PAD_ROWS * INPUT_DIMS)\n"
+                "#define Y_STRIDE (N_SPLITS * PAD_ROWS * OUTPUT_DIMS)\n",
                 c.K, c.cb, c.in, c.in / 16, c.out / 16, c.out, 8 * c.K, 32 * c.K, c.nt, c.mb, c.sg,
-                c.splits, c.pad_rows);
+                c.splits, c.pad_rows, c.group);
   header += buf;
+
+  // One launch covers `group` tensors when group > 1: grid.z enumerates
+  // (split, member) and each member reads its own weight buffer and its own
+  // PAD_ROWS slice of the stacked activations/output.
+  std::vector<std::string> inputs = {"xhat"};
+  std::string body = kQmvSource;
+  std::string head;
+  if (c.group > 1) {
+    for (int m = 0; m < c.group; ++m) inputs.push_back("trellis" + std::to_string(m));
+    head = "  uint member = threadgroup_position_in_grid.z / uint(N_SPLITS);\n"
+           "  uint split = threadgroup_position_in_grid.z % uint(N_SPLITS);\n"
+           "  const device uchar* wsel = trellis0;\n";
+    head += "  switch (member) {\n";
+    for (int m = 1; m < c.group; ++m) {
+      head += "    case " + std::to_string(m) + "u: wsel = trellis" + std::to_string(m) +
+              "; break;\n";
+    }
+    head += "    default: break;\n  }\n";
+  } else {
+    inputs.push_back("trellis");
+    head = "  uint split = threadgroup_position_in_grid.z;\n"
+           "  const device uchar* wsel = trellis;\n";
+  }
+  auto subst = [&](const char* what, const std::string& with) {
+    const size_t pos = body.find(what);
+    if (pos == std::string::npos) throw std::runtime_error(std::string("qmv source: no ") + what);
+    body.replace(pos, std::strlen(what), with);
+  };
+  subst("@GROUPHEAD@\n", head);
+  subst("@XOFF@", c.group > 1 ? "member * uint(X_STRIDE) + " : "");
+  subst("@YOFF@", c.group > 1 ? "member * uint(Y_STRIDE) + " : "");
 
   char name[160];
   std::snprintf(name, sizeof(name), "exl3_qmv_%s", key.c_str());
-  auto fn = mx::fast::metal_kernel(name, {"xhat", "trellis"}, {"yhat"}, kQmvSource, header, true,
-                                   false, mx::CompileOptions{});
+  auto fn = mx::fast::metal_kernel(name, inputs, {"yhat"}, body, header, true, false,
+                                   mx::CompileOptions{});
   return g_kernels.emplace(key, std::move(fn)).first->second;
 }
 
@@ -289,11 +347,12 @@ const mx::fast::CustomKernelFunction& had_kernel_for(const HadConfig& c) {
   const std::string key = had_key(c);
   auto it = g_had_kernels.find(key);
   if (it != g_had_kernels.end()) return it->second;
-  char buf[256];
+  char buf[320];
   std::snprintf(buf, sizeof(buf),
                 "#define BLOCKS_PER_ROW %d\n#define HAD_PRE %d\n#define HAD_SCALE %a\n"
-                "#define HALF_OUT(v) half(v)\n",
-                c.blocks_per_row, (int)c.pre, (double)kHadScale);
+                "#define HALF_OUT(v) half(v)\n#define S_STRIDE %d\n#define ROWS_PER_MEMBER %d\n",
+                c.blocks_per_row, (int)c.pre, (double)kHadScale,
+                c.stacked ? c.blocks_per_row * 128 : 0, c.stacked ? c.rows : 1);
   std::string header = std::string("#include <metal_stdlib>\nusing namespace metal;\n") + buf;
   char name[96];
   std::snprintf(name, sizeof(name), "exl3_%s", key.c_str());
@@ -308,14 +367,17 @@ const mx::fast::CustomKernelFunction& had_kernel_for(const HadConfig& c) {
 // The output side reads the QMV's f32 result and rounds it to f16 itself,
 // which is where the operator graph used to put its `astype`: one dispatch
 // fewer per linear (~1450 per decode token) with the same arithmetic.
+// `s` is either one (in_features,) vector (the single-tensor form) or a packed
+// concatenation of one per member (the stacked form, with `rows` rows per
+// member and x's blocks in (member, row, block) order).
 mx::array hadamard_run(const mx::array& x, const mx::array& s, int blocks_per_row, bool pre,
-                       const mx::Shape& out_shape) {
+                       const mx::Shape& out_shape, int rows = 1, bool stacked = false) {
   // NOTE: mx::Shape is a std::vector<int>, so `.size()` is the rank, not the
   // element count (a zero grid silently skips the whole transform).
   int64_t total = 1;
   for (auto d : out_shape) total *= d;
   const int64_t blocks = total / 128;
-  HadConfig cfg{blocks_per_row, pre};
+  HadConfig cfg{blocks_per_row, pre, stacked, stacked ? rows : 1};
   std::lock_guard<std::mutex> lk(g_mutex);
   const auto& kernel = had_kernel_for(cfg);
   auto outs = kernel({x, s}, {out_shape}, {mx::float16}, {(int)blocks * 128, 1, 1}, {128, 1, 1},
@@ -370,7 +432,13 @@ mx::array trellis_matmul_raw(const TrellisWeight& w, const mx::array& xhat) {
 
   TrellisTuning tn = tuning_state();
   const int sg = tn.sg > 0 ? tn.sg : 4;
-  const int mb = tn.mb > 0 ? tn.mb : (rows >= 8 ? 8 : (rows >= 4 ? 4 : 1));
+  // Rows per threadgroup: acc is QMV_MB*QMV_NT*8 floats, so the two together
+  // must stay around 4 (32 accumulators) or the kernel spills - measured on the
+  // 4096x24576 K4 shape: {mb,nt} = {4,2} at 4 rows is 1.9x slower than {4,1},
+  // {8,2} at 8 rows 2.6x slower than {4,1}, and {1,4} at 1 row 1.1x slower than
+  // {1,2}. Up to 4 rows a wider mb amortises the codebook decode over more rows
+  // and wins (rows 2..26 all best at mb = min(rows,4)).
+  const int mb = tn.mb > 0 ? tn.mb : (rows >= 4 ? 4 : rows);
   // Tiles per threadgroup: enough threadgroups to fill the GPU, but large
   // enough to amortize the per-tile decode of the activations.
   int nt = tn.nt;
@@ -379,6 +447,7 @@ mx::array trellis_matmul_raw(const TrellisWeight& w, const mx::array& xhat) {
     while (n_tiles / nt > 1024) nt *= 2;
     while (n_tiles % nt != 0) nt /= 2;
     if (nt < 1) nt = 1;
+    if (mb >= 3) nt = 1; // mb*nt <= 4
   }
   const int splits = split_count(k_tiles, n_tiles);
 
@@ -392,7 +461,7 @@ mx::array trellis_matmul_raw(const TrellisWeight& w, const mx::array& xhat) {
         {xhat, mx::zeros(mx::Shape{pad_rows - rows, in}, mx::float16)}, 0);
   }
 
-  Config cfg{in, out, w.K, w.codebook, nt, sg, mb, splits, pad_rows};
+  Config cfg{in, out, w.K, w.codebook, nt, sg, mb, splits, pad_rows, 1, w.aligned ? 1 : 0};
   std::vector<mx::Shape> shapes;
   if (splits > 1) shapes = {mx::Shape{splits, pad_rows, out}};
   else shapes = {mx::Shape{pad_rows, out}};
@@ -409,6 +478,135 @@ mx::array trellis_matmul_raw(const TrellisWeight& w, const mx::array& xhat) {
   if (splits > 1) y = mx::sum(y, std::vector<int>{0}, false);
   if (pad_rows > rows) y = mx::slice(y, {0, 0}, {rows, out});
   return y;
+}
+
+// n linears in one launch. The members must share in_features/out_features/K
+// and codebook (checked; they then need the same tiles/rows/splits geometry).
+//   x       : (n, rows, in) f16, one activation block per member
+//   returns : (n, rows, out) f16, y[m] = W_m @ x[m]
+// Everything in between is batched: one Hadamard over the stacked input with a
+// per-member scale vector, one QMV kernel whose grid.z enumerates
+// (split, member), and one Hadamard over the stacked output.
+mx::array trellis_matmul_group(const std::vector<TrellisWeight>& ws, const mx::array& x, int rows) {
+  const int n = (int)ws.size();
+  if (n <= 0) return mx::array(0.0f);
+  const int in = ws[0].in_features, out = ws[0].out_features;
+  for (const auto& w : ws) {
+    if (w.in_features != in || w.out_features != out || w.K != ws[0].K ||
+        w.codebook != ws[0].codebook || w.aligned != ws[0].aligned) {
+      throw std::invalid_argument("trellis_matmul_group: members must share their shape and word alignment");
+    }
+  }
+  const int k_tiles = in / 16, n_tiles = out / 16;
+  TrellisTuning tn = tuning_state();
+  const int sg = tn.sg > 0 ? tn.sg : 4;
+  const int mb = tn.mb > 0 ? tn.mb : (rows >= 4 ? 4 : rows);
+  int nt = tn.nt;
+  if (nt <= 0) {
+    nt = 1;
+    while (n_tiles / nt > 1024) nt *= 2;
+    while (nt > 1 && n_tiles % nt != 0) nt /= 2;
+    if (mb >= 3) nt = 1;
+  }
+  if (nt > n_tiles) nt = n_tiles;
+  const int splits = split_count(k_tiles, n_tiles);
+  int pad_rows = (int)(((rows + mb - 1) / mb) * mb);
+  if (pad_rows >= 64) pad_rows = ((pad_rows + 31) / 32) * 32;
+
+  mx::array xin = x;
+  if (pad_rows > rows) xin = mx::concatenate({x, mx::zeros({n, pad_rows - rows, in}, mx::float16)}, 1);
+
+  Config cfg{in, out, ws[0].K, ws[0].codebook, nt, sg, mb, splits, pad_rows, n,
+             ws[0].aligned ? 1 : 0};
+  std::vector<mx::Shape> shapes;
+  if (splits > 1) shapes = {mx::Shape{n, splits, pad_rows, out}};
+  else shapes = {mx::Shape{n, pad_rows, out}};
+  std::vector<mx::array> args;
+  args.reserve((size_t)n + 1);
+  args.push_back(xin);
+  for (const auto& w : ws) args.push_back(w.packed);
+  mx::array y = mx::array(0.0f);
+  {
+    std::lock_guard<std::mutex> lk(g_mutex);
+    const auto& kernel = kernel_for(cfg);
+    auto outs = kernel(args, shapes, {mx::float32},
+                       {n_tiles / nt * sg * 32, pad_rows / mb, splits * n}, {sg * 32, 1, 1},
+                       std::vector<std::pair<std::string, mx::fast::TemplateArg>>{}, std::nullopt,
+                       false, mx::default_device());
+    y = outs[0];
+  }
+  if (splits > 1) y = mx::sum(y, std::vector<int>{1}, false); // (n, pad_rows, out)
+  // One batched output Hadamard: the members' svh vectors concatenated give the
+  // per-member scale (the kernel's block index runs member-major over rows).
+  std::vector<mx::array> svh;
+  svh.reserve((size_t)n);
+  for (const auto& w : ws) svh.push_back(w.svh);
+  mx::array sstack = mx::concatenate(svh, 0);
+  y = hadamard_run(mx::reshape(y, {n * pad_rows, out}), sstack, out / 128, /*pre=*/false,
+                   mx::Shape{n * pad_rows, out}, pad_rows, /*stacked=*/true);
+  y = mx::reshape(y, {n, pad_rows, out});
+  if (pad_rows > rows) y = mx::slice(y, {0, 0, 0}, {n, rows, out});
+  return y;
+}
+
+namespace {
+// xhat = ((x . suh_m) H128 / sqrt(128)) for all members in one launch, then the
+// grouped QMV and one batched output Hadamard.
+mx::array group_impl(const std::vector<TrellisWeight>& ws, const mx::array& xr, int rows) {
+  const int n = (int)ws.size();
+  const int in = ws[0].in_features;
+  std::vector<mx::array> suh;
+  suh.reserve((size_t)n);
+  for (const auto& w : ws) suh.push_back(w.suh);
+  mx::array sstack = mx::concatenate(suh, 0);
+  mx::array xhat = hadamard_run(xr, sstack, in / 128, /*pre=*/true, mx::Shape{n, rows, in}, rows,
+                                /*stacked=*/true);
+  return trellis_matmul_group(ws, xhat, rows);
+}
+} // namespace
+
+mx::array trellis_linear_group(const std::vector<TrellisWeight>& ws, const mx::array& x) {
+  // One activation block shared by every member: replicate it (the Hadamard
+  // would materialise a broadcast view anyway) and take the stacked path.
+  const int n = (int)ws.size();
+  if (n <= 0) return mx::array(0.0f);
+  const int in = ws[0].in_features;
+  const int rows = (int)(x.size() / in);
+  mx::array xr = mx::reshape(x, {1, rows, in});
+  if (n > 1) xr = mx::reshape(mx::tile(xr, {n, 1, 1}), {n, rows, in});
+  return group_impl(ws, xr, rows);
+}
+
+mx::array trellis_linear_group_rows(const std::vector<TrellisWeight>& ws, const mx::array& x,
+                                    int rows) {
+  const int n = (int)ws.size();
+  if (n <= 0) return mx::array(0.0f);
+  const int in = ws[0].in_features;
+  if ((int64_t)x.size() != (int64_t)n * rows * in) {
+    throw std::invalid_argument("trellis_linear_group_rows: activation size mismatch");
+  }
+  return group_impl(ws, x, rows);
+}
+
+mx::array trellis_pack(const uint16_t* words16, int k_tiles, int n_tiles, int K) {
+  if (words16 == nullptr || k_tiles <= 0 || n_tiles <= 0 || K <= 0 || K > 8) return mx::array(0.0f);
+  const int words = 8 * K;           // u32 ring words per 16x16 tile
+  const int tile_bytes = 4 * words;  // == 32*K, the file's bytes per tile
+  const size_t bytes = (size_t)k_tiles * (size_t)n_tiles * (size_t)tile_bytes;
+  // The buffer is a fresh, 16-byte-aligned (malloc) allocation that the engine
+  // owns, so tile (tk, tn) starts at a multiple of 32*K and word j at +4*j -
+  // the alignment the kernels' 32-bit loads need. `new uint8_t[]` is
+  // uninitialised: value-initialising a 100 GB checkpoint's worth of these
+  // costs a full extra pass over memory.
+  uint8_t* buf = new uint8_t[bytes];
+  // The current mapping is the file's own: the tile's 8*K little-endian words
+  // in ring order. A different (permuted) layout would be applied here, and the
+  // kernel's tile/word indexing is the only other place that must agree.
+  std::memcpy(buf, words16, bytes);
+  mx::array out((void*)buf, mx::Shape{(int)k_tiles, (int)n_tiles, tile_bytes}, mx::uint8,
+                [buf](void*) { delete[] buf; });
+  mx::eval(out);
+  return out;
 }
 
 mx::array trellis_linear(const TrellisWeight& w, const mx::array& x) {
@@ -429,12 +627,15 @@ mx::array trellis_linear(const TrellisWeight& w, const mx::array& x) {
   const int n_tiles = out / 16;
   TrellisTuning tn = tuning_state();
   const int sg = tn.sg > 0 ? tn.sg : 4;
-  const int mb = tn.mb > 0 ? tn.mb : (rows >= 8 ? 8 : (rows >= 4 ? 4 : 1));
+  // See trellis_matmul_raw for why mb*nt must stay near 4 (accumulator
+  // registers) and why mb = min(rows, 4) is the measured optimum.
+  const int mb = tn.mb > 0 ? tn.mb : (rows >= 4 ? 4 : rows);
   int nt = tn.nt;
   if (nt <= 0) {
     nt = 1;
     while (n_tiles / nt > 1024) nt *= 2;
     while (nt > 1 && n_tiles % nt != 0) nt /= 2;
+    if (mb >= 3) nt = 1; // mb*nt <= 4
   }
   if (nt > n_tiles) nt = n_tiles;
   const int splits = split_count(k_tiles, n_tiles);
@@ -448,7 +649,7 @@ mx::array trellis_linear(const TrellisWeight& w, const mx::array& x) {
     xin = mx::concatenate({xhat, mx::zeros(zshape, mx::float16)}, row_axis);
   }
 
-  Config cfg{in, out, w.K, w.codebook, nt, sg, mb, splits, pad_rows};
+  Config cfg{in, out, w.K, w.codebook, nt, sg, mb, splits, pad_rows, 1, w.aligned ? 1 : 0};
   std::vector<mx::Shape> shapes;
   if (splits > 1) shapes = {mx::Shape{splits, pad_rows, out}};
   else shapes = {mx::Shape{pad_rows, out}};

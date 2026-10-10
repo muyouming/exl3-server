@@ -256,11 +256,17 @@ bool Model::load_trellis(const SafetensorsFile& st, const std::string& key, Trel
     return false;
   }
   {
-    auto* holder = new std::vector<uint8_t>((size_t)(k_tiles * n_tiles * words16 * 2));
-    std::memcpy(holder->data(), src, holder->size());
-    out.packed = mx::array((void*)holder->data(),
-                           mx::Shape{(int)k_tiles, (int)n_tiles, (int)(words16 * 2)}, mx::uint8,
-                           [holder](void*) { delete holder; });
+    // Keep the words in a buffer whose base is 4-byte aligned (see
+    // TrellisWeight::aligned): trellis_pack materialises the file's bytes,
+    // which is also what the kernels require - they must read memory the
+    // engine owns.
+    const uint8_t* raw = (const uint8_t*)src;
+    out.packed = trellis_pack((const uint16_t*)raw, (int)k_tiles, (int)n_tiles, out.K);
+    out.aligned = true;
+    if (out.packed.size() == 0) {
+      err = key + ": empty trellis";
+      return false;
+    }
   }
   out.suh = load_vector(st, key + ".suh", err, false);
   out.svh = load_vector(st, key + ".svh", err, false);
