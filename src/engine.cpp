@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <random>
 
+#include "glm5_forward.h"
 #include "util.h"
 
 namespace exl3 {
@@ -79,6 +80,93 @@ class ThinkSplitter {
 
   std::string buf_;
   bool in_think_ = false;
+};
+
+// The emission half of one request: token -> text, <think> routing, stop
+// strings, and the running counters in GenerateResult. Extracted from
+// Engine::generate so the serial loop and the batch scheduler share exactly one
+// implementation of it (the stop-string holdback is subtle enough that a second
+// copy would be a bug farm).
+class Emitter {
+ public:
+  Emitter(const Tokenizer& tok, const std::vector<int>& eos_ids, const GenerateOptions& opt,
+          GenerateResult& res)
+      : eos_(eos_ids), opt_(opt), res_(res), stream_(&tok) {
+    if (opt_.start_in_think) think_.start_in_think();
+    size_t max_stop = 0;
+    for (auto& st : opt_.stop) max_stop = std::max(max_stop, st.size());
+    holdback_ = max_stop > 0 ? max_stop - 1 : 0;
+  }
+
+  // Appends the token, streams its text and reports whether generation must
+  // stop (EOS or a stop string was hit).
+  bool emit(int tok, const DeltaFn& on_delta) {
+    res_.completion_tokens++;
+    res_.tokens.push_back(tok);
+    if (!opt_.ignore_eos && std::find(eos_.begin(), eos_.end(), tok) != eos_.end()) {
+      res_.finish_reason = "stop";
+      return false;
+    }
+    std::string delta = stream_.push(tok);
+    if (!delta.empty()) {
+      hold_ += delta;
+      size_t stop_at = std::string::npos;
+      for (auto& st : opt_.stop) {
+        if (st.empty()) continue;
+        size_t k = hold_.find(st);
+        if (k != std::string::npos) stop_at = std::min(stop_at, k);
+      }
+      if (stop_at != std::string::npos) {
+        std::string out = hold_.substr(0, stop_at);
+        feed(out, on_delta);
+        full_ += out;
+        hold_.clear();
+        res_.finish_reason = "stop";
+        return false;
+      }
+      if (hold_.size() > holdback_) {
+        std::string out = hold_.substr(0, hold_.size() - holdback_);
+        feed(out, on_delta);
+        full_ += out;
+        hold_.erase(0, hold_.size() - holdback_);
+      }
+    }
+    return true;
+  }
+
+  // Flushes the held-back text, closes the thinking stream and files the text
+  // into the result. Call once, after the last emit().
+  void finish(const DeltaFn& on_delta) {
+    if (!hold_.empty()) {
+      feed(hold_, on_delta);
+      full_ += hold_;
+      hold_.clear();
+    }
+    if (opt_.split_think) think_.finish(on_delta);
+    res_.text = full_;
+    if (opt_.split_think) {
+      res_.content = think_.content;
+      res_.reasoning = think_.reasoning;
+    } else {
+      res_.content = full_;
+      res_.reasoning.clear();
+    }
+  }
+
+ private:
+  void feed(const std::string& s, const DeltaFn& on_delta) {
+    if (s.empty()) return;
+    if (opt_.split_think) think_.feed(s, on_delta);
+    else if (on_delta) on_delta(s, std::string());
+  }
+
+  std::vector<int> eos_;
+  GenerateOptions opt_;
+  GenerateResult& res_;
+  ThinkSplitter think_;
+  Tokenizer::Stream stream_;
+  std::string hold_, full_;
+  size_t holdback_ = 0;
 };
 
 } // namespace
@@ -176,56 +264,9 @@ GenerateResult Engine::generate(const std::vector<int>& prompt, const GenerateOp
   const auto& cfg = model_.config();
   std::vector<int> history = prompt;
 
-  // ---- shared emission machinery -------------------------------------------
-  ThinkSplitter think;
-  if (opt.start_in_think) think.start_in_think();
-  Tokenizer::Stream stream(&tok_);
-  auto feed = [&](const std::string& s) {
-    if (s.empty()) return;
-    if (opt.split_think) think.feed(s, on_delta);
-    else if (on_delta) on_delta(s, std::string());
-  };
-  std::string hold, full;
-  size_t max_stop = 0;
-  for (auto& st : opt.stop) max_stop = std::max(max_stop, st.size());
-  const size_t holdback = max_stop > 0 ? max_stop - 1 : 0;
-
-  // Returns false when generation must stop (EOS or a stop string was hit).
-  auto emit = [&](int tok) -> bool {
-    res.completion_tokens++;
-    res.tokens.push_back(tok);
-    if (!opt.ignore_eos &&
-        std::find(cfg.eos_token_ids.begin(), cfg.eos_token_ids.end(), tok) !=
-            cfg.eos_token_ids.end()) {
-      res.finish_reason = "stop";
-      return false;
-    }
-    std::string delta = stream.push(tok);
-    if (!delta.empty()) {
-      hold += delta;
-      size_t stop_at = std::string::npos;
-      for (auto& st : opt.stop) {
-        if (st.empty()) continue;
-        size_t k = hold.find(st);
-        if (k != std::string::npos) stop_at = std::min(stop_at, k);
-      }
-      if (stop_at != std::string::npos) {
-        std::string out = hold.substr(0, stop_at);
-        feed(out);
-        full += out;
-        hold.clear();
-        res.finish_reason = "stop";
-        return false;
-      }
-      if (hold.size() > holdback) {
-        std::string out = hold.substr(0, hold.size() - holdback);
-        feed(out);
-        full += out;
-        hold.erase(0, hold.size() - holdback);
-      }
-    }
-    return true;
-  };
+  // ---- emission machinery (one implementation, shared with the batch path) --
+  Emitter em(tok_, cfg.eos_token_ids, opt, res);
+  auto emit = [&](int tok) -> bool { return em.emit(tok, on_delta); };
 
   uint64_t rng = opt.sample.seed;
   if (rng == 0) {
@@ -313,22 +354,220 @@ GenerateResult Engine::generate(const std::vector<int>& prompt, const GenerateOp
   (void)stopped;
   if (res.finish_reason.empty()) res.finish_reason = "length";
 
-  if (!hold.empty()) {
-    feed(hold);
-    full += hold;
-  }
-  if (opt.split_think) think.finish(on_delta);
-
+  em.finish(on_delta);
   res.decode_seconds = (double)(now_ms() - d0) / 1000.0;
-  res.text = full;
-  if (opt.split_think) {
-    res.content = think.content;
-    res.reasoning = think.reasoning;
-  } else {
-    res.content = full;
-    res.reasoning.clear();
-  }
   return res;
+}
+
+// ---------------------------------------------------------------------------
+// Request-level batching
+// ---------------------------------------------------------------------------
+
+struct Engine::Pending {
+  std::vector<int> prompt;
+  GenerateOptions opt;
+  DeltaFn on_delta;
+  CancelFn cancelled;
+  std::mutex m;
+  std::condition_variable cv;
+  bool done = false;
+  GenerateResult result;
+};
+
+void Engine::start_batch(int max_batch) {
+  stop_batch();
+  if (max_batch <= 0) return;
+  if (!model_.glm5()) {
+    // Only the GLM-5-Next path keeps per-slot state; the Llama path has one
+    // shared KV cache, so there is nothing to batch.
+    std::fprintf(stderr, "engine: batching needs a GLM-5-Next checkpoint; staying serial\n");
+    return;
+  }
+  batch_stop_.store(false);
+  batch_max_ = max_batch;
+  worker_ = std::thread([this] { batch_worker(); });
+}
+
+void Engine::stop_batch() {
+  if (worker_.joinable()) {
+    batch_stop_.store(true);
+    qcv_.notify_all();
+    worker_.join();
+  }
+  batch_max_ = 0;
+  std::deque<std::shared_ptr<Pending>> left;
+  {
+    std::lock_guard<std::mutex> lk(qmu_);
+    left.swap(queue_);
+  }
+  for (auto& p : left) {
+    std::lock_guard<std::mutex> lk(p->m);
+    p->result.finish_reason = "cancelled";
+    p->done = true;
+    p->cv.notify_all();
+  }
+}
+
+GenerateResult Engine::submit_batch(const std::vector<int>& prompt, const GenerateOptions& opt,
+                                    const DeltaFn& on_delta, const CancelFn& cancelled) {
+  // Speculative decoding and a batch of one are the serial path's job; a
+  // request that asks for the MTP drafter must not go through the batch (its
+  // draft-row state is per sequence and not batched).
+  if (batch_max_ <= 0 || !worker_.joinable() || !model_.glm5() || opt.draft_tokens > 1 ||
+      prompt.empty())
+    return generate(prompt, opt, on_delta, cancelled);
+  auto p = std::make_shared<Pending>();
+  p->prompt = prompt;
+  p->opt = opt;
+  p->on_delta = on_delta;
+  p->cancelled = cancelled;
+  p->result.prompt_tokens = (int)prompt.size();
+  {
+    std::lock_guard<std::mutex> lk(qmu_);
+    queue_.push_back(p);
+  }
+  qcv_.notify_all();
+  std::unique_lock<std::mutex> lk(p->m);
+  p->cv.wait(lk, [&] { return p->done; });
+  return p->result;
+}
+
+void Engine::batch_worker() {
+  try {
+    batch_worker_loop();
+  } catch (const std::exception& e) {
+    // A failure inside a step must not take the process down: release whatever
+    // the batch held and let the next request start from a clean state.
+    std::fprintf(stderr, "engine: batch worker stopped: %s\n", e.what());
+    batch_stop_.store(true);
+  }
+}
+
+void Engine::batch_worker_loop() {
+  struct Req {
+    std::shared_ptr<Pending> p;
+    int slot = -1;
+    std::vector<int> history;
+    uint64_t rng = 0;
+    int next = -1;              // the token this slot feeds at the next step
+    int64_t t_decode0 = 0;      // when this slot's decode phase began
+    std::unique_ptr<Emitter> em;
+    std::vector<float> logits;  // one row's logits, reused every step
+    bool finished = false;
+  };
+  std::vector<Req> live;
+  const int V = model_.glm5()->vocab_size();
+  const std::vector<int> eos = config().eos_token_ids;
+
+  auto finish_req = [](Req& r, const char* fallback) {
+    r.finished = true;
+    if (r.p->result.finish_reason.empty() && fallback) r.p->result.finish_reason = fallback;
+  };
+  auto publish = [&](Req& r) {
+    r.em->finish(r.p->on_delta);
+    r.p->result.decode_seconds = (double)(now_ms() - r.t_decode0) / 1000.0;
+    if (r.p->result.finish_reason.empty()) r.p->result.finish_reason = "length";
+    std::lock_guard<std::mutex> lk(r.p->m);
+    r.p->done = true;
+    r.p->cv.notify_all();
+  };
+
+  while (!batch_stop_.load()) {
+    // ---- admit waiting requests (prefill + first token, as the serial path) --
+    std::vector<std::shared_ptr<Pending>> incoming;
+    {
+      std::unique_lock<std::mutex> lk(qmu_);
+      if (live.empty()) {
+        qcv_.wait(lk, [&] { return batch_stop_.load() || !queue_.empty(); });
+        if (batch_stop_.load()) break;
+      }
+      while (!queue_.empty() && (int)(live.size() + incoming.size()) < batch_max_) {
+        incoming.push_back(queue_.front());
+        queue_.pop_front();
+      }
+    }
+    for (auto& p : incoming) {
+      Req r;
+      r.p = p;
+      r.history = p->prompt;
+      r.rng = p->opt.sample.seed;
+      if (r.rng == 0) {
+        std::random_device rd;
+        r.rng = ((uint64_t)rd() << 32) ^ (uint64_t)rd() ^ (uint64_t)now_ms();
+        if (r.rng == 0) r.rng = 0x9E3779B97F4A7C15ull;
+      }
+      r.em = std::make_unique<Emitter>(tok_, eos, p->opt, p->result);
+      std::vector<float> lg;
+      const int64_t t0 = now_ms();
+      {
+        std::lock_guard<std::mutex> lk(mu_);
+        r.slot = model_.glm5()->batch_join(p->prompt, &lg);
+      }
+      p->result.prefill_seconds = (double)(now_ms() - t0) / 1000.0;
+      r.t_decode0 = now_ms();
+      // The prefill's own row is the first token's distribution, exactly as the
+      // serial loop takes it.
+      int tok = sample_token(lg, p->opt.sample, r.history, r.rng);
+      r.history.push_back(tok);
+      if (!r.em->emit(tok, p->on_delta)) {
+        finish_req(r, "stop");
+      } else if (p->result.completion_tokens >= p->opt.max_tokens) {
+        finish_req(r, "length");
+      } else {
+        r.next = tok;
+      }
+      live.push_back(std::move(r));
+    }
+
+    // ---- retire finished slots -------------------------------------------
+    for (;;) {
+      int idx = -1;
+      for (int i = 0; i < (int)live.size(); ++i)
+        if (live[(size_t)i].finished) {
+          idx = i;
+          break;
+        }
+      if (idx < 0) break;
+      Req r = std::move(live[(size_t)idx]);
+      live.erase(live.begin() + idx);
+      {
+        std::lock_guard<std::mutex> lk(mu_);
+        model_.glm5()->batch_leave(r.slot);
+      }
+      for (auto& o : live)
+        if (o.slot > r.slot) o.slot -= 1;
+      publish(r);
+    }
+    if (live.empty()) continue;
+
+    // ---- one fused step for every live request ---------------------------
+    std::vector<int> feed;
+    feed.reserve(live.size());
+    for (auto& r : live) feed.push_back(r.next);
+    mx::array logits = mx::array(0.0f);
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      logits = model_.glm5()->batch_step(feed);
+    }
+    const float* lp = logits.data<float>();
+    for (size_t i = 0; i < live.size(); ++i) {
+      Req& r = live[i];
+      r.logits.assign(lp + i * (size_t)V, lp + (i + 1) * (size_t)V);
+      if (r.p->cancelled && r.p->cancelled()) {
+        finish_req(r, "cancelled");
+        continue;
+      }
+      int tok = sample_token(r.logits, r.p->opt.sample, r.history, r.rng);
+      r.history.push_back(tok);
+      if (!r.em->emit(tok, r.p->on_delta)) {
+        finish_req(r, "stop");
+      } else if (r.p->result.completion_tokens >= r.p->opt.max_tokens) {
+        finish_req(r, "length");
+      } else {
+        r.next = tok;
+      }
+    }
+  }
 }
 
 } // namespace exl3

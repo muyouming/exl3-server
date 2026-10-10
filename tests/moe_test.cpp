@@ -501,6 +501,117 @@ int main() {
                 (unsigned long long)hg, (unsigned long long)hp, (unsigned long long)hr);
     eq("grouped == per-expert", hg == hp);
     eq("grouped == general", hg == hr);
+
+    // (g) the decode-batch rows path: row b of an N-row call must be what a
+    // single-row call gives for that row - the same expert, the same launch
+    // geometry per member, the same weighted sum. 2*B members must stay inside
+    // one grouped launch (31 Metal buffers), which is why B <= 14 for a real K.
+    //
+    // Its own fixture, and the fixture's numbers matter: (a) its in/out must be
+    // multiples of the Hadamard block (128), because 32-wide takes the degenerate
+    // blocks_per_row = 0 path; (b) the mul1 codebook maps a 16-bit code to an
+    // arbitrary half, and the random words of (f) land on NaN for about half of
+    // them, so comparing against that layer agrees vacuously - the first version
+    // of this section "passed" for exactly that reason while the member order
+    // was wrong. Here every codeword of a member is the same byte-uniform value,
+    // chosen from the codebook's finite range, and the gate below rejects NaN and
+    // underflow so a mismatch cannot hide.
+    std::printf("== (g) rows path: N rows vs N single-row calls ==\n");
+    const int GQH = 128, GQI = 128, GQE = 4, GQK = 3;
+    // byte b decodes to |w| <= 0.25 for these twelve (computed from the kernel's
+    // own mul1 formula): a fixture whose products stay inside f16.
+    const unsigned GB[12] = {9, 31, 49, 62, 75, 89, 110, 128, 155, 173, 186, 199};
+    auto mkqg = [&](int in, int out, int kk, unsigned byte) {
+      exl3::G5Linear g;
+      g.quantized = true;
+      g.in_features = in;
+      g.out_features = out;
+      g.tw.in_features = in;
+      g.tw.out_features = out;
+      g.tw.K = kk;
+      g.tw.codebook = 2;
+      std::vector<uint16_t> src((size_t)(in / 16) * (out / 16) * (16 * kk),
+                                (uint16_t)(0x0101u * (byte & 0xffu)));
+      g.tw.packed = exl3::trellis_pack(src.data(), in / 16, out / 16, kk);
+      std::vector<float> sc((size_t)in), sv((size_t)out);
+      for (size_t i = 0; i < sc.size(); ++i)
+        sc[i] = 0.5f + 0.01f * (float)((i * 13u + byte) % 17u);
+      for (size_t i = 0; i < sv.size(); ++i)
+        sv[i] = 0.25f + 0.01f * (float)((i * 7u + byte) % 13u);
+      g.tw.suh = mx::astype(mx::array(sc.data(), {in}, mx::float32, [](void*) {}), mx::float16);
+      g.tw.svh = mx::astype(mx::array(sv.data(), {out}, mx::float32, [](void*) {}), mx::float16);
+      mx::eval(g.tw.packed, g.tw.suh, g.tw.svh);
+      return g;
+    };
+    exl3::G5Layer gl;
+    gl.moe = true;
+    gl.experts.resize((size_t)GQE * 3);
+    for (int e = 0; e < GQE; ++e) {
+      for (int w = 0; w < 3; ++w) {
+        const unsigned bb = GB[(size_t)(e * 3 + w) % 12];
+        gl.experts[(size_t)(e * 3 + w)] = (w == 2) ? mkqg(GQI, GQH, 3, bb) : mkqg(GQH, GQI, 3, bb);
+      }
+    }
+    std::vector<float> gw((size_t)GQE * GQH), gb2((size_t)GQE);
+    for (auto& v : gw) v = 0.2f * (float)(qr() % 100) / 100.0f - 0.1f;
+    for (auto& v : gb2) v = 0.05f * (float)(qr() % 100) / 100.0f;
+    gl.router_w = mk2(gw, GQE, GQH);
+    gl.router_bias = mk1(gb2);
+    gl.shared_gate = mkqg(GQH, GQI, 3, 9);
+    gl.shared_up = mkqg(GQH, GQI, 3, 31);
+    gl.shared_down = mkqg(GQI, GQH, 3, 49);
+    exl3::ModelConfig gc;
+    gc.hidden_size = GQH;
+    gc.n_routed_experts = GQE;
+    gc.num_experts_per_tok = GQK;
+    gc.moe_intermediate_size = GQI;
+    gc.n_shared_experts = 1;
+    gc.routed_scaling_factor = 1.5f;
+    gc.swiglu_limit = 10.0f;
+    gc.norm_topk_prob = true;
+    // Values are copied out of each evaluation: a later eval may recycle the
+    // buffer a pointer was taken from.
+    auto host = [](const mx::array& a) {
+      mx::array f = mx::astype(a, mx::float32);
+      mx::eval(f);
+      const float* p = f.data<float>();
+      return std::vector<float>(p, p + (size_t)a.size());
+    };
+    const int NR = 4;
+    std::vector<float> hv((size_t)NR * GQH);
+    for (size_t i = 0; i < hv.size(); ++i) hv[i] = 0.03f * (float)((i * 29 + 7) % 31) - 0.4f;
+    mx::array h4 = mx::astype(mx::array(hv.data(), {NR, 1, GQH}, mx::float32, [](void*) {}),
+                              mx::float16);
+    mx::eval(h4);
+    unsetenv("EXL3_MOE_GENERAL");
+    unsetenv("EXL3_MOE_NONGROUPED");
+    const std::vector<float> yb = host(exl3::moe_layer_rows(gl, gc, h4));
+    bool finite = true;
+    double scale = 0;
+    for (float v : yb) {
+      finite = finite && std::isfinite(v);
+      if (std::isfinite(v)) scale = std::max(scale, (double)std::fabs(v));
+    }
+    eq("rows-path outputs finite and non-zero (no NaN/underflow vacuity)", finite && scale > 1e-3);
+    double maxd = 0;
+    for (int b = 0; b < NR; ++b) {
+      mx::array hb = mx::reshape(mx::slice(h4, {b, 0, 0}, {b + 1, 1, GQH}), {1, 1, GQH});
+      const std::vector<float> ys = host(exl3::moe_layer_rows(gl, gc, hb));
+      for (int j = 0; j < GQH; ++j)
+        maxd = std::max(maxd, (double)std::fabs(ys[(size_t)j] - yb[(size_t)b * GQH + j]));
+    }
+    // And the general gather/scatter form, which the rows path replaces for a
+    // batch (it is what the prefill and the MTP verify batch run today).
+    setenv("EXL3_MOE_GENERAL", "1", 1);
+    const std::vector<float> ygen = host(exl3::moe_layer_rows(gl, gc, h4));
+    unsetenv("EXL3_MOE_GENERAL");
+    double maxdg = 0;
+    for (size_t i = 0; i < (size_t)NR * GQH; ++i)
+      maxdg = std::max(maxdg, (double)std::fabs(ygen[i] - yb[i]));
+    std::printf("  |out|max = %.4g, max|row diff| vs single-row = %g, vs general path = %g\n",
+                scale, maxd, maxdg);
+    eq("rows path == single-row calls", maxd == 0);
+    eq("rows path == general path (a batch)", maxdg == 0);
   }
 
   std::printf("%s\n", g_ok ? "ALL OK" : "FAILURES");

@@ -2,10 +2,14 @@
 // Generation loop shared by the CLI and the HTTP server: prefix-aware KV cache
 // reuse, streaming detokenization, stop strings, and <think>/</think> routing.
 
+#include <atomic>
+#include <condition_variable>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "model.h"
@@ -75,6 +79,11 @@ using CancelFn = std::function<bool()>;
 
 class Engine {
  public:
+  Engine() = default;
+  // Stops the batch scheduler (a joinable worker thread outliving main would
+  // have std::thread call std::terminate).
+  ~Engine() { stop_batch(); }
+
   bool load(const std::string& model_path, std::string& err, int threads = 0,
             bool fp16_weights = false);
   const ModelConfig& config() const { return model_.config(); }
@@ -94,7 +103,32 @@ class Engine {
   void set_drafter(std::shared_ptr<Drafter> d) { drafter_ = std::move(d); }
   const std::shared_ptr<Drafter>& drafter() const { return drafter_; }
 
+  // ---- request-level batching ---------------------------------------------
+  //
+  // With a batch scheduler running, concurrent requests share one fused decode
+  // step (rows = sequences) instead of queueing behind each other. The
+  // scheduler owns a worker thread that pulls requests off a queue, prefills
+  // the new ones through the ordinary single-sequence path and then advances
+  // every live request by one token per step. `start_batch(0)` disables it.
+  //
+  // Batching is GLM-5-Next only (the Llama path has one shared KV cache and no
+  // per-slot state): for any other architecture submit_batch() is generate().
+  void start_batch(int max_batch);
+  void stop_batch();
+  bool batch_running() const { return batch_max_ > 0; }
+  int batch_max() const { return batch_max_; }
+  // Submits one request and blocks until it is done. `on_delta` is called from
+  // the scheduler thread while this call is blocked (the HTTP handlers rely on
+  // that: the sink is only ever written by this thread).
+  GenerateResult submit_batch(const std::vector<int>& prompt, const GenerateOptions& opt,
+                              const DeltaFn& on_delta = nullptr,
+                              const CancelFn& cancelled = nullptr);
+
  private:
+  struct Pending;
+  void batch_worker();
+  void batch_worker_loop();
+
   std::shared_ptr<Drafter> drafter_;
   Model model_;
   Tokenizer tok_;
@@ -102,6 +136,13 @@ class Engine {
   std::vector<int> prefix_; // tokens currently resident in the cache
   std::mutex mu_;
   std::string model_name_;
+
+  std::mutex qmu_;
+  std::condition_variable qcv_;
+  std::deque<std::shared_ptr<Pending>> queue_;
+  std::thread worker_;
+  std::atomic<bool> batch_stop_{false};
+  int batch_max_ = 0;
 };
 
 } // namespace exl3

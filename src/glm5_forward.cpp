@@ -281,6 +281,172 @@ mx::array Glm5Model::forward_tokens(const std::vector<int>& ids, int start_pos) 
   return apply_lm_head(forward_hidden(ids, start_pos));
 }
 
+// ---------------------------------------------------------------------------
+// Request-level batching
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// (1, L, D) -> (1, T, D) with the data at the END (zero rows in front): a slot's
+// block holds its own rows as the suffix, so appending the step's new row is a
+// concatenate along dim 1 that touches no padding.
+mx::array pad_left(const mx::array& a, int T) {
+  const int L = (int)a.shape(1);
+  if (L >= T) return a;
+  return mx::concatenate({mx::zeros(mx::Shape{1, T - L, (int)a.shape(2)}, a.dtype()), a}, 1);
+}
+
+// The batch's cache (B0, T0, D) and one new slot's (1, L, D) -> (B0+1, T, D),
+// every block left-padded to T.
+mx::array append_slot(const mx::array& cur, int B0, const mx::array& add, int T) {
+  mx::array a = pad_left(add, T);
+  if (B0 == 0 || cur.size() <= 1) return a;
+  mx::array c = cur;
+  const int T0 = (int)cur.shape(1);
+  if (T0 < T)
+    c = mx::concatenate({mx::zeros(mx::Shape{B0, T - T0, (int)cur.shape(2)}, cur.dtype()), c}, 1);
+  return mx::concatenate({c, a}, 0);
+}
+
+// One row of a (B, ...) state array out (B-1 rows), for batch_leave.
+mx::array drop_slot(const mx::array& a, int slot, int B) {
+  if (B <= 1 || a.size() <= 1) return mx::array(0.0f);
+  auto rows = [&](int from, int to) {
+    mx::Shape st(a.shape().size(), 0), en = a.shape();
+    st[0] = from;
+    en[0] = to;
+    return mx::slice(a, st, en);
+  };
+  if (slot == 0) return mx::contiguous(rows(1, B));
+  if (slot == B - 1) return mx::contiguous(rows(0, B - 1));
+  return mx::contiguous(mx::concatenate({rows(0, slot), rows(slot + 1, B)}, 0));
+}
+
+} // namespace
+
+int Glm5Model::batch_join(const std::vector<int>& prompt, std::vector<float>* logits_last) {
+  if (prompt.empty()) throw std::runtime_error("Glm5Model::batch_join: empty prompt");
+  // The prefill is the ordinary single-sequence path (chunked, and the numerics
+  // the serial decoder would use); what it leaves per layer is copied into the
+  // batch's slot below.
+  mx::array hidden = forward_hidden(prompt, 0);
+  if (logits_last != nullptr) {
+    // The head on the chunk's last row only, as Model::forward_glm5 does.
+    const int L = (int)hidden.shape(1);
+    const int hs = (int)cfg_.hidden_size;
+    mx::array row = mx::slice(hidden, {0, L - 1, 0}, {1, L, hs});
+    mx::array lg = apply_lm_head(row); // (1, vocab) f32, eval'd inside
+    const float* p = lg.data<float>();
+    logits_last->assign(p, p + vocab_);
+  }
+  const int P = (int)prompt.size();
+  const int B0 = batch_.size;
+  if (batch_.layers.empty()) batch_.layers.assign((size_t)cfg_.num_layers, Glm5BatchLayerState{});
+  int T = P; // the cache width after this join (every block is padded to it)
+  if (B0 > 0) {
+    // Any live cache tells the width: layer 0 is a KDA layer and has none.
+    for (const auto& st : batch_.layers) {
+      if (st.idx.packed.size() > 1) {
+        T = std::max(T, (int)st.idx.packed.shape(1));
+        break;
+      }
+    }
+  }
+  for (int i = 0; i < cfg_.num_layers; ++i) {
+    const G5Layer& l = w_.layers[(size_t)i];
+    LayerState& src = states_[(size_t)i];
+    Glm5BatchLayerState& dst = batch_.layers[(size_t)i];
+    if (l.plan.linear_attention) {
+      // The delta-rule state has no time axis: one more row on dim 0.
+      dst.kda.recurrent = (B0 > 0 && dst.kda.recurrent.size() > 1)
+                              ? mx::concatenate({dst.kda.recurrent, src.kda.recurrent}, 0)
+                              : src.kda.recurrent;
+      // The conv window is a fixed klen-1 rows; a slot whose prompt is shorter
+      // than that is left-padded with zeros, which is exactly the conv's own
+      // missing-left-context padding.
+      const int kw = std::max(1, (int)l.conv1d_w.shape(l.conv1d_w.ndim() - 1) - 1);
+      dst.kda.conv_window =
+          append_slot(dst.kda.conv_window, B0, mx::astype(src.kda.conv_window, mx::float32), kw);
+    } else {
+      dst.mla.k_pass = append_slot(dst.mla.k_pass, B0, mx::astype(src.mla.k_pass, mx::float32), T);
+      dst.idx.packed = append_slot(dst.idx.packed, B0, mx::astype(src.idx.packed, mx::float32), T);
+    }
+  }
+  batch_.pos.push_back(P);
+  batch_.size = B0 + 1;
+  return B0;
+}
+
+void Glm5Model::batch_leave(int slot) {
+  if (slot < 0 || slot >= batch_.size) throw std::runtime_error("Glm5Model::batch_leave: bad slot");
+  const int B = batch_.size;
+  if (B == 1) {
+    batch_.clear();
+    return;
+  }
+  for (auto& st : batch_.layers) {
+    st.kda.recurrent = drop_slot(st.kda.recurrent, slot, B);
+    st.kda.conv_window = drop_slot(st.kda.conv_window, slot, B);
+    st.mla.k_pass = drop_slot(st.mla.k_pass, slot, B);
+    st.idx.packed = drop_slot(st.idx.packed, slot, B);
+  }
+  batch_.pos.erase(batch_.pos.begin() + slot);
+  batch_.size = B - 1;
+}
+
+mx::array Glm5Model::batch_step(const std::vector<int>& tokens) {
+  const int B = batch_.size;
+  if (B <= 0) throw std::runtime_error("Glm5Model::batch_step: empty batch");
+  if ((int)tokens.size() != B)
+    throw std::runtime_error("Glm5Model::batch_step: expected one token per live slot");
+  for (auto p : batch_.pos)
+    if (p <= 0) throw std::runtime_error("Glm5Model::batch_step: a slot has no state");
+
+  mx::array ids_a(tokens.data(), mx::Shape{B, 1}, mx::int32);
+  mx::array emb = mx::take(w_.embed, ids_a, 0);    // (B, 1, hidden) f16
+  mx::array streams = g5_hc_expand(emb, hc_.mult); // (B, 1, N, hidden)
+
+  for (int i = 0; i < cfg_.num_layers; ++i) {
+    const G5Layer& l = w_.layers[(size_t)i];
+    Glm5BatchLayerState& st = batch_.layers[(size_t)i];
+
+    mx::array residual = streams;
+    G5HcActivation a =
+        g5_hc_prepare(streams, l.hc_attn_base, l.hc_attn_fn, l.hc_attn_scale, hc_);
+    mx::array h = rms_norm(a.collapsed, l.input_norm, cfg_.rms_norm_eps);
+    mx::array out = mx::array(0.0f);
+    if (l.plan.linear_attention) {
+      // kda_layer's dim 0 is the batch by construction (its recurrence is
+      // elementwise over it), so the batched call is the single-sequence call
+      // with B rows and a per-slot state.
+      out = kda_layer(l, cfg_, h, st.kda, nullptr);
+    } else {
+      mx::array q_resid = mla_q_resid(l, h);
+      // The lengths the caches will hold after this step (position + the new
+      // row), which is what the mask/selection are expressed against.
+      std::vector<int> after((size_t)B);
+      for (int b = 0; b < B; ++b) after[(size_t)b] = batch_.pos[(size_t)b] + 1;
+      mx::array topk = indexer_topk_batch(l, cfg_, h, q_resid, st.idx, after);
+      out = mla_layer_batch(l, cfg_, h, st.mla, after, topk, q_resid);
+    }
+    streams = g5_hc_mix(out, a.post, a.comb, residual);
+
+    residual = streams;
+    G5HcActivation f = g5_hc_prepare(streams, l.hc_ffn_base, l.hc_ffn_fn, l.hc_ffn_scale, hc_);
+    h = rms_norm(f.collapsed, l.post_norm, cfg_.rms_norm_eps);
+    out = l.moe ? moe_layer_rows(l, cfg_, h) : dense_mlp(l, cfg_, h);
+    streams = g5_hc_mix(out, f.post, f.comb, residual);
+  }
+
+  mx::array hidden = rms_norm(g5_hc_head(streams), w_.final_norm, cfg_.rms_norm_eps); // (B,1,D)
+  // One head for the whole batch: the rows share the read of the 317 MB head.
+  mx::array y = g5_linear(w_.lm_head, mx::astype(hidden, mx::float16));
+  mx::array logits = mx::reshape(mx::astype(y, mx::float32), {B, vocab_});
+  mx::eval(logits);
+  for (auto& p : batch_.pos) p += 1;
+  return logits;
+}
+
 std::vector<float> Glm5Model::forward_last_logits(const std::vector<int>& ids, int start_pos) {
   mx::array logits = forward_tokens(ids, start_pos);
   const size_t n = (size_t)logits.shape(0);

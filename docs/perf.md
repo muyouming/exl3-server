@@ -321,3 +321,94 @@ above (sub-second, single process) are the instrument that actually resolves a
 change of this size. (Both runs in the ticket's baseline came from a colder
 page cache: the earlier session measured 152.8/116.8 ms/step for the same binary
 that reads 125.8/88.0 here.)
+
+## Fifth pass (2026-10-10): request-level batching, and the ceiling it hits
+
+The 70 tok/s target is unreachable on ONE stream: a token reads ~6 GB of trellis
+weights and the trellis GEMV delivers 118-170 GB/s on this model's shapes, so a
+14.3 ms step would need ~420 GB/s sustained. The remaining route to the number is
+**aggregate** throughput - several concurrent sequences sharing each weight read.
+This pass builds that and measures where it stops.
+
+### What was built
+
+* `Glm5Model::batch_join / batch_step / batch_leave` (`src/glm5_forward.cpp`):
+  B sequences advance by one token each in ONE fused forward pass, every tensor
+  of the step carrying the slot on dim 0, so one step's weight reads serve the
+  whole batch while each slot keeps its own state.
+  * The KDA half needed **no new layer code**: `kda_layer`'s conv window and
+    delta-rule matrix are already dim-0-batched and its recurrence is elementwise
+    over them, so a `(B, k-1, C)` window and a `(B, H, kd, vd)` matrix are the
+    entire change. (The state is 142 MB per slot - 34 layers x 64 heads x
+    128 x 128 fp32 - which is the batch's irreducible memory cost.)
+  * The MLA latent cache and the packed DSA indexer cache are `(B, T, ...)` with
+    slot b's rows as the **last** `pos[b]` rows of its own block - blocks are per
+    slot, so padding never aliases - which makes a step's append one concatenate
+    at a common index and the per-slot mask/selection a host-side range
+    (`mla_layer_batch`, `indexer_topk_batch` in `src/glm5_attn.cpp`).
+  * `batch_join` prefills through the ordinary single-sequence path and copies
+    its state in, so the prefill is untouched and a batch of one is
+    bit-identical to serial decoding (gate below).
+* `moe_layer_rows` (`src/glm5_moe.cpp`): the routed experts of a batch as K
+  grouped launches per layer with B members each (the merged gate|up launch has
+  2B). One Metal kernel takes 31 buffers - measured, 30 members + x + out fails
+  to compile ("buffer attribute parameter is out of bounds") - so a single launch
+  cannot hold K*B work items, and the per-rank split is what fits.
+  **The rows of a batch do not share experts**: with 8 rows and top-8 of 288, the
+  expected number of distinct experts is 288*(1-(1-8/288)^8) = 57.6, so the
+  expert bytes (2.4 GB of the 6 GB) barely move per token. The batch amortises
+  the launches, the host bookkeeping and the *dense* weights; it does not amortise
+  the expert weights unless the rows route alike.
+* `Engine::start_batch / submit_batch` + one worker thread (`src/engine.cpp`): a
+  single inference thread owns the model, admits requests continuously, prefills
+  a joining request through the single-sequence path **while the batch is
+  mid-flight** (the batch keeps its own state, so the prefill cannot disturb it),
+  and advances every live slot once per step. The per-request emission machinery
+  (think routing, stop strings, streaming deltas) was extracted into one
+  `Emitter` shared verbatim with the serial loop.
+* `--serve --batch N` (default 8 for GLM-5-Next, `0` = one request at a time)
+  routes every request through the scheduler; `Engine::submit_batch` falls back
+  to the serial `generate()` whenever batching is off, the model is not
+  GLM-5-Next, the request asks for the MTP drafter, or the worker died.
+
+### Gates (real checkpoint, one binary, one session)
+
+| gate | result |
+|---|---|
+| batch of one vs the serial decode (prefill row + 3 steps) | max abs logit diff = **0** (bit-identical) |
+| 4 slots, same prompt/tokens: rows against each other | **0** (no cross-slot coupling) |
+| 4 slots, same prompt/tokens: rows vs the serial row | 0.51 = **1.99%** of max logit, argmax identical |
+| 4 slots, 4 different prompts, greedy (argmax per step + token sequence) | **identical to 4 serial runs** |
+| `moe_layer_rows` vs per-row `moe_layer` vs the general gather/scatter path | **exact** in both comparisons (light fixture, `tests/moe_test.cpp` (g)) |
+
+The 2% logit delta is a *shape* effect, not an algorithmic one: the light gate
+compares rows=1 against rows=4 through the same code path and gets bit-equality,
+so the trellis GEMVs do not move; what moves is MLX's batched fp16 reduction
+order in the MLA/attention matmuls and the head. Token identity is the hard gate
+and it holds for every prompt for the whole measured window.
+
+Two traps this pass walked into, both worth keeping:
+
+* the first version of the light gate **passed while the grouped MoE's member
+  order was wrong**. Its fixture was 32-wide (below the Hadamard's 128-block, so
+  `blocks_per_row = 0` - degenerate) and its random trellis words decoded through
+  the mul1 codebook to NaN, so every comparison agreed vacuously (`NaN - NaN`,
+  and `std::max(0, NaN) == 0`). The fix was a 128-wide fixture with byte-uniform
+  codewords whose decode is finite (computed from the kernel's own formula), plus
+  an `isfinite && |out| > 0` gate in front of the comparison;
+* the *test* of the batch was off by one row (a step's logits follow the token it
+  was fed), which reads exactly like a wrong kernel.
+
+### What did NOT pay off
+
+* **A single grouped MoE launch per projection class**: blocked by Metal's
+  31-buffer limit (`kMaxGroupMembers = 29`); the per-rank split costs K launches
+  per layer instead of 1. mlx-serve's device-indexed expert bank is the way
+  through it (`docs/research/mlx-serve.md` §5) and needs a descriptor table for
+  our 288 scattered expert tensors.
+* **Deduplicating experts within a rank** (the other half of the launch story):
+  at 8 rows the expected saving is ~11% of the expert bytes (57.6 distinct of 64
+  selections), which is not worth the padded-row waste it costs.
+* **Speculative decoding inside the batch**: it is deliberately not enabled -
+  `submit_batch` falls back to the serial path when a request asks for the MTP
+  drafter, because the draft rows (and the rewind bookkeeping) are per sequence.

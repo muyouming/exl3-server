@@ -47,6 +47,7 @@ glm5_forward G
 glm5_mtp G
 glm5_exl3_decode G
 glm5_rewind G
+glm5_batch G
 glm5_bench G
 "
 sel() { awk -v want="$1" -v o="$ONLY" '$2==want && (o=="" || $1 ~ o){print $1}' <<< "$PLAN"; }

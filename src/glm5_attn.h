@@ -81,4 +81,40 @@ mx::array mla_layer(const G5Layer& l, const ModelConfig& cfg, const mx::array& h
                     MlaState& state, int start_pos, const mx::array& topk = mx::array(0.0f),
                     const mx::array& q_resid_in = mx::array(0.0f));
 
+// ---- batched decode (B sequences, one new row each) -------------------------
+//
+// Both per-layer caches are (B, T, ...): row b of the batch is the b-th
+// sequence, a step appends every sequence's new row at the end of the array at
+// once, and slot b's valid rows are the LAST len[b] rows of its own block. A
+// slot that joined late therefore carries zero rows in front of its own history
+// (a zero latent expands to zero k/v and a zero indexer row is invalid), and
+// the caches of the different slots never alias - dim 0 separates them.
+struct MlaBatchCache {
+  mx::array k_pass = mx::array(0.0f); // (B, T, kv_lora_rank) f32
+};
+struct IndexerBatchCache {
+  mx::array packed = mx::array(0.0f); // (B, T, 2*index_head_dim + 1) f32
+};
+
+// One batched MLA layer: `h` is (B, 1, hidden), the new rows are appended to
+// `cache` (its width grows by one) and `len` (per slot, before the append).
+// `topk` is (B, 1, W) int32 of CACHE row indices (-1 = none) for the slots' new
+// query rows - exactly what indexer_topk_batch produces. Returns (B, 1, hidden).
+//
+// The context of every slot is expanded in one matmul (kv_b_proj over the whole
+// padded cache), which is the single-sequence decoder's own cost, now shared by
+// the batch; the attention itself is per (slot, head) over the slot's own rows.
+mx::array mla_layer_batch(const G5Layer& l, const ModelConfig& cfg, const mx::array& h,
+                          MlaBatchCache& cache, const std::vector<int>& len, const mx::array& topk,
+                          const mx::array& q_resid);
+
+// The DSA indexer of a batched decode step: every row of a slot is visible to
+// that slot's query, the pools are gathered from the slot's own block of the
+// packed cache, and the selection is the reference's (top pools by score, then
+// the incomplete tail). Appends one packed row per slot. Returns (B, 1, W)
+// int32 of cache row indices, -1 for absent entries.
+mx::array indexer_topk_batch(const G5Layer& l, const ModelConfig& cfg, const mx::array& h,
+                             const mx::array& q_resid, IndexerBatchCache& cache,
+                             const std::vector<int>& len);
+
 } // namespace exl3

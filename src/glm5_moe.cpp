@@ -78,6 +78,113 @@ mx::array dense_mlp(const G5Layer& l, const ModelConfig& cfg, const mx::array& h
 
 namespace {
 
+// Defined below, with the rest of the layer's decode preparation (G5MoePrep):
+// declared here because moe_layer_rows needs it before the definition.
+const G5MoePrep* moe_prep_of(const G5Layer& l, const ModelConfig& cfg);
+
+// A grouped launch's member list must share this, and the kernel is limited to
+// 31 buffers: x + n member weights + the output, so n <= 29. Measured: a launch
+// with 30 members fails to build ("buffer attribute parameter is out of
+// bounds: must be between 0 and 30").
+constexpr int kMaxGroupMembers = 29;
+
+// Everything matmul_group_impl requires of one launch's members.
+bool group_uniform(const std::vector<TrellisWeight>& ws) {
+  for (const auto& w : ws) {
+    if (!w.aligned || w.K != ws[0].K || w.codebook != ws[0].codebook ||
+        w.in_features != ws[0].in_features || w.out_features != ws[0].out_features) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool groupable(const G5Linear& g) {
+  return g.quantized && !g.has_bias && g.tw.aligned && g.tw.packed.size() > 1;
+}
+
+} // namespace
+
+mx::array moe_layer_rows(const G5Layer& l, const ModelConfig& cfg, const mx::array& h) {
+  const int B = (int)h.shape(0), L = (int)h.shape(1), H = (int)h.shape(2);
+  const int E = cfg.n_routed_experts;
+  const int K = cfg.num_experts_per_tok;
+  const G5MoePrep* prep = moe_prep_of(l, cfg);
+  // A one-row call IS the serial decode path (its fast path is the same
+  // arithmetic and one launch per class), and a wider-than-a-launch batch has
+  // to go through the general gather/scatter form.
+  if (B <= 1 || L != 1 || prep == nullptr || E <= 0 || K <= 0 || 2 * B > kMaxGroupMembers)
+    return moe_layer(l, cfg, h);
+
+  // The shared expert does not depend on the router: dispatch it first so the
+  // GPU has it queued while the host waits for the ids (as moe_layer does).
+  mx::array shared = swiglu(l.shared_gate, l.shared_up, l.shared_down, h, cfg.swiglu_limit);
+
+  mx::array x = mx::reshape(mx::astype(h, mx::float32), {B, H});
+  mx::array logits = mx::matmul(x, mx::transpose(prep->router_w_f32));
+  auto [weights, indices] = moe_topk_route(logits, l.router_bias, cfg.n_group, cfg.topk_group, K,
+                                           cfg.norm_topk_prob, cfg.routed_scaling_factor);
+  mx::eval(indices); // the step's one host round trip
+  const int32_t* idx = indices.data<int32_t>();
+
+  std::vector<mx::array> outs;
+  outs.reserve((size_t)K);
+  const float limit = cfg.swiglu_limit;
+  mx::array hf = mx::reshape(h, {B, H});
+  for (int k = 0; k < K; ++k) {
+    // Member order, for all of wgu / xgu / gu_ids at once: the batch's rows with
+    // the rank's GATE experts first (0..B-1), then the same rows with the UP
+    // experts (B..2B-1) - which is also how the merged scale stack is laid out
+    // (gate rows 0..E-1, up rows E..2E-1; see moe_prep_of) and how the gu4 slice
+    // below splits gate from up.
+    std::vector<TrellisWeight> wgu((size_t)2 * B), wd;
+    std::vector<int32_t> gu_ids((size_t)2 * B), d_ids((size_t)B);
+    wd.reserve((size_t)B);
+    for (int b = 0; b < B; ++b) {
+      const int e = (int)idx[(size_t)b * K + k];
+      if (e < 0 || e >= E || (int)l.experts.size() != E * 3) return moe_layer(l, cfg, h);
+      const G5Linear& g = l.experts[(size_t)(e * 3 + 0)];
+      const G5Linear& u = l.experts[(size_t)(e * 3 + 1)];
+      const G5Linear& d = l.experts[(size_t)(e * 3 + 2)];
+      if (!groupable(g) || !groupable(u) || !groupable(d)) return moe_layer(l, cfg, h);
+      wgu[(size_t)b] = g.tw;
+      wgu[(size_t)(B + b)] = u.tw;
+      wd.push_back(d.tw);
+      gu_ids[(size_t)b] = e;
+      gu_ids[(size_t)(B + b)] = E + e;
+      d_ids[(size_t)b] = e;
+    }
+    if (!group_uniform(wgu) || !group_uniform(wd)) return moe_layer(l, cfg, h);
+    // The activation block is the batch itself, twice: member m<B is row m's
+    // gate expert, member B+m is row m's up expert (moe_prep_of's member order).
+    mx::array xgu = mx::reshape(mx::tile(mx::reshape(hf, {1, B, H}), {2, 1, 1}), {2 * B, 1, H});
+    mx::array gu = trellis_linear_group_rows_scaled(
+        wgu, xgu, /*rows=*/1, mx::take(prep->suh_gu, mx::array(gu_ids.data(), {2 * B}, mx::int32), 0),
+        mx::take(prep->svh_gu, mx::array(gu_ids.data(), {2 * B}, mx::int32), 0));
+    const int out_i = wgu[0].out_features;
+    mx::array gu4 = mx::reshape(gu, {2, B, 1, out_i});
+    mx::array gate = mx::reshape(mx::slice(gu4, {0, 0, 0, 0}, {1, B, 1, out_i}), {B, 1, out_i});
+    mx::array up = mx::reshape(mx::slice(gu4, {1, 0, 0, 0}, {2, B, 1, out_i}), {B, 1, out_i});
+    gate = mx::clip(gate, std::nullopt, mx::array(limit, gate.dtype()));
+    up = mx::clip(up, mx::array(-limit, up.dtype()), mx::array(limit, up.dtype()));
+    mx::array act = mx::multiply(gate, mx::sigmoid(gate));
+    mx::array actup = mx::multiply(act, up);
+    mx::array down = trellis_linear_group_rows_scaled(
+        wd, actup, /*rows=*/1, mx::take(prep->suh_d, mx::array(d_ids.data(), {B}, mx::int32), 0),
+        mx::take(prep->svh_d, mx::array(d_ids.data(), {B}, mx::int32), 0));
+    outs.push_back(down); // (B, 1, H)
+  }
+  // The general path's weighted sum, term by term in rank order: (K, B, 1, H)
+  // times the per-(row, rank) weight, rounded to h's dtype, summed over K.
+  mx::array stk = mx::stack(outs, 0);                              // (K, B, 1, H)
+  mx::array wt = mx::reshape(mx::transpose(weights), {K, B, 1, 1}); // (B,K) f32 -> (K,B,1,1)
+  mx::array routed = mx::reshape(mx::sum(mx::astype(mx::multiply(stk, wt), h.dtype()), 0),
+                                 {B, L, H});
+  return mx::add(routed, shared);
+}
+
+namespace {
+
 // The layer's decode preparation (G5MoePrep in glm5.h), built on first use:
 // the router weight in the layout its matmul consumes, and one stacked scale
 // vector per projection class. Returns nullptr when the experts are not uniform

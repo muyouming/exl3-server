@@ -21,6 +21,9 @@ CUDA/ROCm backend, no plugin system.
   reuses the longest common token prefix on the next request.
 - OpenAI-compatible API: `/v1/models`, `/v1/chat/completions`, `/v1/completions`
   (SSE streaming and non-streaming), `/health`.
+- Request-level batching for GLM-5-Next (`--serve --batch N`): up to N concurrent
+  requests advance through one fused decode step (rows = sequences), each with its
+  own KDA/MLA/indexer state; a batch of one is bit-identical to serial decoding.
 - Samplers: greedy, temperature, top-k, top-p, min-p, repetition / presence /
   frequency penalties, seeded RNG, stop strings.
 
@@ -77,6 +80,20 @@ fused into one `self_attn.qkv_proj`, the KDA tensors live under `self_attn.*`,
 forget gate uses the config's `gate_lower_bound = -5`, and bitrates vary per
 tensor (e.g. `kv_a_proj_with_mqa` at K=5 while most are K=4).
 
+### Request-level batching
+
+`--serve --batch N` (default 8 for GLM-5-Next, `0` = one at a time) runs up to N
+concurrent sequences through one fused decode step: the rows of the step are the
+sequences, so a step's weight reads serve the whole batch while each slot keeps
+its own state (KDA conv window + delta-rule matrix, the compressed MLA latent
+cache, the packed DSA indexer cache). A joining request is prefilled through the
+ordinary single-sequence path and its state copied in, so a batch of one is
+bit-identical to serial decoding, and four concurrent greedy runs produce exactly
+the tokens four serial runs do (`tests/glm5_batch_test.cpp`). What batching does
+**not** buy is the routed experts: 8 rows over top-8 of 288 experts select ~58
+distinct experts, so those 2.4 GB/token are read either way; the ~3.3 GB of dense
+weight reads per token are shared. See `docs/perf.md`, "request-level batching".
+
 ## CLI
 
 ```sh
@@ -99,6 +116,7 @@ exl3-server --model /models/MiniCPM5-2B-EXL3-Quantized --serve --host 127.0.0.1 
 | `-p, --prompt TEXT` | generate from a prompt (repeatable) |
 | `-i, --interactive` | chat REPL (`/exit`, `/reset`, `/think`, `/nothink`, `/system TEXT`, `/raw TEXT`) |
 | `--serve`, `--host`, `--port` | HTTP server (default `127.0.0.1:8080`) |
+| `--batch N` | serve up to N concurrent requests through one fused decode step (GLM-5-Next only; default 8, `0` = serial) |
 | `--raw` | treat `--prompt` as a raw completion (no chat template) |
 | `--system TEXT` | system prompt for chat modes |
 | `--think` / `--no-think` | start the reply inside / outside a `<think>` block (default: empty think block) |

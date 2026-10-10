@@ -65,6 +65,33 @@ struct Glm5Profile {
   void reset() { *this = Glm5Profile{}; }
 };
 
+// One layer's batched decode state. The KDA half is a KdaState whose arrays
+// carry a leading B (the conv window and the delta-rule matrix are per slot and
+// kda_layer is already written against dim 0 = batch); the caches are the
+// batched (B, T, ...) forms documented in glm5_attn.h. Every slot's block has
+// the same width T and its valid rows are the LAST `len` rows of it.
+struct Glm5BatchLayerState {
+  KdaState kda;
+  MlaBatchCache mla;
+  IndexerBatchCache idx;
+};
+
+// A decode batch: `size` live sequences, each advancing one token per step.
+// Slot b is row b of every state array; `pos[b]` is the number of tokens slot b
+// has processed (so its next absolute position) and equals its cache block's
+// valid length. Adding or dropping a slot re-packs the state (a bulk copy of
+// ~the recurrent state, once per event, not per step).
+struct Glm5BatchState {
+  int size = 0;
+  std::vector<Glm5BatchLayerState> layers;
+  std::vector<int> pos;
+  void clear() {
+    size = 0;
+    layers.clear();
+    pos.clear();
+  }
+};
+
 class Glm5Model {
  public:
   Glm5Model() = default;
@@ -154,6 +181,34 @@ class Glm5Model {
   // with it).
   void rewind(int pos);
 
+  // ---- request-level batching ---------------------------------------------
+  //
+  // B sequences advanced by one token each in ONE fused forward pass, rows =
+  // sequences: every weight read of a step is shared by the batch's rows, while
+  // each sequence keeps its own state (KDA recurrence + conv window, the
+  // compressed MLA latent cache, the packed DSA indexer cache).
+  //
+  // `batch_join` runs the ordinary single-sequence prefill (the single-sequence
+  // path itself is untouched; what it leaves in the model is what gets copied)
+  // and returns the new slot's index. When `logits_last` is non-null it receives
+  // the prompt's last-position logits (vocab f32) - the same row the serial
+  // decoder would sample its first token from, so a batched request starts from
+  // exactly that distribution. Only one generation path may drive the model at a
+  // time: a join overwrites the single sequence's state, and the batch keeps its
+  // own, so the prefill of a joining request does not disturb the batch that is
+  // mid-flight.
+  int batch_join(const std::vector<int>& prompt, std::vector<float>* logits_last = nullptr);
+  // Drops a slot; the remaining slots keep their state and positions.
+  void batch_leave(int slot);
+  // tokens.size() == batch_size(), one token per live slot. Returns (B, vocab)
+  // f32 logits (row b = slot b, the logits of the token slot b is about to
+  // generate) and advances every slot's position by one.
+  mx::array batch_step(const std::vector<int>& tokens);
+  void batch_reset() { batch_.clear(); }
+  int batch_size() const { return batch_.size; }
+  int batch_pos(int slot) const { return batch_.pos[(size_t)slot]; }
+  const std::vector<int>& batch_positions() const { return batch_.pos; }
+
   struct LayerState {
     KdaState kda;      // linear_attention layers
     MlaState mla;      // deepseek_sparse_attention layers
@@ -167,6 +222,7 @@ class Glm5Model {
   Glm5Weights w_;
   G5HcConfig hc_;
   std::vector<LayerState> states_;
+  Glm5BatchState batch_; // the decode batch's own state (see batch_join)
   int pos_ = 0;
   int vocab_ = 0;
   double load_seconds_ = 0.0;

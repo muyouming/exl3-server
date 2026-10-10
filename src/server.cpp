@@ -278,7 +278,7 @@ int run_server(Engine& engine, const ServerOptions& opt, std::atomic<bool>& stop
                                                    {"finish_reason", nullptr}}});
               sse.send(chunk);
             };
-            GenerateResult r = engine.generate(prompt, p.gen, on_delta,
+            GenerateResult r = engine.submit_batch(prompt, p.gen, on_delta,
                                                [&] { return sse.dead || stop.load(); });
             finish = r.finish_reason == "cancelled" ? "stop" : r.finish_reason;
             if (p.verbose) {
@@ -304,7 +304,7 @@ int run_server(Engine& engine, const ServerOptions& opt, std::atomic<bool>& stop
     json choices = json::array();
     int64_t prompt_tokens = 0, completion_tokens = 0;
     for (int i = 0; i < p.n; ++i) {
-      GenerateResult r = engine.generate(prompt, p.gen, nullptr, [&] { return stop.load(); });
+      GenerateResult r = engine.submit_batch(prompt, p.gen, nullptr, [&] { return stop.load(); });
       if (p.verbose)
         std::fprintf(stderr, "[chat] %d prompt + %d gen tokens, %.1f tok/s\n", r.prompt_tokens,
                      r.completion_tokens,
@@ -384,7 +384,7 @@ int run_server(Engine& engine, const ServerOptions& opt, std::atomic<bool>& stop
                                                      {"finish_reason", nullptr}}});
                 sse.send(chunk);
               };
-              GenerateResult r = engine.generate(encoded[idx], p.gen, on_delta,
+              GenerateResult r = engine.submit_batch(encoded[idx], p.gen, on_delta,
                                                  [&] { return sse.dead || stop.load(); });
               json last = base;
               last["choices"] = json::array({json{{"text", ""},
@@ -402,7 +402,7 @@ int run_server(Engine& engine, const ServerOptions& opt, std::atomic<bool>& stop
     json choices = json::array();
     int64_t prompt_tokens = 0, completion_tokens = 0;
     for (size_t idx = 0; idx < encoded.size(); ++idx) {
-      GenerateResult r = engine.generate(encoded[idx], p.gen, nullptr, [&] { return stop.load(); });
+      GenerateResult r = engine.submit_batch(encoded[idx], p.gen, nullptr, [&] { return stop.load(); });
       if (p.verbose)
         std::fprintf(stderr, "[completion] %d prompt + %d gen tokens, %.1f tok/s\n",
                      r.prompt_tokens, r.completion_tokens,

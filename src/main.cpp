@@ -32,6 +32,9 @@ void usage() {
       "server:\n"
       "      --host HOST       bind address (default 127.0.0.1)\n"
       "      --port N          port (default 8080)\n"
+      "      --batch N         serve up to N concurrent sequences through one fused decode\n"
+      "                        step (rows = sequences); 0 = one request at a time\n"
+      "                        (default 8 for GLM-5-Next, off for other architectures)\n"
       "\n"
       "sampling:\n"
       "      --max-tokens N           maximum tokens to generate (default 512)\n"
@@ -77,6 +80,7 @@ int main(int argc, char** argv) {
   int threads = 0;
   int draft_ngram = 0;
   int draft_mtp = 0;
+  int batch = -1; // <0: default by architecture
   bool serve = false;
   bool fp16_weights = false;
   exl3::CliOptions cli;
@@ -118,6 +122,8 @@ int main(int argc, char** argv) {
       draft_ngram = std::atoi(arg(i, "--draft-ngram").c_str());
     } else if (a == "--draft-mtp" || a.rfind("--draft-mtp=", 0) == 0) {
       draft_mtp = std::atoi(arg(i, "--draft-mtp").c_str());
+    } else if (a == "--batch" || a.rfind("--batch=", 0) == 0) {
+      batch = std::atoi(arg(i, "--batch").c_str());
     } else if (a == "--fp16-weights") {
       fp16_weights = true;
     } else if (a == "--think") {
@@ -199,6 +205,11 @@ int main(int argc, char** argv) {
   cli.stats = verbose;
 
   if (serve) {
+    // Batching is on by default for GLM-5-Next (a concurrent request then shares
+    // the decode step instead of queueing behind the one in flight); the Llama
+    // path has a single shared KV cache and no per-slot state, so it stays off.
+    const int max_batch = batch >= 0 ? batch : (engine.model().glm5() ? 8 : 0);
+    if (max_batch > 0) engine.start_batch(max_batch);
     exl3::ServerOptions so;
     so.host = host;
     so.port = port;
