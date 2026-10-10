@@ -19,15 +19,27 @@ namespace exl3 {
 namespace mx = mlx::core;
 
 struct TrellisWeight {
-  mx::array words = mx::array(0.0f); // uint32 (in/16, out/16, 8*K)
-  mx::array suh = mx::array(0.0f);   // f16 (in)
-  mx::array svh = mx::array(0.0f);   // f16 (out)
+  // The packed trellis words as little-endian BYTES: one uint8 element per
+  // byte, shaped (in/16, out/16, 16*K) - i.e. the raw file layout of the
+  // tensor (each 32-bit word is two u16 halves, word i = b[4i] | b[4i+1]<<8 |
+  // b[4i+2]<<16 | b[4i+3]<<24).
+  //
+  // Byte granularity is what makes a zero-copy mmap view safe: MLX divides a
+  // buffer offset by the new element size when an array is *viewed* as a wider
+  // dtype, and a safetensors tensor does not have to start on a 4-byte
+  // boundary (the shard header length is arbitrary), so viewing the file bytes
+  // as uint32 silently reads up to 3 bytes early.
+  mx::array packed = mx::array(0.0f); // uint8 (in/16, out/16, 16*K)
+  mx::array suh = mx::array(0.0f);    // f16 (in)
+  mx::array svh = mx::array(0.0f);    // f16 (out)
   int in_features = 0;
   int out_features = 0;
   int K = 4;
   int codebook = 2; // mul1
 
-  int64_t bytes() const { return (int64_t)words.size() * 4 + 2 * ((int64_t)in_features + out_features); }
+  int64_t bytes() const {
+    return (int64_t)packed.size() + 2 * ((int64_t)in_features + out_features);
+  }
 };
 
 // y = x @ W in fp16, x is (rows, in_features).

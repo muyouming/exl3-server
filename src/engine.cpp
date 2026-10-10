@@ -121,13 +121,13 @@ bool Engine::load(const std::string& model_path, std::string& err, int threads, 
   std::string name = fs::path(model_path).filename().string();
   if (name.empty()) name = "exl3-model";
   model_name_ = name;
-  cache_.init(model_.config().num_layers);
+  model_.reset_cache(cache_);
   return true;
 }
 
 void Engine::reset() {
   std::lock_guard<std::mutex> lk(mu_);
-  cache_.init(model_.config().num_layers);
+  model_.reset_cache(cache_);
   prefix_.clear();
 }
 
@@ -143,10 +143,15 @@ GenerateResult Engine::generate(const std::vector<int>& prompt, const GenerateOp
 
   const bool speculative = drafter_ && opt.draft_tokens > 1 && opt.sample.temperature <= 0.0f;
 
-  // Reuse the longest common prefix already in the KV cache.
+  // Reuse the longest common prefix already in the KV cache. GLM-5-Next keeps a
+  // recurrent state (KDA delta matrices + a compressed KV/indexer cache) that
+  // cannot be rewound to an arbitrary position, so it always restarts at 0 -
+  // Model::forward_glm5 then resets the state and re-prefills.
   size_t common = 0;
-  while (common < prefix_.size() && common < prompt.size() && prefix_[common] == prompt[common])
-    common++;
+  if (model_.config().arch != Arch::Glm5Next) {
+    while (common < prefix_.size() && common < prompt.size() && prefix_[common] == prompt[common])
+      common++;
+  }
   int restart = (int)common;
   if (restart >= (int)prompt.size()) restart = (int)prompt.size() - 1;
   if (restart != cache_.offset) cache_.trim(restart);

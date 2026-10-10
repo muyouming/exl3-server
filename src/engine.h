@@ -68,6 +68,9 @@ class Engine {
   bool load(const std::string& model_path, std::string& err, int threads = 0,
             bool fp16_weights = false);
   const ModelConfig& config() const { return model_.config(); }
+  // The loaded model, for tests/benchmarks that drive forward_multi directly.
+  const Model& model() const { return model_; }
+  Model& model() { return model_; }
   const Tokenizer& tokenizer() const { return tok_; }
   const std::string& model_name() const { return model_name_; }
   void set_model_name(const std::string& n) { model_name_ = n; }

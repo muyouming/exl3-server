@@ -62,7 +62,7 @@ static void dump_lin(const char* name, const exl3::G5Linear& l) {
               l.out_features);
   if (l.quantized) {
     std::printf("  K=%d codebook=%d words=%s %s suh=%s svh=%s", l.tw.K, l.tw.codebook,
-                shape_str(l.tw.words).c_str(), dtype_name(l.tw.words.dtype()),
+                shape_str(l.tw.packed).c_str(), dtype_name(l.tw.packed.dtype()),
                 shape_str(l.tw.suh).c_str(), shape_str(l.tw.svh).c_str());
   } else {
     std::printf("  w=%s %s", shape_str(l.w).c_str(), dtype_name(l.w.dtype()));

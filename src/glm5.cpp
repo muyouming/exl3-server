@@ -167,8 +167,17 @@ bool tensor_view(const Store& st, const std::string& name, mx::Dtype dt, const m
     err = "unsupported byte layout for " + name;
     return false;
   }
-  const int64_t align = info.nbytes / numel; // 2 for f16, 4 for f32/u32
+  const int64_t align = info.nbytes / numel; // bytes per source element (2 for f16, 4 for f32)
   if (info.nbytes % align != 0 || off % align != 0) {
+    err = "unaligned data for " + name;
+    return false;
+  }
+  // The view is created inside a page-aligned mapping, so the alignment that
+  // matters is the one of the *target* dtype: MLX stores an array offset in
+  // elements of that dtype, and a mismatch would silently truncate it instead
+  // of failing (which is why the packed trellis words are read as bytes).
+  const int64_t req = mx::size_of(dt);
+  if (req <= 0 || off % req != 0) {
     err = "unaligned data for " + name;
     return false;
   }
@@ -296,22 +305,25 @@ G5Linear load_linear(const Store& st, const std::string& key, std::string& err) 
     lin.out_features = (int)(nt * 16);
     lin.tw.in_features = lin.in_features;
     lin.tw.out_features = lin.out_features;
-    // The packed words are used straight out of the mapping (uint32 words, the
-    // file stores them as I16 pairs).
-    mx::array words = mx::array(0.0f);
+    // The packed words are kept as raw bytes: MLX's `view()` divides a buffer
+    // offset when reinterpreting it as a wider dtype, so a uint32 view of the
+    // file bytes would silently start up to 3 bytes early (a shard's header
+    // length is arbitrary, so a tensor need not begin on a 4-byte boundary).
+    mx::array packed = mx::array(0.0f);
     std::string view_err;
-    if (!tensor_view(st, key + ".trellis", mx::uint32,
-                     mx::Shape{(int)kt, (int)nt, (int)(words16 / 2)}, words, view_err)) {
+    if (!tensor_view(st, key + ".trellis", mx::uint8,
+                     mx::Shape{(int)kt, (int)nt, (int)(words16 * 2)}, packed, view_err)) {
       // fall back to a copy of the packed weights
-      const uint16_t* src = (const uint16_t*)f->i16_data(key + ".trellis", err);
+      const uint8_t* src = f->data(key + ".trellis", err);
       if (!src) return lin;
-      auto* holder = new std::vector<uint32_t>((size_t)(kt * nt * words16 / 2));
-      std::memcpy(holder->data(), src, holder->size() * 4);
-      words = mx::array((void*)holder->data(), mx::Shape{(int)kt, (int)nt, (int)(words16 / 2)},
-                        mx::uint32, [holder](void*) { delete holder; });
+      auto* holder = new std::vector<uint8_t>((size_t)(kt * nt * words16 * 2));
+      std::memcpy(holder->data(), src, holder->size());
+      packed = mx::array((void*)holder->data(),
+                         mx::Shape{(int)kt, (int)nt, (int)(words16 * 2)}, mx::uint8,
+                         [holder](void*) { delete holder; });
     }
-    mx::eval(words);
-    lin.tw.words = words;
+    mx::eval(packed);
+    lin.tw.packed = packed;
     lin.tw.suh = load_any(st, key + ".suh", false, false, err);
     lin.tw.svh = load_any(st, key + ".svh", false, false, err);
   } else if (st.has(key + ".weight")) {
@@ -352,17 +364,8 @@ bool expect_vec(const mx::array& a, int64_t n, const std::string& what, std::str
 }
 
 // `text_config.linear_attn_config.gate_lower_bound` (a checkpoint property the
-// engine needs to pick the forget-gate arm; see G5Layer::kda_gate_lower_bound).
-float read_gate_lower_bound(const std::string& dir) {
-  nlohmann::json j;
-  std::string err;
-  if (!parse_json_file(dir + "/config.json", j, err)) return 0.0f;
-  if (j.contains("text_config") && j["text_config"].is_object()) j = j["text_config"];
-  if (!j.contains("linear_attn_config") || !j["linear_attn_config"].is_object()) return 0.0f;
-  const auto& la = j["linear_attn_config"];
-  if (!la.contains("gate_lower_bound") || !la["gate_lower_bound"].is_number()) return 0.0f;
-  return la["gate_lower_bound"].get<float>();
-}
+// engine needs to pick the forget-gate arm; see G5Layer::kda_gate_lower_bound)
+// is parsed into ModelConfig::linear_gate_lower_bound by ModelConfig::load.
 
 } // namespace
 
@@ -376,7 +379,7 @@ bool load_glm5(const std::string& dir, const ModelConfig& cfg, Glm5Weights& out,
   const int64_t t0 = now_ms();
   Store st;
   if (!st.open(dir, err)) return false;
-  st.gate_lower_bound = read_gate_lower_bound(dir);
+  st.gate_lower_bound = cfg.linear_gate_lower_bound;
   if (verbose) {
     std::fprintf(stderr, "glm5: %zu shards, %zu tensors, %.1f GB mapped in %.1fs\n",
                  st.files.size(), st.where.size(), st.bytes / 1e9, (now_ms() - t0) / 1000.0);

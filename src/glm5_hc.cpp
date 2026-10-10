@@ -6,11 +6,11 @@
 
 namespace exl3 {
 
-G5HcConfig g5_hc_config(const ModelConfig& cfg, float eps) {
+G5HcConfig g5_hc_config(const ModelConfig& cfg) {
   G5HcConfig hc;
   hc.mult = cfg.hc_mult;
   hc.sinkhorn_iters = cfg.hc_sinkhorn_iters;
-  hc.eps = eps;
+  hc.eps = cfg.hc_eps;
   return hc;
 }
 

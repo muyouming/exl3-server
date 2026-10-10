@@ -7,6 +7,7 @@
 #include "trellis_gemm.h"
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -15,6 +16,8 @@ namespace exl3 {
 namespace mx = mlx::core;
 
 enum class Arch { Llama, Glm5Next };
+
+class Glm5Model;
 
 struct ModelConfig {
   Arch arch = Arch::Llama;
@@ -60,6 +63,12 @@ struct ModelConfig {
   bool mhc = false;      // hyper-connections
   int hc_mult = 0;
   int hc_sinkhorn_iters = 0;
+  float hc_eps = 1e-6f;  // hc_eps (reference default 1e-6)
+  int n_group = 1;       // MoE routing groups
+  int topk_group = 1;    // groups kept by the router
+  // text_config.linear_attn_config.gate_lower_bound: non-zero selects fla's
+  // USE_LOWER_BOUND forget gate (this checkpoint: -5.0).
+  float linear_gate_lower_bound = 0.0f;
   int num_nextn_predict_layers = 0;
 
   static bool load(const std::string& dir, ModelConfig& out, std::string& err);
@@ -78,12 +87,17 @@ struct KVCache {
 
 class Model {
  public:
+  Model();
+  ~Model();
   // Load config + safetensors from a model directory (or a .safetensors file).
   bool load(const std::string& path, std::string& err, int threads = 0,
             bool fp16_weights = false);
   const ModelConfig& config() const { return cfg_; }
   size_t weight_bytes() const { return weight_bytes_; }
   double load_seconds() const { return load_seconds_; }
+  // GLM-5-Next only (0 on the Llama path): the loader's tensor inventory.
+  int64_t used_tensors() const;
+  int64_t total_tensors() const;
 
   // Run `tokens` through the model, appending to `cache`, and return the
   // float32 logits of the last position.
@@ -107,7 +121,7 @@ class Model {
                               bool capture_taps = false);
 
   // Reset the KV cache (keeps allocations).
-  void reset_cache(KVCache& cache) const { cache.init((int)cfg_.num_layers); }
+  void reset_cache(KVCache& cache) const;
 
  private:
   struct Linear {
@@ -125,6 +139,9 @@ class Model {
 
   mx::array load_linear(const struct SafetensorsFile& st, const std::string& key,
                         std::string& err, int threads);
+  // GLM-5-Next forward: `all_logits` runs the lm_head on every position (needed
+  // only to verify speculative proposals), otherwise just on the last one.
+  ForwardResult forward_glm5(const std::vector<int>& tokens, KVCache& cache, bool all_logits);
   bool load_trellis(const struct SafetensorsFile& st, const std::string& key, TrellisWeight& out,
                     std::string& err);
   mx::array load_vector(const struct SafetensorsFile& st, const std::string& name,
@@ -136,6 +153,9 @@ class Model {
   mx::array embed_ = mx::array(0.0f);      // f16 (vocab, hidden)
   mx::array final_norm_ = mx::array(0.0f); // f16 (hidden)
   Linear lm_head_;
+  // GLM-5-Next path (cfg_.arch == Arch::Glm5Next): all weights and the
+  // incremental state live here; `layers_`/`embed_`/`lm_head_` stay empty.
+  std::unique_ptr<Glm5Model> glm5_;
   size_t weight_bytes_ = 0;
   double load_seconds_ = 0;
 };

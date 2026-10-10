@@ -9,41 +9,36 @@
 
 namespace exl3 {
 
-namespace {
-// This checkpoint has n_group = 1 / topk_group = 1 (docs/glm5.md): every expert
-// lives in one group, which the `topk_group == n_group` branch restores as the
-// full candidate set. ModelConfig does not carry the group counts (the loader
-// does not parse them), so the (degenerate here) values are named here.
-constexpr int kNumGroups = 1;
-constexpr int kTopkGroup = 1;
-} // namespace
-
 std::pair<mx::array, mx::array> moe_topk_route(const mx::array& logits, const mx::array& bias,
                                                int n_group, int topk_group, int top_k,
                                                bool norm_topk_prob, float routed_scaling_factor) {
   const int N = (int)logits.shape(0);
   const int E = (int)logits.shape(1);
-  const int gsize = E / n_group;
+  // n_group/topk_group come from the config (1/1 for this checkpoint, which the
+  // `topk_group == n_group` branch below degenerates to "keep every expert").
+  const int ng = n_group > 1 ? n_group : 1;
+  const int tg = topk_group > 0 ? (topk_group < ng ? topk_group : ng) : 1;
+  const int gsize = E / ng;
 
   mx::array scores = mx::sigmoid(logits);
   mx::array sfc = mx::add(scores, mx::astype(bias, mx::float32)); // scores_for_choice
 
   // group_scores = sum of the top-2 scores_for_choice in each group.
-  mx::array r = mx::reshape(sfc, {N, n_group, gsize});
+  mx::array r = mx::reshape(sfc, {N, ng, gsize});
   const int gtop = gsize >= 2 ? 2 : 1;
-  mx::array gperm = mx::argpartition(mx::negative(r), gtop - 1, 2); // (N, n_group, gsize)
-  mx::array gidx = mx::slice(gperm, {0, 0, 0}, {N, n_group, gtop});
-  mx::array gtop2 = mx::take_along_axis(r, gidx, 2);          // (N, n_group, gtop)
-  mx::array group_scores = mx::sum(gtop2, 2);                 // (N, n_group)
+  mx::array gperm = mx::argpartition(mx::negative(r), gtop - 1, 2); // (N, ng, gsize)
+  mx::array gidx = mx::slice(gperm, {0, 0, 0}, {N, ng, gtop});
+  mx::array gtop2 = mx::take_along_axis(r, gidx, 2);          // (N, ng, gtop)
+  mx::array group_scores = mx::sum(gtop2, 2);                 // (N, ng)
 
   // Keep the `topk_group` best groups (topk_group == n_group keeps everything -
   // this is the path taken by the shipped checkpoint).
-  mx::array gperm2 = mx::argpartition(mx::negative(group_scores), topk_group - 1, 1);
-  mx::array gsel = mx::slice(gperm2, {0, 0}, {N, topk_group}); // (N, topk_group)
-  mx::array gmask = mx::scatter_add_axis(mx::zeros({N, n_group}, mx::float32), gsel,
-                                         mx::ones({N, topk_group}, mx::float32), 1);
+  mx::array gperm2 = mx::argpartition(mx::negative(group_scores), tg - 1, 1);
+  mx::array gsel = mx::slice(gperm2, {0, 0}, {N, tg}); // (N, tg)
+  mx::array gmask = mx::scatter_add_axis(mx::zeros({N, ng}, mx::float32), gsel,
+                                         mx::ones({N, tg}, mx::float32), 1);
   mx::array score_mask =
-      mx::reshape(mx::broadcast_to(mx::expand_dims(gmask, -1), {N, n_group, gsize}), {N, E});
+      mx::reshape(mx::broadcast_to(mx::expand_dims(gmask, -1), {N, ng, gsize}), {N, E});
   mx::array masked = mx::where(mx::greater(score_mask, mx::array(0.0f)), sfc,
                                mx::array(-std::numeric_limits<float>::infinity(), mx::float32));
 
@@ -90,7 +85,7 @@ mx::array moe_layer(const G5Layer& l, const ModelConfig& cfg, const mx::array& h
   // preceding layer by the caller).
   mx::array x = mx::reshape(mx::astype(h, mx::float32), {N, H});
   mx::array logits = mx::matmul(x, mx::transpose(mx::astype(l.router_w, mx::float32)));
-  auto [weights, indices] = moe_topk_route(logits, l.router_bias, kNumGroups, kTopkGroup, K,
+  auto [weights, indices] = moe_topk_route(logits, l.router_bias, cfg.n_group, cfg.topk_group, K,
                                            cfg.norm_topk_prob, cfg.routed_scaling_factor);
   mx::eval(indices);
 

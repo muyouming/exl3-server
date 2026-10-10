@@ -11,6 +11,7 @@
 
 #include "exl3.h"
 #include "fp16.h"
+#include "glm5_forward.h"
 #include "safetensors.h"
 #include "util.h"
 
@@ -153,7 +154,16 @@ bool ModelConfig::load(const std::string& dir, ModelConfig& out, std::string& er
       out.mhc = j.value("mhc", false);
       out.hc_mult = j.value("hc_mult", 0);
       out.hc_sinkhorn_iters = j.value("hc_sinkhorn_iters", 0);
+      out.hc_eps = j.value("hc_eps", 1e-6f);
       out.num_nextn_predict_layers = j.value("num_nextn_predict_layers", 0);
+      out.n_group = j.value("n_group", 1);
+      out.topk_group = j.value("topk_group", 1);
+      if (j.contains("linear_attn_config") && j["linear_attn_config"].is_object()) {
+        const auto& la = j["linear_attn_config"];
+        if (la.contains("gate_lower_bound") && la["gate_lower_bound"].is_number()) {
+          out.linear_gate_lower_bound = la["gate_lower_bound"].get<float>();
+        }
+      }
       // MLA heads: the nope-only checkpoints carry no rope dims.
       out.head_dim = j.value("qk_nope_head_dim", 0) > 0 ? j.value("qk_nope_head_dim", 0)
                                                         : out.head_dim;
@@ -245,11 +255,11 @@ bool Model::load_trellis(const SafetensorsFile& st, const std::string& key, Trel
     return false;
   }
   {
-    auto* holder = new std::vector<uint32_t>((size_t)(k_tiles * n_tiles * words16 / 2));
-    std::memcpy(holder->data(), src, holder->size() * 4);
-    out.words = mx::array((void*)holder->data(),
-                          mx::Shape{(int)k_tiles, (int)n_tiles, (int)(words16 / 2)}, mx::uint32,
-                          [holder](void*) { delete holder; });
+    auto* holder = new std::vector<uint8_t>((size_t)(k_tiles * n_tiles * words16 * 2));
+    std::memcpy(holder->data(), src, holder->size());
+    out.packed = mx::array((void*)holder->data(),
+                           mx::Shape{(int)k_tiles, (int)n_tiles, (int)(words16 * 2)}, mx::uint8,
+                           [holder](void*) { delete holder; });
   }
   out.suh = load_vector(st, key + ".suh", err, false);
   out.svh = load_vector(st, key + ".svh", err, false);
@@ -308,6 +318,19 @@ bool Model::load(const std::string& path, std::string& err, int threads, bool fp
   std::string dir = path;
   if (fs::is_regular_file(path)) dir = fs::path(path).parent_path().string();
   if (!ModelConfig::load(dir, cfg_, err)) return false;
+
+  if (cfg_.arch == Arch::Glm5Next) {
+    glm5_ = std::make_unique<Glm5Model>();
+    if (!glm5_->load(dir, cfg_, err, threads, /*verbose=*/true)) return false;
+    cfg_ = glm5_->config();
+    weight_bytes_ = (size_t)glm5_->weight_bytes();
+    load_seconds_ = glm5_->load_seconds();
+    std::fprintf(stderr,
+                 "exl3-server: loaded %.2f GB of weights in %.1fs (GLM-5-Next, %lld/%lld tensors)\n",
+                 (double)weight_bytes_ / 1e9, load_seconds_,
+                 (long long)glm5_->used_tensors(), (long long)glm5_->total_tensors());
+    return true;
+  }
 
   TensorStore store;
   if (!store.open(dir, err)) return false;
@@ -419,13 +442,62 @@ bool Model::load(const std::string& path, std::string& err, int threads, bool fp
 
 const int Model::kTapLayers[Model::kNumTaps] = {1, 10, 20, 30, 39};
 
+// Out-of-line so that std::unique_ptr<Glm5Model> only needs the complete type
+// here (model.h keeps a forward declaration).
+Model::Model() = default;
+Model::~Model() = default;
+
 std::vector<float> Model::forward(const std::vector<int>& tokens, KVCache& cache) {
   return forward_multi(tokens, cache, false).logits_last;
+}
+
+void Model::reset_cache(KVCache& cache) const {
+  if (glm5_) glm5_->reset(); // the GLM state lives in the model, not the cache
+  cache.init((int)cfg_.num_layers);
+}
+
+int64_t Model::used_tensors() const { return glm5_ ? glm5_->used_tensors() : 0; }
+int64_t Model::total_tensors() const { return glm5_ ? glm5_->total_tensors() : 0; }
+
+Model::ForwardResult Model::forward_glm5(const std::vector<int>& tokens, KVCache& cache,
+                                         bool all_logits) {
+  const int L = (int)tokens.size();
+  ForwardResult res;
+  mx::array h = glm5_->forward_hidden(tokens, cache.offset); // (1, L, hidden)
+  // A prefill only needs the last position: running the (EXL3, 6 bpw) head on
+  // one row costs the same weight traffic as on all of them, but the f32 logits
+  // of a long prompt would not fit next to the weights.
+  mx::array logits = mx::array(0.0f);
+  if (all_logits) {
+    logits = glm5_->apply_lm_head(h); // (L, vocab)
+  } else {
+    mx::array last = mx::slice(h, {0, L - 1, 0}, {1, L, (int)cfg_.hidden_size});
+    logits = glm5_->apply_lm_head(last); // (1, vocab)
+  }
+  const int rows = (int)logits.shape(0);
+  const int vocab = (int)logits.shape(1);
+  const float* lp = logits.data<float>();
+  res.greedy.resize((size_t)rows);
+  for (int i = 0; i < rows; ++i) {
+    const float* row = lp + (size_t)i * vocab;
+    int best = 0;
+    for (int v = 1; v < vocab; ++v) {
+      if (row[v] > row[best]) best = v;
+    }
+    res.greedy[(size_t)i] = best;
+  }
+  res.logits_last.assign(lp + (size_t)(rows - 1) * vocab, lp + (size_t)rows * vocab);
+  cache.offset = glm5_->position();
+  return res;
 }
 
 Model::ForwardResult Model::forward_multi(const std::vector<int>& tokens, KVCache& cache,
                                           bool capture_taps) {
   const int L = (int)tokens.size();
+  if (L <= 0) return {};
+  // GLM-5-Next owns all of its state (recurrent KDA state, compressed KV cache
+  // and the indexer cache) inside Glm5Model; `cache` only carries the position.
+  if (glm5_) return forward_glm5(tokens, cache, capture_taps);
   const int hidden = cfg_.hidden_size;
   const int n_heads = cfg_.num_heads, n_kv = cfg_.num_kv_heads, hd = cfg_.head_dim;
   const int S = cache.offset + L;

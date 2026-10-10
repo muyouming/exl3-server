@@ -84,9 +84,9 @@ struct G5HcConfig {
   float eps = 1e-6f;        // hc_eps
 };
 
-// Reads mult/sinkhorn_iters from the model config (eps is not in ModelConfig,
-// the reference default is 1e-6).
-G5HcConfig g5_hc_config(const ModelConfig& cfg, float eps = 1e-6f);
+// Reads mult/sinkhorn_iters/eps from the model config (hc_mult,
+// hc_sinkhorn_iters, hc_eps).
+G5HcConfig g5_hc_config(const ModelConfig& cfg);
 
 // Sinkhorn-Knopp on a strictly positive (..., N, N) matrix, exactly as the
 // reference applies it to the post-softmax+eps combination matrix (321-324):

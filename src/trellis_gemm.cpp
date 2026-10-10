@@ -75,10 +75,12 @@ const char* kQmvSource = R"METAL(
       xv[b][3] = float(xb.y);
     }
     for (uint ot = 0u; ot < uint(QMV_NT); ++ot) {
-      const device uint* words =
-          trellis + (tk * uint(TILES_N) + tile_n + ot) * uint(PACKED_U32);
+      // `trellis` is the raw little-endian byte stream of the tile's packed
+      // words; word j is 4 bytes starting at 4*j.
+      const device uchar* tile =
+          trellis + (tk * uint(TILES_N) + tile_n + ot) * uint(PACKED_BYTES);
       for (uint g = 0u; g < 2u; ++g) {
-        ulong merged = (ulong(words[word0[g]]) << 32) | ulong(words[word1[g]]);
+        ulong merged = (ulong(qmv_word(tile, word0[g])) << 32) | ulong(qmv_word(tile, word1[g]));
         uint sh = shift[g];
         uint win = uint(merged >> sh);
         uint cw3 = win & 0xffffu;
@@ -140,15 +142,24 @@ std::string codebook_prologue(int cb) {
       "inline uint sel4(uint4 v, uint i) {\n"
       "  return i == 0u ? v.x : (i == 1u ? v.y : (i == 2u ? v.z : v.w));\n"
       "}\n";
+  // The packed trellis words are addressed as raw little-endian bytes: an MLX
+  // buffer offset is an element offset, and the file bytes of a tensor are not
+  // guaranteed to be 4-byte aligned.
+  static const char* kWord =
+      "inline uint qmv_word(const device uchar* p, uint j) {\n"
+      "  uint b = j * 4u;\n"
+      "  return uint(p[b]) | (uint(p[b + 1u]) << 8) | (uint(p[b + 2u]) << 16) |\n"
+      "         (uint(p[b + 3u]) << 24);\n"
+      "}\n";
   if (std::getenv("EXL3_QMV_NODECODE")) {
-    return "#include <metal_stdlib>\nusing namespace metal;\n"
+    return std::string("#include <metal_stdlib>\nusing namespace metal;\n") + kWord +
            "inline float quad_sum(float v) { v += simd_shuffle_xor(v, ushort(1));"
            " v += simd_shuffle_xor(v, ushort(2)); return v; }\n"
            "inline float qmv_decode(uint x) { return float(x & 0xffu); }\n";
   }
   std::string s =
       std::string("#include <metal_stdlib>\n")
-      + "using namespace metal;\n" + kSel4 +
+      + "using namespace metal;\n" + kSel4 + kWord +
       "inline float quad_sum(float v) {\n"
       "  v += simd_shuffle_xor(v, ushort(1));\n"
       "  v += simd_shuffle_xor(v, ushort(2));\n"
@@ -251,14 +262,15 @@ const mx::fast::CustomKernelFunction& kernel_for(const Config& c) {
   if (it != g_kernels.end()) return it->second;
 
   std::string header = codebook_prologue(c.cb);
-  char buf[512];
+  char buf[640];
   std::snprintf(buf, sizeof(buf),
                 "#define K %d\n#define CBK %d\n#define INPUT_DIMS %d\n#define TILES_K %d\n"
                 "#define TILES_N %d\n#define OUTPUT_DIMS %d\n#define PACKED_U32 %d\n"
+                "#define PACKED_BYTES %d\n"
                 "#define QMV_NT %d\n#define QMV_MB %d\n#define QMV_SG %d\n#define N_SPLITS %d\n"
                 "#define PAD_ROWS %d\n",
-                c.K, c.cb, c.in, c.in / 16, c.out / 16, c.out, 8 * c.K, c.nt, c.mb, c.sg, c.splits,
-                c.pad_rows);
+                c.K, c.cb, c.in, c.in / 16, c.out / 16, c.out, 8 * c.K, 32 * c.K, c.nt, c.mb, c.sg,
+                c.splits, c.pad_rows);
   header += buf;
 
   char name[160];
@@ -377,7 +389,7 @@ mx::array trellis_matmul_raw(const TrellisWeight& w, const mx::array& xhat) {
   {
     std::lock_guard<std::mutex> lk(g_mutex); // kernel map only; never held while launching more
     const auto& kernel = kernel_for(cfg);
-    auto outs = kernel({xin, w.words}, shapes, {mx::float32},
+    auto outs = kernel({xin, w.packed}, shapes, {mx::float32},
                        {n_tiles / nt * sg * 32, pad_rows / mb, splits}, {sg * 32, 1, 1},
                        std::vector<std::pair<std::string, mx::fast::TemplateArg>>{}, std::nullopt,
                        false, mx::default_device());
@@ -433,7 +445,7 @@ mx::array trellis_linear(const TrellisWeight& w, const mx::array& x) {
   {
     std::lock_guard<std::mutex> lk(g_mutex);
     const auto& kernel = kernel_for(cfg);
-    auto outs = kernel({xin, w.words}, shapes, {mx::float32},
+    auto outs = kernel({xin, w.packed}, shapes, {mx::float32},
                        {n_tiles / nt * sg * 32, pad_rows / mb, splits}, {sg * 32, 1, 1},
                        std::vector<std::pair<std::string, mx::fast::TemplateArg>>{}, std::nullopt,
                        false, mx::default_device());
