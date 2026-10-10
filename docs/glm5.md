@@ -250,6 +250,29 @@ Recurrent-state details for the engine: the conv keeps a 3-position rolling
 window (kernel 4) and the delta rule keeps one (heads, k_head_dim, v_head_dim)
 state per layer; both must be part of the KV/state cache for incremental decode.
 
+## MLA layer (Glm5NextTextAttention, 1116-1235)
+
+```
+q_resid = q_a_layernorm(q_a_proj(h))                     # q_lora_rank 1536, fp32 RMSNorm
+q       = q_b_proj(q_resid) -> (B, L, 64, 256)           # qk_head_dim = nope 256 + rope 0
+kv      = kv_a_proj_with_mqa(h) -> [kv_lora_rank 512 | rope 0] -> kv_a_layernorm
+kv      = kv_b_proj(kv_cached) -> (B, Ltot, 64, 256+256) -> split k_nope / v
+scores  = q @ k^T * qk_head_dim**-0.5                    # scaling = 256**-0.5
+mask    = causal, intersected with the DSA top-k indices (-1 = invalid)
+out     = softmax(scores) @ v -> reshape(B, L, 64*256) -> o_proj
+```
+
+The compressed KV latent (512 wide) is what gets cached, not the expanded
+k/v - the expansion is re-done per step (`expand_kv`), which is 32x cheaper
+in memory. `build_attention_mask_from_topk` scatters the selected indices into
+a per-query key mask; the indexer has already applied causality and padding,
+so the mask is exactly the top-k set.
+
+Status: `mla_layer()` implements this against the loader's `G5Layer`; the
+prefill/incremental invariant is verified by `tests/mla_incremental_test.cpp`
+(decode after a n-1 prefill reproduces the n-token prefill's last row to
+6e-08). Numeric agreement with HF is still pending real weights.
+
 ## Expected performance envelope
 
 Rough sizing: the MoE holds ~300 B expert parameters at 2.51 bpw (~95 GB on

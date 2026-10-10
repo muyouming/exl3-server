@@ -38,6 +38,7 @@ add_executable(exl3-server
   src/dspark.cpp
   src/glm5.cpp
   src/glm5_kda.cpp
+  src/glm5_attn.cpp
   src/model.cpp
   src/tokenizer.cpp
   src/engine.cpp
