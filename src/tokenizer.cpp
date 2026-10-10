@@ -379,9 +379,12 @@ void split_word_regex(const std::string& s, std::vector<std::pair<size_t, size_t
   while (p < n) {
     size_t e = match_contraction(s, p);
     if (e == kNPos) e = match_letters(s, p);
-    if (e == kNPos) e = match_numbers(s, p);
-    // the regex's digit branch may be capped (\p{N}{1,N}) instead of unbounded
-    if (e != kNPos && digit_limit > 0 && e - p > (size_t)digit_limit) e = p + (size_t)digit_limit;
+    if (e == kNPos) {
+      e = match_numbers(s, p);
+      // Only the regex's digit branch may be capped (\p{N}{1,N} instead of
+      // \p{N}+) - applying the cap to the other branches would shred words.
+      if (e != kNPos && digit_limit > 0 && e - p > (size_t)digit_limit) e = p + (size_t)digit_limit;
+    }
     if (e == kNPos) e = match_punct(s, p);
     if (e == kNPos) e = match_space_crlf(s, p);
     if (e == kNPos) e = match_space_no_nonspace(s, p);

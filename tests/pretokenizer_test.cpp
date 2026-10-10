@@ -56,6 +56,24 @@ int main() {
   int rc = 0;
   rc |= check("MiniCPM5", "/Volumes/External/Models/ewin-reg/MiniCPM5-2B-EXL3-Quantized");
   rc |= check("GLM-5.3", "/tmp/glmtok");
+  // Independent ground truth: a GPT-2-style byte-level BPE over the real
+  // merges (verified by a Python implementation) gives these single tokens.
+  {
+    static const struct { const char* text; int n_ids; int first; } kCases[] = {
+        {" the", 1, 279}, {" capital", 1, 6722}, {" sentence", 1, 11646},
+        {" trellis", 3, 4258}, {" quantization", 2, 10267},
+    };
+    exl3::Tokenizer t; std::string err;
+    if (t.load("/tmp/glmtok", err)) {
+      for (const auto& c : kCases) {
+        auto ids = t.encode(c.text, false);
+        bool ok = (int)ids.size() == c.n_ids && (!ids.empty() && ids[0] == c.first);
+        std::printf("  %-14s -> %zu ids, first %d (want %d ids, first %d) %s\n", c.text,
+                    ids.size(), ids.empty() ? -1 : ids[0], c.n_ids, c.first, ok ? "ok" : "FAIL");
+        if (!ok) rc = 1;
+      }
+    }
+  }
   std::printf("pretokenizer chain: %s\n", rc == 0 ? "PASS" : "FAIL");
   return rc;
 }
