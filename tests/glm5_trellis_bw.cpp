@@ -1,42 +1,40 @@
-// Effective weight-read bandwidth of the trellis GEMV, per tensor shape and row
-// count - the measurement that says whether the trellis path is bandwidth-bound
-// or launch/latency-bound. The eval() round-trip (~0.2 ms) is excluded by
-// building a batch of independent iterations into one graph and evaluating once;
-// an f16 matmul of the same output shape is included as the "what MLX's own
-// GEMV achieves" reference.
+// Effective weight-read bandwidth of the trellis GEMV, per REAL tensor shape of
+// the checkpoint and row count - the measurement that says whether the trellis
+// path is bandwidth-bound or issue/latency-bound. The eval() round-trip
+// (~0.1-0.2 ms) is excluded by building a batch of independent iterations into
+// one graph and evaluating once; an f16 matmul of the same output shape is
+// included as the "what MLX's own GEMV achieves" reference.
 //
 // Build (repo root):
-//   clang++ -std=c++20 -O2 -Ivendor -Isrc -I$(brew --prefix mlx)/include -o /tmp/glm5_trellis_bw \
-//     tests/glm5_trellis_bw.cpp src/glm5_forward.cpp src/glm5.cpp src/glm5_kda.cpp \
-//     src/glm5_attn.cpp src/glm5_hc.cpp src/glm5_moe.cpp src/glm5_mtp.cpp src/trellis_gemm.cpp \
-//     src/safetensors.cpp src/model.cpp src/exl3.cpp src/tokenizer.cpp src/engine.cpp \
-//     -L$(brew --prefix mlx)/lib -lmlx -Wl,-rpath,$(brew --prefix mlx)/lib \
+//   MLX=$(brew --prefix mlx); SRC=$(ls src/*.cpp | grep -v '^src/main.cpp$')
+//   clang++ -std=c++20 -O2 -Ivendor -Isrc -I$MLX/include -o /tmp/glm5_trellis_bw \
+//     tests/glm5_trellis_bw.cpp $SRC -L$MLX/lib -lmlx -Wl,-rpath,$MLX/lib \
 //     -framework Foundation -framework Metal -framework Accelerate
 //
-//   usage: /tmp/glm5_trellis_bw [iterations_per_graph]
+//   usage: /tmp/glm5_trellis_bw [iterations_per_graph] [shapes|all]
+//
+// Three rows per (shape, rows) cell, all over the same packed buffer:
+//   qmv     yhat = xhat @ W_hat                      - the custom Metal kernel
+//   had     2x trellis_hadamard (in and out)          - the dispatch pair it
+//   lin     trellis_linear = qmv + both hadamards     - what a decode step calls
+// `qmv` is the kernel's own rate (the number that says whether the kernel is
+// fine); `lin` is what the model pays, so the difference is pure dispatch.
 //
 // The iteration count matters: at 8 iterations per graph the host-side dispatch
 // of the 3 kernels per iteration is what gets measured (~123 GB/s for the
 // 4096x24576 tensor at rows=1). From ~64 iterations on, the number is the
-// kernel's. Measured on an M4 Max (128 GB), GB/s of packed weights read, raw
-// QMV (no Hadamards), 64 iterations per graph, before -> after the aligned-word
-// / row-blocking pass in trellis_gemm.cpp:
+// kernel's. Measured on an M4 Max (128 GB), GB/s of packed weights read:
 //
-//   shape                        rows=1        rows=2       rows=4      rows=8
-//   qkv_proj  4096x24576 K4   254 -> 305    139 -> 244   71 -> 138   26 -> 72
-//   o_proj    8192x4096  K4   199 -> 225    115 -> 176  112 -> 124   32 -> 67
-//   expert    4096x2048  K3   110 -> 134     64 -> 101   74 ->  77   24 -> 44
-//   expert    2048x4096  K3   105 -> 123     60 ->  96   55 ->  58   22 -> 30
-//   f_a       4096x256   K4    51 ->  45     29 ->  29   26 ->  28    9 -> 16
-//   f16 matmul 4096x24576(ref)       420 GB/s at rows=1, 200 GB/s at rows 2-8
+//   shape (real checkpoint geometry)      rows=1   rows=2   rows=4   rows=8
+//   qkv_proj      4096x24576   K4         305       247      137       71
+//   o_proj-aux    8192x4096    K4         225       176      124       67
+//   expert gate   4096x2048    K3         134       101       77       44
+//   expert down   2048x4096    K3         123        96       58       30
+//   kda f_a       4096x256     K4          45        29       28       16
+//   f16 matmul 4096x24576 (ref)           420 GB/s at rows=1, 200 GB/s at rows 2-8
 //
-// so the trellis GEMV is 1.35x off a plain f16 GEMV in *time* at one row (it
-// reads 4x fewer bytes), the rows collapse was accumulator spills rather than
-// weight re-reads, and the small per-layer tensors (f_a) are launch-bound:
-// batching them, not a better kernel, is what they need.
-// Effective weight-read bandwidth of the trellis GEMV per shape and row count,
-// with the mx::eval overhead excluded (a batch of iterations is built into one
-// graph and evaluated once; a no-op baseline shows what dispatch alone costs).
+// so the trellis GEMV is 1.35x off a plain f16 GEMV in *time* at one row while
+// reading 4x fewer bytes, and the small per-layer tensors are launch-bound.
 #include <mlx/mlx.h>
 
 #include <chrono>
@@ -81,9 +79,17 @@ static exl3::G5Linear make_trellis(int in, int out, int K, unsigned seed) {
   return l;
 }
 
+static mx::array f16_rows(int rows, int in, float fill) {
+  std::vector<float> xv((size_t)rows * in, fill);
+  mx::array x =
+      mx::astype(mx::array((void*)xv.data(), {rows, in}, mx::float32, [](void*) {}), mx::float16);
+  mx::eval(x);
+  return x;
+}
+
 // Build `reps` independent evaluations of `build()` into ONE graph, then
 // evaluate once - so the ~0.2 ms eval round-trip is amortised instead of being
-// charged to every sample.
+// charged to every sample. Every intermediate stays alive in `acc`.
 static double batch_ms(int reps, int rounds, auto&& build) {
   mx::array acc = mx::zeros({1}, mx::float32);
   mx::eval(acc);
@@ -97,32 +103,79 @@ static double batch_ms(int reps, int rounds, auto&& build) {
   return best;
 }
 
+// The real checkpoint's EXL3 shape classes (from the shard headers): in, out, K.
+struct Shape {
+  const char* name;
+  int in, out, K, count; // count = tensors of this class in the checkpoint
+} kShapes[] = {
+    {"lm_head          4096x154880 K6", 4096, 154880, 6, 1},
+    {"kda qkv_proj     4096x24576  K4", 4096, 24576, 4, 34},
+    {"mla o_proj      16384x4096   K4", 16384, 4096, 4, 11},
+    {"kda o_proj       8192x4096   K4", 8192, 4096, 4, 34},
+    {"exp gate K2      4096x2048   K2", 4096, 2048, 2, 22 * 288},
+    {"exp gate K3      4096x2048   K3", 4096, 2048, 3, 20 * 288},
+    {"exp down K2      2048x4096   K2", 2048, 4096, 2, 22 * 288},
+    {"exp down K3      2048x4096   K3", 2048, 4096, 3, 20 * 288},
+    {"shared gate      4096x2048   K4", 4096, 2048, 4, 43},
+    {"shared down      2048x4096   K4", 2048, 4096, 4, 43},
+    {"dense gate/up    4096x12288  K3", 4096, 12288, 3, 3 * 2},
+    {"dense down      12288x4096   K3", 12288, 4096, 3, 3},
+    {"mla q_b          1536x16384  K4", 1536, 16384, 4, 11},
+    {"mla kv_a         4096x512    K4", 4096, 512, 4, 11},
+    {"kda f_a          4096x256    K4", 4096, 256, 4, 34},
+};
+
+// The kernel reads a weight tile once per row block: rows are padded to mb
+// (= min(rows,4)) rows per threadgroup block, and each block streams the whole
+// tensor. So a cell's DRAM traffic is bytes * passes(), and a GB/s figure that
+// does not say so understates the memory rate for the multi-row cells.
+static int weight_passes(int rows) {
+  const int mb = rows >= 4 ? 4 : rows;
+  int pad = ((rows + mb - 1) / mb) * mb;
+  if (pad >= 64) pad = ((pad + 31) / 32) * 32;
+  return pad / mb;
+}
+
 int main(int argc, char** argv) {
   const int reps = argc > 1 ? std::atoi(argv[1]) : 64;
-  struct Shape {
-    const char* name;
-    int in, out, K;
-  } shapes[] = {
-      {"qkv_proj     4096x24576 K4", 4096, 24576, 4},
-      {"o_proj       8192x4096  K4", 8192, 4096, 4},
-      {"expert gate  4096x2048  K3", 4096, 2048, 3},
-      {"expert down  2048x4096  K3", 2048, 4096, 3},
-      {"kda f_a      4096x256   K4", 4096, 256, 4},
-  };
+  const char* sel = argc > 2 ? argv[2] : "all";
   std::printf("=== trellis GEMV effective weight-read bandwidth (eval excluded, %d iters/graph) ===\n",
               reps);
-  for (auto& sh : shapes) {
+  for (auto& sh : kShapes) {
+    if (std::string(sel) != "all" && std::string(sh.name).find(sel) == std::string::npos) continue;
     exl3::G5Linear t = make_trellis(sh.in, sh.out, sh.K, 7u * sh.in + sh.out);
     const double bytes = (double)sh.in * sh.out * sh.K / 8.0;
-    for (int rows : {1, 2, 4, 8}) {
-      std::vector<float> xv((size_t)rows * sh.in, 0.05f);
-      mx::array x = mx::astype(mx::array((void*)xv.data(), {rows, sh.in}, mx::float32, [](void*) {}),
-                               mx::float16);
-      mx::eval(x);
-      const double ms = batch_ms(reps, 3, [&](int) { return exl3::trellis_linear(t.tw, x); });
-      std::printf("  %-30s rows %d: %7.3f ms -> %5.1f GB/s\n", sh.name, rows, ms,
-                  bytes / (ms * 1e-3) / 1e9);
+    for (int rows : {1, 2, 3, 4, 13, 26}) {
+      mx::array x = f16_rows(rows, sh.in, 0.05f);
+      mx::array xhat = f16_rows(rows, sh.in, 0.05f);
+      const double t_raw = batch_ms(reps, 3, [&](int) { return exl3::trellis_matmul_raw(t.tw, xhat); });
+      const double t_lin = batch_ms(reps, 3, [&](int) { return exl3::trellis_linear(t.tw, x); });
+      const int passes = weight_passes(rows);
+      std::printf("  %-32s rows %2d: qmv %8.4f ms %6.1f GB/s x%d (%6.1f DRAM) | lin %8.4f ms "
+                  "%6.1f GB/s\n",
+                  sh.name, rows, t_raw, bytes / (t_raw * 1e-3) / 1e9, passes,
+                  bytes * passes / (t_raw * 1e-3) / 1e9, t_lin, bytes / (t_lin * 1e-3) / 1e9);
     }
+    std::fflush(stdout);
+  }
+  // the routed experts of one decode step: 8 members, one grouped launch each
+  // for gate|up and one for the down (the shapes the model's MoE pays for)
+  for (int K : {2, 3}) {
+    std::vector<exl3::TrellisWeight> gu, dn;
+    for (int m = 0; m < 8; ++m) {
+      gu.push_back(make_trellis(4096, 2048, K, 100u + m).tw);
+      dn.push_back(make_trellis(2048, 4096, K, 200u + m).tw);
+    }
+    const double bytes = 2.0 * 8.0 * 4096.0 * 2048.0 * K / 8.0; // gate|up and down
+    for (int rows : {1, 2, 4}) {
+      mx::array x = f16_rows(rows, 4096, 0.05f);
+      mx::array xd = f16_rows(rows, 2048, 0.05f);
+      const double t_gu = batch_ms(reps, 3, [&](int) { return exl3::trellis_linear_group(gu, x); });
+      const double t_dn = batch_ms(reps, 3, [&](int) { return exl3::trellis_linear_group(dn, xd); });
+      std::printf("  exp8 gate|up+down K%d           rows %2d: gu %8.4f dn %8.4f ms %6.1f GB/s\n", K,
+                  rows, t_gu, t_dn, bytes / ((t_gu + t_dn) * 1e-3) / 1e9);
+    }
+    std::fflush(stdout);
   }
   // reference: a plain f16 matmul reading the same number of bytes
   {
@@ -133,12 +186,9 @@ int main(int argc, char** argv) {
                              mx::float16);
     mx::eval(w);
     for (int rows : {1, 2, 4, 8}) {
-      std::vector<float> xv((size_t)rows * in, 1.0f);
-      mx::array x = mx::astype(mx::array((void*)xv.data(), {rows, in}, mx::float32, [](void*) {}),
-                               mx::float16);
-      mx::eval(x);
+      mx::array x = f16_rows(rows, in, 1.0f);
       const double ms = batch_ms(reps, 3, [&](int) { return mx::matmul(x, w); });
-      std::printf("  %-30s rows %d: %7.3f ms -> %5.1f GB/s\n", "f16 matmul 4096x24576 (ref)", rows,
+      std::printf("  %-32s rows %2d: %8.4f ms %6.1f GB/s\n", "f16 matmul 4096x24576 (ref)", rows,
                   ms, bytes / (ms * 1e-3) / 1e9);
     }
   }

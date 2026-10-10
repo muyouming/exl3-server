@@ -1,5 +1,6 @@
 #include "trellis_gemm.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -393,7 +394,23 @@ mx::array trellis_hadamard(const mx::array& x, const mx::array& s, int blocks_pe
   return hadamard_run(x, s, blocks_per_row, pre, x.shape(), rows, stacked);
 }
 
+static TrellisTuning& tuning_state(); // the knobs, defined with the tuning API below
+
 namespace {
+
+// The k-split count is a pure function of the tensor's own geometry (k_tiles,
+// n_tiles) and must stay one: the split partials are summed by mx::sum over
+// axis 0 in the caller, so a different split count is a different f32
+// association and a different result. Only the thread mapping (nt) below is
+// free to change without changing a single output bit.
+int split_count_impl(int k_tiles, int n_tiles) {
+  // Enough independent simdgroups to cover the machine's memory latency, as
+  // long as every one of them still gets a few k-tiles.
+  int warps = n_tiles * 4; // 4 simdgroups per output tile
+  int splits = 1;
+  while (warps * splits < 1280 && k_tiles / (splits * 2) >= 4) splits *= 2;
+  return splits;
+}
 
 int split_count(int k_tiles, int n_tiles) {
   int forced = env_int("EXL3_QMV_SPLITS");
@@ -401,10 +418,71 @@ int split_count(int k_tiles, int n_tiles) {
     while (k_tiles / forced < 1) forced /= 2;
     return forced > 0 ? forced : 1;
   }
-  int warps = n_tiles * 4; // simdgroups (4 warps) per output tile
-  int splits = 1;
-  while (warps * splits < 1280 && k_tiles / (splits * 2) >= 4) splits *= 2;
-  return splits;
+  return split_count_impl(k_tiles, n_tiles);
+}
+
+// One geometry for every entry point of this file: rows per threadgroup (mb),
+// output tiles per threadgroup (nt), k-splits and the padded row count. Only nt
+// is free to change without moving a single output bit; mb and splits are part
+// of the arithmetic (see split_count).
+//
+// The accumulator array is acc[mb][nt][8] floats and a product above 4 spills
+// it: measured 2.7x for {1,16} at 1 row - which is what the old
+// "n_tiles/nt > 1024" rule picked for the lm_head's 9680 output tiles (224 GB/s
+// against 476 at nt=2/4 on the real K6 tensor) - and 5.8x for {2,16} at 2 rows
+// (36 GB/s against 387).
+//
+// nt>1 is also what keeps the SIMD pipes fed, and this is a scheduling change:
+// a (16x16 output tile, k-tile) simdgroup-iteration retires ~110
+// warp-instructions (8 codeword decodes and their 8 FMAs per lane, 4 packed-word
+// loads, the window shift) and 393216 of them in 0.168 ms on the 4096x24576
+// tensor is 256e9/s - the machine's whole issue width. The tile rate that comes
+// out is 2.4e9 tiles/s (300 GB/s of 128-byte K4 tiles, i.e. 2.4e9 * K/2 bytes/s
+// for any K) on the shapes whose grid is large enough, and it is the
+// per-iteration activation load, its two shuffles and the loop's address math
+// that nt shares. The small grids measure 2.0e9 tiles/s at nt=1 against 2.3e9 at
+// nt=4 (the 8-member grouped launch of the 4096x2048 K3 experts: 185 against 219
+// GB/s), while on the 4096x24576 K4 tensor nt=4 loses 17% (266 against 317 GB/s)
+// because 384 threadgroups is one wave.
+struct Geom {
+  int mb, nt, sg, splits, pad_rows;
+};
+
+Geom pick_geom(int k_tiles, int n_tiles, int rows, int members = 1) {
+  TrellisTuning tn = tuning_state();
+  const int sg = tn.sg > 0 ? tn.sg : 4;
+  // Rows per threadgroup: up to 4 a wider mb amortises the codebook decode over
+  // more rows and wins (rows 2..26 all best at mb = min(rows,4)).
+  int mb = tn.mb > 0 ? tn.mb : (rows >= 4 ? 4 : rows);
+  if (mb > 4) mb = 4;
+  // Tiles per threadgroup: the largest power of two that (a) keeps mb*nt inside
+  // the accumulator register budget, (b) divides n_tiles (the kernel writes
+  // tile_n + ot for every ot < nt without a bound check) and (c) still leaves
+  // ~2048 simdgroups in flight - nt amortises the per-iteration activation
+  // path, but it is paid for in threadgroups, and on the 4096x24576 K4 tensor
+  // nt=4 leaves 384 threadgroups (one wave) and measures 17% slower than
+  // nt=2's 768. nt is the only knob here that cannot move an output bit: the
+  // per-tile accumulation order, the split count and mb are all unchanged by
+  // which threadgroup covers which output tile.
+  const int splits = split_count(k_tiles, n_tiles);
+  int nt = 1;
+  const int cap = 4 / mb > 0 ? 4 / mb : 1;
+  if (tn.nt > 0) {
+    nt = tn.nt;
+  } else {
+    for (int cand = 2; cand <= cap; cand *= 2) {
+      if (n_tiles % cand != 0) continue;
+      const int64_t in_flight = (int64_t)(n_tiles / cand) * splits * 4 * members;
+      if (in_flight < 2048) break;
+      nt = cand;
+    }
+  }
+  while (nt > 1 && (n_tiles % nt != 0 || n_tiles / nt < 2)) nt /= 2;
+  // Rows padded to a whole number of row blocks so the kernel needs no row
+  // bound; large row counts are bucketed to limit kernel variants.
+  int pad_rows = ((rows + mb - 1) / mb) * mb;
+  if (pad_rows >= 64) pad_rows = ((pad_rows + 31) / 32) * 32;
+  return Geom{mb, nt, sg, splits, pad_rows};
 }
 
 } // namespace
@@ -439,31 +517,8 @@ mx::array trellis_matmul_raw(const TrellisWeight& w, const mx::array& xhat) {
   const int k_tiles = in / 16;
   const int n_tiles = out / 16;
 
-  TrellisTuning tn = tuning_state();
-  const int sg = tn.sg > 0 ? tn.sg : 4;
-  // Rows per threadgroup: acc is QMV_MB*QMV_NT*8 floats, so the two together
-  // must stay around 4 (32 accumulators) or the kernel spills - measured on the
-  // 4096x24576 K4 shape: {mb,nt} = {4,2} at 4 rows is 1.9x slower than {4,1},
-  // {8,2} at 8 rows 2.6x slower than {4,1}, and {1,4} at 1 row 1.1x slower than
-  // {1,2}. Up to 4 rows a wider mb amortises the codebook decode over more rows
-  // and wins (rows 2..26 all best at mb = min(rows,4)).
-  const int mb = tn.mb > 0 ? tn.mb : (rows >= 4 ? 4 : rows);
-  // Tiles per threadgroup: enough threadgroups to fill the GPU, but large
-  // enough to amortize the per-tile decode of the activations.
-  int nt = tn.nt;
-  if (nt <= 0) {
-    nt = 1;
-    while (n_tiles / nt > 1024) nt *= 2;
-    while (n_tiles % nt != 0) nt /= 2;
-    if (nt < 1) nt = 1;
-    if (mb >= 3) nt = 1; // mb*nt <= 4
-  }
-  const int splits = split_count(k_tiles, n_tiles);
-
-  // Rows are padded to a whole number of row blocks so the kernel needs no row
-  // bound, and large row counts are bucketed to limit kernel variants.
-  int pad_rows = ((rows + mb - 1) / mb) * mb;
-  if (pad_rows >= 64) pad_rows = ((pad_rows + 31) / 32) * 32;
+  const Geom g = pick_geom(k_tiles, n_tiles, rows);
+  const int mb = g.mb, nt = g.nt, sg = g.sg, splits = g.splits, pad_rows = g.pad_rows;
   mx::array xin = xhat;
   if (pad_rows > rows) {
     xin = mx::concatenate(
@@ -518,20 +573,8 @@ mx::array matmul_group_impl(const std::vector<TrellisWeight>& ws, const mx::arra
     }
   }
   const int k_tiles = in / 16, n_tiles = out / 16;
-  TrellisTuning tn = tuning_state();
-  const int sg = tn.sg > 0 ? tn.sg : 4;
-  const int mb = tn.mb > 0 ? tn.mb : (rows >= 4 ? 4 : rows);
-  int nt = tn.nt;
-  if (nt <= 0) {
-    nt = 1;
-    while (n_tiles / nt > 1024) nt *= 2;
-    while (nt > 1 && n_tiles % nt != 0) nt /= 2;
-    if (mb >= 3) nt = 1;
-  }
-  if (nt > n_tiles) nt = n_tiles;
-  const int splits = split_count(k_tiles, n_tiles);
-  int pad_rows = (int)(((rows + mb - 1) / mb) * mb);
-  if (pad_rows >= 64) pad_rows = ((pad_rows + 31) / 32) * 32;
+  const Geom g = pick_geom(k_tiles, n_tiles, rows, n);
+  const int mb = g.mb, nt = g.nt, sg = g.sg, splits = g.splits, pad_rows = g.pad_rows;
 
   mx::array xin = x;
   if (pad_rows > rows) xin = mx::concatenate({x, mx::zeros({n, pad_rows - rows, in}, mx::float16)}, 1);
@@ -686,22 +729,8 @@ mx::array trellis_linear(const TrellisWeight& w, const mx::array& x) {
   // yhat = xhat @ W_hat, split rows padded so the kernel needs no row bound.
   const int k_tiles = in / 16;
   const int n_tiles = out / 16;
-  TrellisTuning tn = tuning_state();
-  const int sg = tn.sg > 0 ? tn.sg : 4;
-  // See trellis_matmul_raw for why mb*nt must stay near 4 (accumulator
-  // registers) and why mb = min(rows, 4) is the measured optimum.
-  const int mb = tn.mb > 0 ? tn.mb : (rows >= 4 ? 4 : rows);
-  int nt = tn.nt;
-  if (nt <= 0) {
-    nt = 1;
-    while (n_tiles / nt > 1024) nt *= 2;
-    while (nt > 1 && n_tiles % nt != 0) nt /= 2;
-    if (mb >= 3) nt = 1; // mb*nt <= 4
-  }
-  if (nt > n_tiles) nt = n_tiles;
-  const int splits = split_count(k_tiles, n_tiles);
-  int pad_rows = (int)(((rows + mb - 1) / mb) * mb);
-  if (pad_rows >= 64) pad_rows = ((pad_rows + 31) / 32) * 32;
+  const Geom g = pick_geom(k_tiles, n_tiles, (int)rows);
+  const int mb = g.mb, nt = g.nt, sg = g.sg, splits = g.splits, pad_rows = g.pad_rows;
   mx::array xin = xhat;
   if (pad_rows > rows) {
     mx::Shape zshape(xhat.shape().begin(), xhat.shape().end());
