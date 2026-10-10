@@ -37,6 +37,7 @@
 #include "engine.h"
 #include "glm5_forward.h"
 #include "model.h"
+#include "trellis_gemm.h" // TrellisPathInfo: which kernel the step's classes take
 #include "util.h"
 
 namespace mx = mlx::core;
@@ -355,6 +356,30 @@ static int run(int argc, char** argv) {
   if (bench) {
     std::printf("\n== 5. aggregate decode rate (same session, warmed) ==\n");
     const int warm = 12, meas = 8;
+    // Which kernel the step's shared-weight classes take: a batched forward's
+    // rows are the row count of every fused linear (kda qkv_proj/o_proj, the
+    // shared expert, the dense MLP, mla q_b/o_proj), so one query per row count
+    // says it for all of them (src/trellis_gemm.h, TrellisPathInfo). Printed
+    // because a throughput cell without the path that produced it is not
+    // comparable with a cell from a different build.
+    {
+      const exl3::TrellisTuning tn = exl3::trellis_get_tuning();
+      std::printf("  tuning: mat_min_rows=%d mat_max_rows=%d nt=%d sg=%d mb=%d\n", tn.mat_min_rows,
+                  tn.mat_max_rows, tn.nt, tn.sg, tn.mb);
+      const exl3::G5Layer& l0 = g5->weights().layers[0];
+      auto probe = [&](const char* what, const exl3::G5Linear& lin) {
+        if (!lin.quantized || lin.tw.packed.size() <= 1) return false;
+        std::printf("  %s (%dx%d K%d):", what, lin.in_features, lin.out_features, lin.tw.K);
+        for (int rows : {1, 4, 8, 16, 32}) {
+          const exl3::TrellisPathInfo pi = exl3::trellis_path_info(lin.tw, rows);
+          std::printf(" %d:%s(mb%d x%d)%s", rows, pi.staged ? "staged" : "QMV", pi.rows_per_block,
+                      pi.passes, rows == 32 ? "\n" : "");
+        }
+        return true;
+      };
+      if (!probe("kda qkv_proj", l0.kda_qkv)) (void)probe("shared gate", l0.shared_gate);
+      std::fflush(stdout);
+    }
     // serial
     {
       std::vector<int> t = ref[0].tokens;
@@ -388,8 +413,10 @@ static int run(int argc, char** argv) {
     struct Case {
       int B;
       int prom;
-      std::vector<double> ms;
+      std::vector<double> ms;     // the default tuning (staged where it applies)
+      std::vector<double> ms_off; // the byte-exact QMV, for the paired before/after
     };
+    const exl3::TrellisTuning dflt_tuning = exl3::trellis_get_tuning();
     std::vector<Case> cases;
     for (int B : {1, 2, 4, 8}) cases.push_back({B, 4, {}});
     for (int B : {4, 8}) cases.push_back({B, 1, {}});
@@ -405,38 +432,62 @@ static int run(int argc, char** argv) {
     cases.push_back({16, 4, {}});
     const int E = engine.config().n_routed_experts, K = engine.config().num_experts_per_tok;
     const int nprom = (int)ids.size();
+    // One measured round of one case: join `prom` slots, warm `warm` steps, time
+    // `meas`. The slots' state is per-batch, so dropping it here is what a
+    // finished request does (batch_leave); reset is the bulk form.
+    auto run_case = [&](Case& c, std::vector<double>& ms) {
+      std::vector<int> feed((size_t)c.B);
+      try {
+        for (int b = 0; b < c.B; ++b) {
+          const size_t pi = (size_t)(b % std::min(c.prom, nprom));
+          (void)g5->batch_join(ids[pi]);
+          feed[(size_t)b] = ref[pi].tokens[0];
+        }
+        auto one = [&]() {
+          mx::array lg = g5->batch_step(feed);
+          const float* p = lg.data<float>();
+          for (int b = 0; b < c.B; ++b) {
+            const float* row = p + (size_t)b * (size_t)V;
+            feed[(size_t)b] = (int)(std::max_element(row, row + V) - row);
+          }
+        };
+        for (int i = 0; i < warm; ++i) one();
+        const double s0 = now_s();
+        for (int i = 0; i < meas; ++i) one();
+        ms.push_back((now_s() - s0) / meas);
+      } catch (const std::exception& e) {
+        // A width this box cannot hold (the batch state is ~150 MB per slot
+        // plus the caches) is reported, not fatal: the numbers above it stay
+        // valid.
+        std::printf("  B=%d %d prompts: SKIPPED (%s)\n", c.B, c.prom, e.what());
+      }
+      g5->batch_reset();
+    };
+    // Interleaved rounds: each round measures every case twice - once with the
+    // default tuning and once with the staged path forced off - and the order
+    // alternates by round. The box drifts far more than the lever (this pass saw
+    // the B=8 two-prompt cell at 465 and 289 ms for the SAME code, and the B=1
+    // serial cell at 135/171/177 ms across three processes), so only a pair
+    // measured back to back in one process is a measurement. The printed
+    // "ms/step" line above stays the best-of-3 of the default tuning.
+    exl3::TrellisTuning off_tuning = dflt_tuning;
+    off_tuning.mat_min_rows = 0; // the byte-exact QMV
     for (int r = 0; r < 3; ++r) {
       for (auto& c : cases) {
-        std::vector<int> feed((size_t)c.B);
-        try {
-          for (int b = 0; b < c.B; ++b) {
-            const size_t pi = (size_t)(b % std::min(c.prom, nprom));
-            (void)g5->batch_join(ids[pi]);
-            feed[(size_t)b] = ref[pi].tokens[0];
-          }
-          auto one = [&]() {
-            mx::array lg = g5->batch_step(feed);
-            const float* p = lg.data<float>();
-            for (int b = 0; b < c.B; ++b) {
-              const float* row = p + (size_t)b * (size_t)V;
-              feed[(size_t)b] = (int)(std::max_element(row, row + V) - row);
-            }
-          };
-          for (int i = 0; i < warm; ++i) one();
-          const double s0 = now_s();
-          for (int i = 0; i < meas; ++i) one();
-          c.ms.push_back((now_s() - s0) / meas);
-        } catch (const std::exception& e) {
-          // A width this box cannot hold (the batch state is ~150 MB per slot
-          // plus the caches) is reported, not fatal: the numbers above it stay
-          // valid.
-          std::printf("  B=%d %d prompts: SKIPPED (%s)\n", c.B, c.prom, e.what());
+        if ((r & 1) == 0) {
+          exl3::trellis_set_tuning(dflt_tuning);
+          run_case(c, c.ms);
+          exl3::trellis_set_tuning(off_tuning);
+          run_case(c, c.ms_off);
+        } else {
+          exl3::trellis_set_tuning(off_tuning);
+          run_case(c, c.ms_off);
+          exl3::trellis_set_tuning(dflt_tuning);
+          run_case(c, c.ms);
         }
-        // The slots' state is per-batch, so dropping it here is what a finished
-        // request does (batch_leave); reset is the bulk form.
-        g5->batch_reset();
       }
     }
+    exl3::trellis_set_tuning(dflt_tuning);
     for (auto& c : cases) {
       if (c.ms.empty()) continue;
       const double best = *std::min_element(c.ms.begin(), c.ms.end());
@@ -445,6 +496,27 @@ static int run(int argc, char** argv) {
                   "per seq, aggregate %6.2f tok/s\n",
                   c.B, std::min(c.prom, nprom), c.prom == 1 ? " " : "s", distinct, best * 1000,
                   1.0 / best, (double)c.B / best);
+    }
+
+    // The same cases again with the staged fp16 + simdgroup_matrix path OFF: the
+    // paired measurement of what it buys, and it has to be in this process. The
+    // box drifts 10-30% between processes - this pass measured the B=1 serial
+    // cell (identical code in both runs, rows = 1 so the staged path cannot be
+    // involved) at 135 vs 177 ms across two back-to-back processes, a 24% spread
+    // - so a cross-process before/after is not a measurement.
+    // The pair, best of the interleaved rounds each: what the staged path buys
+    // at this row count, in this process.
+    std::printf("  --- paired (staged / QMV), interleaved rounds ---\n");
+    {
+      for (auto& c : cases) {
+        if (c.ms.empty() || c.ms_off.empty()) continue;
+        const double on = *std::min_element(c.ms.begin(), c.ms.end());
+        const double of = *std::min_element(c.ms_off.begin(), c.ms_off.end());
+        std::printf("  pair B=%d %2d prompt%s: staged %7.2f ms (%5.2f tok/s) | QMV %7.2f ms "
+                    "(%5.2f tok/s) -> %.2fx\n",
+                    c.B, std::min(c.prom, nprom), c.prom == 1 ? " " : "s", on * 1000,
+                    (double)c.B / on, of * 1000, (double)c.B / of, of / on);
+      }
     }
   }
 

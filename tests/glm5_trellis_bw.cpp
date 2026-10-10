@@ -141,39 +141,69 @@ struct Shape {
     {"kda f_a          4096x256    K4", 4096, 256, 4, 34},
 };
 
-// The kernel reads a weight tile once per row block: rows are padded to mb
-// (= min(rows,4)) rows per threadgroup block, and each block streams the whole
-// tensor. So a cell's DRAM traffic is bytes * passes(), and a GB/s figure that
-// does not say so understates the memory rate for the multi-row cells.
-static int weight_passes(int rows) {
-  const int mb = rows >= 4 ? 4 : rows;
-  int pad = ((rows + mb - 1) / mb) * mb;
-  if (pad >= 64) pad = ((pad + 31) / 32) * 32;
-  return pad / mb;
+// The tuning the process started with (the library's own default, env knobs
+// included). The QMV/staged pair below is measured by forcing one and restoring
+// the other, so the "staged" column is the shipped default.
+static exl3::TrellisTuning g_default_tuning = {0, 0, 0, 0, 0};
+
+// The kernel streams the weights once per row block: rows are padded to the
+// path's block (mb = min(rows,4) for the QMV, MAT_MB = 16 or 32 for the staged
+// path) and each block streams the whole tensor. So a cell's DRAM traffic is
+// bytes * passes(), and a GB/s figure that does not say so understates the
+// memory rate for the multi-row cells. The pass count and the path are NOT
+// recomputed here: they come from trellis_path_info(), which is the library's
+// own rule (a test that mirrors the rule cannot catch the rule moving).
+static void measure_cell(const char* name, const Shape& sh, exl3::G5Linear& t, int rows,
+                         int reps, int rounds) {
+  const double bytes = (double)sh.in * sh.out * sh.K / 8.0;
+  // (rows, 1, in): the shape the request-level batch passes, and the shape the
+  // staged path's scope requires (src/trellis_gemm.cpp, decode_shaped). A flat
+  // 2-D call is a prefill shape (the general MoE's per-expert path drives one
+  // that way) and stays on the QMV, so measuring with it would compare the QMV
+  // against itself.
+  mx::array x = mx::reshape(f16_rows(rows, sh.in, 0.05f), {rows, 1, sh.in});
+  mx::array xhat = mx::reshape(f16_rows(rows, sh.in, 0.05f), {rows, 1, sh.in});
+  // Both paths, same session, interleaved: the box drifts 10-30% between runs of
+  // the same binary, so a before/after pair that is not measured next to each
+  // other is not a measurement.
+  exl3::TrellisTuning tn = g_default_tuning;
+  tn.mat_min_rows = 0; // the byte-exact QMV only
+  exl3::trellis_set_tuning(tn);
+  const exl3::TrellisPathInfo ps = exl3::trellis_path_info(t.tw, rows);
+  mx::eval(exl3::trellis_linear(t.tw, x)); // warm the pages and JIT both kernels
+  mx::eval(exl3::trellis_matmul_raw(t.tw, xhat));
+  const double t_qs = batch_ms(reps, rounds, [&](int) { return exl3::trellis_matmul_raw(t.tw, xhat); });
+  const double t_ls = batch_ms(reps, rounds, [&](int) { return exl3::trellis_linear(t.tw, x); });
+  exl3::trellis_set_tuning(g_default_tuning);
+  const exl3::TrellisPathInfo pm = exl3::trellis_path_info(t.tw, rows);
+  mx::eval(exl3::trellis_linear(t.tw, x));
+  mx::eval(exl3::trellis_matmul_raw(t.tw, xhat));
+  const double t_qm = batch_ms(reps, rounds, [&](int) { return exl3::trellis_matmul_raw(t.tw, xhat); });
+  const double t_lm = batch_ms(reps, rounds, [&](int) { return exl3::trellis_linear(t.tw, x); });
+  exl3::trellis_set_tuning(exl3::TrellisTuning{0, 0, 0});
+  const char* path = pm.staged ? (ps.staged ? "mat" : "QMV->mat") : "QMV";
+  std::printf("  %-32s rows %2d [%s mb%d pad%d x%d]: qmv %8.4f/%8.4f ms %6.1f/%6.1f GB/s "
+              "(x%d %6.1f DRAM) | lin %8.4f/%8.4f ms %6.1f/%6.1f GB/s\n",
+              name, rows, path, pm.rows_per_block, pm.pad_rows, pm.passes, t_qs, t_qm,
+              bytes / (t_qs * 1e-3) / 1e9, bytes / (t_qm * 1e-3) / 1e9, pm.passes,
+              bytes * pm.passes / (t_qm * 1e-3) / 1e9, t_ls, t_lm, bytes / (t_ls * 1e-3) / 1e9,
+              bytes / (t_lm * 1e-3) / 1e9);
+  std::fflush(stdout);
 }
 
 int main(int argc, char** argv) {
   const int reps = argc > 1 ? std::atoi(argv[1]) : 64;
   const char* sel = argc > 2 ? argv[2] : "all";
   const int rounds = argc > 3 ? std::atoi(argv[3]) : 5;
+  g_default_tuning = exl3::trellis_get_tuning();
   std::printf("=== trellis GEMV effective weight-read bandwidth (eval excluded, %d iters/graph, median of %d) ===\n",
               reps, rounds);
+  std::printf("    per cell: QMV (byte-exact) / staged-matrix (current default), then the path the\n"
+              "    default picks - qmv and lin figures are `scalar/staged` ms and GB/s each\n");
   for (auto& sh : kShapes) {
     if (std::string(sel) != "all" && std::string(sh.name).find(sel) == std::string::npos) continue;
     exl3::G5Linear t = make_trellis(sh.in, sh.out, sh.K, 7u * sh.in + sh.out);
-    const double bytes = (double)sh.in * sh.out * sh.K / 8.0;
-    for (int rows : {1, 2, 3, 4, 13, 26}) {
-      mx::array x = f16_rows(rows, sh.in, 0.05f);
-      mx::array xhat = f16_rows(rows, sh.in, 0.05f);
-      const double t_raw = batch_ms(reps, rounds, [&](int) { return exl3::trellis_matmul_raw(t.tw, xhat); });
-      const double t_lin = batch_ms(reps, rounds, [&](int) { return exl3::trellis_linear(t.tw, x); });
-      const int passes = weight_passes(rows);
-      std::printf("  %-32s rows %2d: qmv %8.4f ms %6.1f GB/s x%d (%6.1f DRAM) | lin %8.4f ms "
-                  "%6.1f GB/s\n",
-                  sh.name, rows, t_raw, bytes / (t_raw * 1e-3) / 1e9, passes,
-                  bytes * passes / (t_raw * 1e-3) / 1e9, t_lin, bytes / (t_lin * 1e-3) / 1e9);
-    }
-    std::fflush(stdout);
+    for (int rows : {1, 2, 4, 8, 13, 16, 26, 32, 64}) measure_cell(sh.name, sh, t, rows, reps, rounds);
   }
   // the routed experts of one decode step: 8 members, one grouped launch each
   // for gate|up and one for the down (the shapes the model's MoE pays for)

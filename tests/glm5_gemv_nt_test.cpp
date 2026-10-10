@@ -17,6 +17,26 @@
 // the split partials are summed by mx::sum in the caller and a different count
 // is a different f32 association.
 //
+// The three sections, in order:
+//
+//   1. nt/mb invariance of the QMV (`TrellisTuning{0, 0, 0}` pins the byte-exact
+//      kernel, which is what every entry in the recorded table below was made
+//      with);
+//   2. the byte-identity table over the 25 real tensor classes x rows
+//      {1,2,3,13,26} - the QMV's own output, hash for hash, as recorded in
+//      docs/perf.md;
+//   3. `matrix_path()`: the staged fp16 + simdgroup_matrix path, which is a
+//      deliberately NON-byte-identical, gated deviation (it decodes the same
+//      fp16 weights into a threadgroup tile and lets the tensor unit sum the k
+//      range in its own order). It is checked the only way it can be: the
+//      deviation from the QMV is bounded at f32-association scale on every real
+//      class (a wrong decode or fragment layout is off by O(1), not 1e-6), the
+//      staged path is inert to the QMV's nt/sg/mb knobs, the grouped and
+//      scale-stack forms still equal n single-tensor calls when both are
+//      staged, and the staged hashes are printed for the record. The activation
+//      and the switch to it are `TrellisTuning.mat_min_rows` (0 = off, default
+//      16 = the batched-decode width).
+//
 // Build (repo root):
 //   MLX=$(brew --prefix mlx); SRC=$(ls src/*.cpp | grep -v '^src/main.cpp$')
 //   clang++ -std=c++20 -O2 -Ivendor -Isrc -I$MLX/include -o /tmp/glm5_gemv_nt_test \
@@ -80,6 +100,15 @@ static std::vector<char> bytes_of(const mx::array& a) {
 }
 
 static int g_fail = 0;
+
+static void expect_true(const char* what, bool ok) {
+  if (ok) {
+    std::printf("  ok   %s\n", what);
+    return;
+  }
+  ++g_fail;
+  std::printf("  FAIL %s\n", what);
+}
 
 static void expect_same(const char* what, const std::vector<char>& want,
                         const std::vector<char>& got) {
@@ -174,6 +203,123 @@ static void hash_table() {
   }
 }
 
+// The staged matrix path (src/trellis_gemm.cpp, "the staged matrix path").
+//
+// It is a gated, named deviation, not a silent one: the same decoded fp16
+// weights and the same fp32 accumulator, summed by the tensor unit's own tree
+// instead of the QMV's quad-shuffle one. So the gate here cannot be byte
+// identity - the point of the section is (a) to BOUND the deviation on the real
+// tensor classes (it must stay at f32-association scale: ~1e-6 relative, four
+// orders of magnitude below what a wrong decode or a wrong fragment layout would
+// show), (b) to show the staged path is inert to the QMV's scheduling knobs, and
+// (c) to show the grouped/scale-stack forms still agree with n single-tensor
+// calls when both take the staged path.
+static void matrix_path() {
+  std::printf("=== the staged matrix path (rows >= the tuning threshold) ===\n");
+  for (auto& sh : kShapes) {
+    exl3::TrellisWeight tw = make_trellis(sh.in, sh.out, sh.K, 11u * sh.in + sh.out);
+    for (int rows : {16, 32, 64}) {
+      // (rows, 1, in): the batched-decode shape, which is the staged path's
+      // scope (src/trellis_gemm.cpp, decode_shaped).
+      mx::array xhat = mx::reshape(rand_f16(rows, sh.in, 9u * rows + sh.in), {rows, 1, sh.in});
+      exl3::trellis_set_tuning(exl3::TrellisTuning{0, 0, 0});         // byte-exact QMV
+      mx::array ys = exl3::trellis_matmul_raw(tw, xhat);
+      exl3::trellis_set_tuning(exl3::TrellisTuning{0, 0, 0, 16, 0});  // staged, threshold 16
+      mx::array ym = exl3::trellis_matmul_raw(tw, xhat);
+      mx::eval(ys, ym);
+      const float* a = ys.data<float>();
+      const float* b = ym.data<float>();
+      double maxd = 0, maxv = 0;
+      for (size_t i = 0; i < ys.size(); ++i) {
+        maxd = std::max(maxd, std::fabs((double)a[i] - (double)b[i]));
+        maxv = std::max(maxv, std::fabs((double)a[i]));
+      }
+      const double maxrel = maxd / (maxv > 0 ? maxv : 1.0);
+      const exl3::TrellisPathInfo pi = exl3::trellis_path_info(tw, rows);
+      char what[160];
+      std::snprintf(what, sizeof(what), "%s rows %2d staged mb%d pad%d x%d: max|diff| = %.3g (%.2g%% of max|v| %.4g)",
+                    sh.name, rows, pi.rows_per_block, pi.pad_rows, pi.passes, maxd, maxrel * 100,
+                    maxv);
+      // The decode, the staging layout and the fragment mapping are exercised
+      // against a real value (a broken one is off by O(1), not by 1e-6): 1% of
+      // max|v| is a loose bound on a deliberate association change and a hard
+      // fail for a wrong kernel.
+      expect_true(what, pi.staged && maxrel <= 0.01);
+      // The staged path must not depend on the QMV's scheduling knobs.
+      std::vector<char> ref = bytes_of(ym);
+      for (int nt : {1, 2, 4}) {
+        for (int mb : {1, 4}) {
+          exl3::trellis_set_tuning(exl3::TrellisTuning{nt, 0, mb, 16, 0});
+          std::snprintf(what, sizeof(what), "%s rows %2d staged nt %d mb %d", sh.name, rows, nt, mb);
+          expect_same(what, ref, bytes_of(exl3::trellis_matmul_raw(tw, xhat)));
+        }
+      }
+      if (g_fail) {
+        std::printf("staged matrix path: FAIL\n");
+        return;
+      }
+    }
+  }
+  // The grouped launch is deliberately NOT staged (its activation is
+  // (n, rows, in) with the sequence axis flattened into `rows`, so the
+  // decode-shaped scope of the staged path cannot be tested there - see
+  // matmul_group_impl). With the staged path on, the grouped forms must therefore
+  // still equal n single-tensor calls made with it OFF, and the staged path must
+  // not move the grouped forms at all: that is the gate for "the routed experts
+  // did not change".
+  {
+    const int in = 4096, out = 2048, K = 3;
+    std::vector<exl3::TrellisWeight> ws;
+    for (int m = 0; m < 3; ++m) ws.push_back(make_trellis(in, out, K, 31u + m));
+    for (int rows : {16, 32}) {
+      mx::array x = rand_f16(rows, in, 5u + rows);
+      exl3::trellis_set_tuning(exl3::TrellisTuning{0, 0, 0, 16, 0}); // staged on
+      std::vector<char> want = bytes_of(exl3::trellis_linear_group(ws, x));
+      char what[176];
+      {
+        exl3::trellis_set_tuning(exl3::TrellisTuning{0, 0, 0, 16, 0});
+        std::vector<char> again = bytes_of(exl3::trellis_linear_group(ws, x));
+        std::snprintf(what, sizeof(what), "grouped 3 members rows %d unchanged by the staged path",
+                      rows);
+        expect_same(what, want, again);
+        std::vector<mx::array> ys;
+        exl3::trellis_set_tuning(exl3::TrellisTuning{0, 0, 0}); // staged off = byte-exact QMV
+        for (auto& w : ws) ys.push_back(exl3::trellis_linear(w, x));
+        std::snprintf(what, sizeof(what),
+                      "grouped 3 members rows %d == per-expert QMV (staged does not reach it)",
+                      rows);
+        expect_same(what, want, bytes_of(mx::stack(ys, 0)));
+      }
+      std::snprintf(what, sizeof(what), "grouped 3 members rows %d == scale-stack form", rows);
+      expect_same(what, want, bytes_of(exl3::trellis_linear_group_scaled(
+                                   ws, x, mx::concatenate({ws[0].suh, ws[1].suh, ws[2].suh}, 0),
+                                   mx::concatenate({ws[0].svh, ws[1].svh, ws[2].svh}, 0))));
+      if (g_fail) {
+        std::printf("staged matrix path: FAIL\n");
+        return;
+      }
+    }
+  }
+  // The staged hashes, alongside the QMV table above: the same two builds must
+  // print the same values here as well (rows 16 and 26 are the batched widths).
+  std::printf("--- staged path hashes (mat_min_rows = 16) ---\n");
+  for (auto& sh : kRealShapes) {
+    exl3::TrellisWeight tw = make_trellis(sh.in, sh.out, sh.K, 13u * sh.in + sh.out);
+    for (int rows : {16, 26}) {
+      mx::array x = rand_f16(rows, sh.in, 3u * rows + sh.out);
+      mx::array xhat = rand_f16(rows, sh.in, 5u * rows + sh.out);
+      exl3::trellis_set_tuning(exl3::TrellisTuning{0, 0, 0, 16, 0});
+      const uint64_t h_raw = fnv1a(bytes_of(exl3::trellis_matmul_raw(tw, xhat)));
+      const uint64_t h_lin = fnv1a(bytes_of(exl3::trellis_linear(tw, x)));
+      std::printf("mhash %-32s rows %2d raw %016llx lin %016llx\n", sh.name, rows,
+                  (unsigned long long)h_raw, (unsigned long long)h_lin);
+      std::fflush(stdout);
+    }
+  }
+  exl3::trellis_set_tuning(exl3::TrellisTuning{0, 0, 0});
+  std::printf("staged matrix path: %s\n", g_fail ? "FAIL" : "PASS");
+}
+
 int main() {
   std::printf("=== trellis GEMV: nt/mb scheduling must not move a byte ===\n");
   for (auto& sh : kShapes) {
@@ -236,5 +382,6 @@ int main() {
   }
   std::printf("trellis GEMV nt/mb invariance: %s\n", g_fail ? "FAIL" : "PASS");
   hash_table();
+  matrix_path();
   return g_fail ? 1 : 0;
 }

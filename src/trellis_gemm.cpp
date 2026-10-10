@@ -140,6 +140,158 @@ const char* kQmvSource = R"METAL(
   }
 )METAL";
 
+// ---------------------------------------------------------------------------
+// The staged matrix path.
+//
+// The QMV above pays its decode once per (output tile, k-tile) *row block*:
+// mb = min(rows, 4) rows share one pass of the packed words, so a linear with
+// `rows` reads its whole tensor rows/mb times (and pays the decode - a mul1 hash
+// and a half fma, ~10 issued lane-instructions per weight - that many times
+// over). At the row counts a request-level batch reaches that is 4 passes at 16
+// rows and 7 at 26, and the decode, not the weight bytes, is what the machine's
+// issue width is spending (docs/perf.md, "Honest distance to 70 tok/s").
+//
+// This kernel decodes a (16 k x 16 n) weight tile ONCE per threadgroup into a
+// threadgroup fp16 tile and then multiplies with simdgroup_matrix, so the MACs
+// leave the issue pipe and one decode serves MAT_MB rows. It is a *scheduling*
+// change plus one fp32 association change (the tensor unit sums the k range in
+// its own order - see the exactness note in trellis_gemm.h), so it is gated off
+// below MAT_MIN_ROWS rows: every single-sequence call and every rows<=8 batch
+// keeps the byte-exact QMV.
+//
+// Lane mapping. A lane decodes the same eight stream positions as the QMV
+// (`lane*8 + g*4 + m`, two groups of four), so the decoded values are the same
+// bits. Where those positions land in the 16x16 tile is read off the QMV's own
+// accumulator indices: position `lane*8 + g*4 + {0..3}` multiplies the x values
+// at k = 2r, 2r+1, 8+2r, 9+2r (r = lane%4) and accumulates into output column
+// q = lane/4 for g = 0 and q+8 for g = 1. So with p = lane*8 + g*4 + m,
+//   n = q + 8*g            k = 2*r + (m & 1) + 8*(m >> 1)
+// and the four values of a group are a (k, k+1) pair for one n.
+//
+// Staging layout. (n, k)-major with 16 halves per row, because (a) a lane's
+// (2r, 2r+1) and (8+2r, 9+2r) k pairs are then contiguous - two half2 stores
+// per group - and (b) the B fragment of simdgroup_multiply_accumulate is the
+// (k, n) operand, which is what `simdgroup_load(..., elements_per_row = 16,
+// transpose = true)` produces from an (n, k) source.
+//
+// Pipelining: two threadgroup buffers, one barrier per k-tile - stage the next
+// tile before the current tile's fragments are read, and let the barrier order
+// both.
+// ---------------------------------------------------------------------------
+
+const char* kQmvMatSource = R"METAL(
+  uint tid = thread_position_in_threadgroup.x;
+  uint lane = thread_index_in_simdgroup;
+  uint simd = simdgroup_index_in_threadgroup;
+  uint tile_n = threadgroup_position_in_grid.x * uint(MAT_NT) + simd;
+  uint row_base = threadgroup_position_in_grid.y * uint(MAT_MB);
+@GROUPHEAD@
+
+  uint word0[2];
+  uint word1[2];
+  uint shift[2];
+  for (uint g = 0u; g < 2u; ++g) {
+    uint first = lane * 8u + g * 4u;
+    int end = int(first + 4u) * K + 256 * K;
+    int last_word = (end - 1) / 32;
+    word1[g] = uint(last_word) % uint(PACKED_U32);
+    word0[g] = uint(last_word - 1) % uint(PACKED_U32);
+    shift[g] = uint((last_word + 1) * 32 - end);
+  }
+  const uint q = lane >> 2u;
+  const uint r = lane & 3u;
+
+  // One decoded tile per simdgroup (MAT_SG == MAT_NT: simdgroup s owns output
+  // tile s of this threadgroup), double buffered over the k-tile loop.
+  threadgroup half stg[2][MAT_SG][256];
+
+  uint tiles_per_split = (uint(TILES_K) + uint(N_SPLITS) - 1u) / uint(N_SPLITS);
+  uint tile_begin = split * tiles_per_split;
+  uint tile_end = min(tile_begin + tiles_per_split, uint(TILES_K));
+
+  // Per-lane staging, split so the words are loaded one tile AHEAD of their
+  // decode: the device loads for tile tk+1 are issued before tile tk's MACs and
+  // only consumed after them, which is the only way an in-order machine lets
+  // them overlap. The alternative - decode the tile where it is loaded, before
+  // the MACs - stalls the warp on the multiply-hash's operands with the tensor
+  // unit idle and the other warps of the threadgroup queueing behind it:
+  // measured 1.09x slower at 16 rows and 1.29x at 64 (4096x24576 K4, 64
+  // iterations per graph, median of 3, single-warp threadgroups).
+  uint nw0[2];
+  uint nw1[2];
+  auto load_tile = [&](uint tk) {
+    const device uchar* tile = wsel + (tk * uint(TILES_N) + tile_n) * uint(PACKED_BYTES);
+    for (uint g = 0u; g < 2u; ++g) {
+      nw0[g] = qmv_word(tile, word0[g]);
+      nw1[g] = qmv_word(tile, word1[g]);
+    }
+  };
+  auto decode_tile = [&](uint buf) {
+    threadgroup half* dst = &stg[buf][simd][0];
+    for (uint g = 0u; g < 2u; ++g) {
+      ulong merged = (ulong(nw0[g]) << 32) | ulong(nw1[g]);
+      uint sh = shift[g];
+      uint win = uint(merged >> sh);
+      uint cw3 = win & 0xffffu;
+      uint cw2 = (win >> K) & 0xffffu;
+      uint cw1 = (win >> (2u * K)) & 0xffffu;
+      uint cw0 = K <= 5 ? ((win >> (3u * K)) & 0xffffu)
+                        : (uint(merged >> (sh + 3u * K)) & 0xffffu);
+      uint base = (q + 8u * g) * 16u + 2u * r;
+      *reinterpret_cast<threadgroup half2*>(dst + base) =
+          half2(qmv_decode_h(cw0), qmv_decode_h(cw1));
+      *reinterpret_cast<threadgroup half2*>(dst + base + 8u) =
+          half2(qmv_decode_h(cw2), qmv_decode_h(cw3));
+    }
+  };
+
+  simdgroup_matrix<float, 8, 8> acc[MAT_MB / 8][2];
+  for (uint rb = 0u; rb < uint(MAT_MB / 8); ++rb) {
+    for (uint nh = 0u; nh < 2u; ++nh) acc[rb][nh] = simdgroup_matrix<float, 8, 8>(0.0f);
+  }
+
+  if (tile_begin < tile_end) {
+    load_tile(tile_begin);
+    decode_tile(0u);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint tk = tile_begin; tk < tile_end; ++tk) {
+    const uint buf = (tk - tile_begin) & 1u;
+    if (tk + 1u < tile_end) load_tile(tk + 1u);
+    for (uint kh = 0u; kh < 2u; ++kh) {
+      // The weight tile's two 8-column halves, as the (k, n) B fragments.
+      simdgroup_matrix<half, 8, 8> bf[2];
+      simdgroup_load(bf[0], &stg[buf][simd][kh * 8u], 16, ulong2(0, 0), true);
+      simdgroup_load(bf[1], &stg[buf][simd][128u + kh * 8u], 16, ulong2(0, 0), true);
+      for (uint rb = 0u; rb < uint(MAT_MB / 8); ++rb) {
+        simdgroup_matrix<half, 8, 8> af;
+        simdgroup_load(af, xhat + @XOFF@ (row_base + 8u * rb) * uint(INPUT_DIMS) +
+                               tk * 16u + 8u * kh,
+                       uint(INPUT_DIMS), ulong2(0, 0), false);
+        simdgroup_multiply_accumulate(acc[rb][0], af, bf[0], acc[rb][0]);
+        simdgroup_multiply_accumulate(acc[rb][1], af, bf[1], acc[rb][1]);
+      }
+    }
+    // One barrier per k-tile, after both halves of the handoff: it orders this
+    // tile's MAC reads against the next staging's stores (this iteration wrote
+    // the *other* buffer, which the previous iteration read) and makes this
+    // iteration's stores visible to the next iteration's MACs.
+    if (tk + 1u < tile_end) decode_tile(buf ^ 1u);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
+
+  for (uint rb = 0u; rb < uint(MAT_MB / 8); ++rb) {
+    for (uint nh = 0u; nh < 2u; ++nh) {
+      uint index = (row_base + 8u * rb) * uint(OUTPUT_DIMS) + tile_n * 16u + 8u * nh;
+#if N_SPLITS > 1
+      index += split * uint(PAD_ROWS) * uint(OUTPUT_DIMS);
+#endif
+      simdgroup_store(acc[rb][nh], yhat + @YOFF@ index, uint(OUTPUT_DIMS));
+    }
+  }
+)METAL";
+
 // Fixed helper prologue (codebook + reduction helpers) generated per codebook.
 std::string codebook_prologue(int cb, int aligned) {
   static const char* kSel4 =
@@ -170,42 +322,46 @@ std::string codebook_prologue(int cb, int aligned) {
     return std::string("#include <metal_stdlib>\nusing namespace metal;\n") + kWord +
            "inline float quad_sum(float v) { v += simd_shuffle_xor(v, ushort(1));"
            " v += simd_shuffle_xor(v, ushort(2)); return v; }\n"
-           "inline float qmv_decode(uint x) { return float(x & 0xffu); }\n";
+           "inline float qmv_decode(uint x) { return float(x & 0xffu); }\n"
+           "inline half qmv_decode_h(uint x) { return half(x & 0xffu); }\n";
   }
-  std::string s =
-      std::string("#include <metal_stdlib>\n")
-      + "using namespace metal;\n" + kSel4 + kWord +
-      "inline float quad_sum(float v) {\n"
-      "  v += simd_shuffle_xor(v, ushort(1));\n"
-      "  v += simd_shuffle_xor(v, ushort(2));\n"
-      "  return v;\n"
-      "}\n"
-      "inline float qmv_decode(uint x) {\n"
-      "  x &= 0xffffu;\n";
+  // The decode body is emitted twice: `qmv_decode` returns the f16 value as a
+  // float (the QMV's accumulator is f32), `qmv_decode_h` returns it as the half
+  // it is - the staged matrix path stores that half into its threadgroup tile,
+  // and the two spellings are the same bits by construction (the fma and the
+  // subtraction both happen in half precision, so the widening is exact).
+  std::string body = "  x &= 0xffffu;\n";
+  std::string tail;
   if (cb == 2) {
-    s +=
+    body +=
         "  uint bits = x * 0x83DCD12Du;\n"
         "  uint pairs = (bits & 0x00ff00ffu) + ((bits >> 8) & 0x00ff00ffu);\n"
         "  uint sum = 0x6400u + (pairs & 0xffffu) + (pairs >> 16);\n"
         "  half value = as_type<half>(ushort(sum));\n"
         "  half inv = as_type<half>(ushort(0x1EEEu));\n"
-        "  half bias = as_type<half>(ushort(0xC931u));\n"
-        "  return float(fma(value, inv, bias));\n";
+        "  half bias = as_type<half>(ushort(0xC931u));\n";
+    tail = "fma(value, inv, bias)";
   } else if (cb == 1) {
-    s +=
+    body +=
         "  uint bits = x * 0xCBAC1FEDu;\n"
         "  bits = 0x3B603B60u ^ (bits & 0x8FFF8FFFu);\n"
-        "  half2 v = as_type<half2>(bits);\n"
-        "  return float(v.x + v.y);\n";
+        "  half2 v = as_type<half2>(bits);\n";
+    tail = "half(v.x + v.y)";
   } else {
-    s +=
+    body +=
         "  uint bits = x * 89226354u + 64248484u;\n"
         "  bits = 0x3B603B60u ^ (bits & 0x8FFF8FFFu);\n"
-        "  half2 v = as_type<half2>(bits);\n"
-        "  return float(v.x + v.y);\n";
+        "  half2 v = as_type<half2>(bits);\n";
+    tail = "half(v.x + v.y)";
   }
-  s += "}\n";
-  return s;
+  return std::string("#include <metal_stdlib>\n") + "using namespace metal;\n" + kSel4 + kWord +
+         "inline float quad_sum(float v) {\n"
+         "  v += simd_shuffle_xor(v, ushort(1));\n"
+         "  v += simd_shuffle_xor(v, ushort(2));\n"
+         "  return v;\n"
+         "}\n"
+         "inline float qmv_decode(uint x) {\n" + body + "  return float(" + tail + ");\n}\n" +
+         "inline half qmv_decode_h(uint x) {\n" + body + "  return " + tail + ";\n}\n";
 }
 
 const char* kHadSource = R"METAL(
@@ -285,38 +441,27 @@ int env_int(const char* name) {
 std::mutex g_mutex;
 std::unordered_map<std::string, mx::fast::CustomKernelFunction> g_kernels;
 
-const mx::fast::CustomKernelFunction& kernel_for(const Config& c) {
-  const std::string key = config_key(c);
-  auto it = g_kernels.find(key);
-  if (it != g_kernels.end()) return it->second;
-
-  std::string header = codebook_prologue(c.cb, c.aligned);
-  char buf[704];
-  std::snprintf(buf, sizeof(buf),
-                "#define K %d\n#define CBK %d\n#define INPUT_DIMS %d\n#define TILES_K %d\n"
-                "#define TILES_N %d\n#define OUTPUT_DIMS %d\n#define PACKED_U32 %d\n"
-                "#define PACKED_BYTES %d\n"
-                "#define QMV_NT %d\n#define QMV_MB %d\n#define QMV_SG %d\n#define N_SPLITS %d\n"
-                "#define PAD_ROWS %d\n#define N_GROUP %d\n"
-                "#define X_STRIDE (PAD_ROWS * INPUT_DIMS)\n"
-                "#define Y_STRIDE (N_SPLITS * PAD_ROWS * OUTPUT_DIMS)\n",
-                c.K, c.cb, c.in, c.in / 16, c.out / 16, c.out, 8 * c.K, 32 * c.K, c.nt, c.mb, c.sg,
-                c.splits, c.pad_rows, c.group);
-  header += buf;
-
-  // One launch covers `group` tensors when group > 1: grid.z enumerates
-  // (split, member) and each member reads its own weight buffer and its own
-  // PAD_ROWS slice of the stacked activations/output.
+// Build one QMV-family kernel: the codebook prologue + the per-config macros,
+// the member-select head (grid.z enumerates (split, member) when group > 1, and
+// each member then reads its own weight buffer and its own PAD_ROWS slice of
+// the stacked activations/output), and the substituted body. Shared by the
+// scalar QMV and the staged matrix kernel so the two cannot drift apart in the
+// head, the buffer list or the substitution rules - `source` is the only
+// difference besides the macros.
+mx::fast::CustomKernelFunction make_qmv_kernel(const std::string& name, const char* source,
+                                               const std::string& macros, int cb, int aligned,
+                                               int group) {
+  std::string header = codebook_prologue(cb, aligned) + macros;
   std::vector<std::string> inputs = {"xhat"};
-  std::string body = kQmvSource;
+  std::string body = source;
   std::string head;
-  if (c.group > 1) {
-    for (int m = 0; m < c.group; ++m) inputs.push_back("trellis" + std::to_string(m));
+  if (group > 1) {
+    for (int m = 0; m < group; ++m) inputs.push_back("trellis" + std::to_string(m));
     head = "  uint member = threadgroup_position_in_grid.z / uint(N_SPLITS);\n"
            "  uint split = threadgroup_position_in_grid.z % uint(N_SPLITS);\n"
            "  const device uchar* wsel = trellis0;\n";
     head += "  switch (member) {\n";
-    for (int m = 1; m < c.group; ++m) {
+    for (int m = 1; m < group; ++m) {
       head += "    case " + std::to_string(m) + "u: wsel = trellis" + std::to_string(m) +
               "; break;\n";
     }
@@ -332,14 +477,77 @@ const mx::fast::CustomKernelFunction& kernel_for(const Config& c) {
     body.replace(pos, std::strlen(what), with);
   };
   subst("@GROUPHEAD@\n", head);
-  subst("@XOFF@", c.group > 1 ? "member * uint(X_STRIDE) + " : "");
-  subst("@YOFF@", c.group > 1 ? "member * uint(Y_STRIDE) + " : "");
+  subst("@XOFF@", group > 1 ? "member * uint(X_STRIDE) + " : "");
+  subst("@YOFF@", group > 1 ? "member * uint(Y_STRIDE) + " : "");
+  return mx::fast::metal_kernel(name, inputs, {"yhat"}, body, header, true, false,
+                                mx::CompileOptions{});
+}
 
+const mx::fast::CustomKernelFunction& kernel_for(const Config& c) {
+  const std::string key = config_key(c);
+  auto it = g_kernels.find(key);
+  if (it != g_kernels.end()) return it->second;
+
+  char buf[704];
+  std::snprintf(buf, sizeof(buf),
+                "#define K %d\n#define CBK %d\n#define INPUT_DIMS %d\n#define TILES_K %d\n"
+                "#define TILES_N %d\n#define OUTPUT_DIMS %d\n#define PACKED_U32 %d\n"
+                "#define PACKED_BYTES %d\n"
+                "#define QMV_NT %d\n#define QMV_MB %d\n#define QMV_SG %d\n#define N_SPLITS %d\n"
+                "#define PAD_ROWS %d\n#define N_GROUP %d\n"
+                "#define X_STRIDE (PAD_ROWS * INPUT_DIMS)\n"
+                "#define Y_STRIDE (N_SPLITS * PAD_ROWS * OUTPUT_DIMS)\n",
+                c.K, c.cb, c.in, c.in / 16, c.out / 16, c.out, 8 * c.K, 32 * c.K, c.nt, c.mb, c.sg,
+                c.splits, c.pad_rows, c.group);
   char name[160];
   std::snprintf(name, sizeof(name), "exl3_qmv_%s", key.c_str());
-  auto fn = mx::fast::metal_kernel(name, inputs, {"yhat"}, body, header, true, false,
-                                   mx::CompileOptions{});
+  auto fn = make_qmv_kernel(name, kQmvSource, buf, c.cb, c.aligned, c.group);
   return g_kernels.emplace(key, std::move(fn)).first->second;
+}
+
+// The staged matrix kernel: same prologue, head and buffer list, its own
+// geometry macros. `mat_mb` is rows per threadgroup, `mat_nt` output tiles per
+// threadgroup and simdgroups per threadgroup at once (the kernel requires
+// MAT_SG == MAT_NT: simdgroup s stages and owns output tile s), so a geometry
+// key of its own is what keeps this kernel from colliding with the QMV's.
+struct MatConfig {
+  int in, out, K, cb, mb, nt, splits, pad_rows, group, aligned;
+  bool operator==(const MatConfig& o) const {
+    return in == o.in && out == o.out && K == o.K && cb == o.cb && mb == o.mb && nt == o.nt &&
+           splits == o.splits && pad_rows == o.pad_rows && group == o.group &&
+           aligned == o.aligned;
+  }
+};
+
+std::string mat_config_key(const MatConfig& c) {
+  char buf[160];
+  std::snprintf(buf, sizeof(buf), "%d_%d_%d_%d_%d_%d_%d_%d_%d_%d", c.in, c.out, c.K, c.cb, c.mb,
+                c.nt, c.splits, c.pad_rows, c.group, c.aligned);
+  return buf;
+}
+
+std::unordered_map<std::string, mx::fast::CustomKernelFunction> g_mat_kernels;
+
+const mx::fast::CustomKernelFunction& mat_kernel_for(const MatConfig& c) {
+  const std::string key = mat_config_key(c);
+  auto it = g_mat_kernels.find(key);
+  if (it != g_mat_kernels.end()) return it->second;
+
+  char buf[704];
+  std::snprintf(buf, sizeof(buf),
+                "#define K %d\n#define CBK %d\n#define INPUT_DIMS %d\n#define TILES_K %d\n"
+                "#define TILES_N %d\n#define OUTPUT_DIMS %d\n#define PACKED_U32 %d\n"
+                "#define PACKED_BYTES %d\n"
+                "#define MAT_MB %d\n#define MAT_NT %d\n#define MAT_SG %d\n#define N_SPLITS %d\n"
+                "#define PAD_ROWS %d\n#define N_GROUP %d\n"
+                "#define X_STRIDE (PAD_ROWS * INPUT_DIMS)\n"
+                "#define Y_STRIDE (N_SPLITS * PAD_ROWS * OUTPUT_DIMS)\n",
+                c.K, c.cb, c.in, c.in / 16, c.out / 16, c.out, 8 * c.K, 32 * c.K, c.mb, c.nt, c.nt,
+                c.splits, c.pad_rows, c.group);
+  char name[176];
+  std::snprintf(name, sizeof(name), "exl3_qmv_mat_%s", key.c_str());
+  auto fn = make_qmv_kernel(name, kQmvMatSource, buf, c.cb, c.aligned, c.group);
+  return g_mat_kernels.emplace(key, std::move(fn)).first->second;
 }
 
 std::unordered_map<std::string, mx::fast::CustomKernelFunction> g_had_kernels;
@@ -487,6 +695,213 @@ Geom pick_geom(int k_tiles, int n_tiles, int rows, int members = 1) {
   return Geom{mb, nt, sg, splits, pad_rows};
 }
 
+// ---------------------------------------------------------------------------
+// The staged matrix path: gate, geometry, and the two QMV launches.
+//
+// The kernel is described above kQmvMatSource. What it changes is ONE thing
+// besides scheduling: the k range inside a split is summed by the tensor unit's
+// own tree instead of the QMV's (quad shuffle + per-lane partials), so a staged
+// output is not byte-identical to a QMV one - it is the same decoded fp16
+// weights and the same fp32 accumulator, read in a different association.
+//
+// The decision, made here and enforced by the gate below:
+//
+//   * The staged path is OPT-IN and GATED, never silent: it runs only when the
+//     caller's tuning allows it AND the row count reaches the threshold
+//     (`TrellisTuning.mat_min_rows`, default 16 or EXL3_QMV_MAT_MIN_ROWS). The
+//     single-sequence path is rows = 1 and every request-level batch below 16
+//     rows stays on the QMV, so the byte-exact kernel is what serves the serial
+//     path, the B=1..8 batch cells and every prefill chunk narrower than the
+//     threshold.
+//   * The deviation is reported, not loosened: tests/glm5_gemv_nt_test.cpp
+//     hashes both paths and prints the staged path's max|diff| against the QMV
+//     for the real tensor classes, and tests/glm5_batch_test.cpp's token
+//     identity gates (the hard ones) run with the staged path on at B=16.
+//   * Bit-identity was not attempted: the tensor unit's 16-deep k reduction is
+//     not expressible as the QMV's four-lane shuffle tree (the QMV's partials
+//     are `quad_sum(a0+a1) + quad_sum(a2+a3)` per 8 stream positions, and its
+//     per-tile k order is a 4-lane interleave), so reproducing the order would
+//     mean not using the matrix units at all. The staged path also picks its own
+//     k-split count (one warp per output tile needs a different one - see
+//     mat_split_count), which is a second, smaller f32 association change of the
+//     same kind: the split partials are still summed by the caller's mx::sum.
+// ---------------------------------------------------------------------------
+
+// Output tiles per threadgroup == simdgroups per threadgroup: simdgroup s
+// stages tile s of the threadgroup and accumulates the same tile's columns.
+//
+// The default is 1 - a threadgroup is one warp and the per-k-tile barrier costs
+// nothing. Measured across the 15 real tensor classes at 26 rows (median of 3,
+// same session): 1 beats 4 by 5% (lm_head K6) to 41% (kda o_proj) and never
+// loses; the barrier is what the extra tiles per threadgroup buy nothing for
+// (the staging and the MACs of a tile are one warp's work either way, and the
+// barrier serialises them across the threadgroup's warps).
+// EXL3_QMV_MAT_NT overrides it for experiments; every value >= 1 is legal as
+// long as it divides the tile count (checked by the gate).
+constexpr int kMatNT = 1;
+
+int mat_nt_knob() {
+  const int v = env_int("EXL3_QMV_MAT_NT");
+  return v > 0 ? v : kMatNT;
+}
+
+// Threadgroups the staged kernel aims for. It is LATENCY-bound, not issue-bound
+// (its staging phase is a device load plus a dependent multiply-hash chain, with
+// one barrier per k-tile after it), so the threadgroup count is the rate: on
+// mla o_proj (16384x4096 K4, 256 output tiles, 16 rows) the isolated kernel
+// measures 2 splits 30.8 GB/s, 4 -> 60.2, 8 -> 105.5, 16 -> 126.7, i.e. it wants
+// thousands of threadgroups.
+//
+// ... and the STEP wants hundreds. The isolated kernel is not the right
+// instrument for this knob: the same pair of builds measured end to end at 16
+// rows (tests/glm5_batch_test, interleaved rounds) reads 0.83x with a 4096 target
+// and 1.19x with 512, because what the split buys in the isolated kernel (more
+// threadgroups) it pays for in the step (splits f32 output planes per linear,
+// each summed by its own dispatch, and thousands of 32-thread threadgroups
+// competing with the MoE's expert kernels for the SMs). 512 is the shipped
+// number; EXL3_QMV_MAT_TG overrides it.
+constexpr int kMatSplitTarget = 512;
+// ... and a split still has to get enough k-tiles that the staging pipeline's
+// prologue and drain do not dominate.
+constexpr int kMatSplitMinTiles = 8;
+
+int mat_split_count(int k_tiles, int n_tiles, int nt) {
+  const int forced = env_int("EXL3_QMV_SPLITS");
+  if (forced > 0) {
+    int f = forced;
+    while (k_tiles / f < 1) f /= 2;
+    return f > 0 ? f : 1;
+  }
+  const int target = env_int("EXL3_QMV_MAT_TG") > 0 ? env_int("EXL3_QMV_MAT_TG") : kMatSplitTarget;
+  const int64_t tiles = std::max(1, n_tiles / nt);
+  int splits = 1;
+  while (tiles * splits < target && k_tiles / (splits * 2) >= kMatSplitMinTiles) splits *= 2;
+  return splits;
+}
+
+struct MatGeom {
+  int mb, nt, splits, pad_rows;
+};
+
+// A decode-shaped forward: a 3-D (or higher) activation whose sequence axis is
+// one, so its row axis is the batch. The request-level batch passes (B, 1,
+// hidden) and is the only shape that qualifies; the benchmarks pass (rows, 1,
+// in) for the same reason.
+//
+// The scope has to be this narrow, and it is why it is a *shape* rule rather
+// than a row count alone: a prefill reaches the same row counts through several
+// shapes - (1, L, hidden) for the trunk, and (tokens_per_expert, hidden) flat 2-D
+// for the general MoE's per-expert path (measured: the first forward of
+// tests/glm5_forward_test, a 23-token prefill, dispatches the routed experts at
+// 16-21 rows that way). Those must stay on the byte-exact QMV - the ticket's
+// hard gate is that the single-sequence path, its prefill included, is
+// bit-identical - and they are the right calls to keep there anyway: the staged
+// kernel would stream the weights rows/MAT_MB times over a prefill, where the
+// answer is a K-blocked GEMM over the batch.
+bool decode_shaped(const mx::array& x) {
+  return x.ndim() >= 3 && x.shape(x.ndim() - 2) == 1;
+}
+
+bool mat_path_ok(int rows, const TrellisWeight& w) {
+  const TrellisTuning tn = tuning_state();
+  if (tn.mat_min_rows <= 0 || rows < tn.mat_min_rows) return false;
+  if (tn.mat_max_rows > 0 && rows > tn.mat_max_rows) return false;
+  if (w.codebook != 1 && w.codebook != 2 && w.codebook != 3) return false;
+  if (w.in_features < 16 || w.in_features % 16 != 0) return false;
+  // The kernel writes MAT_NT output tiles per threadgroup with no bound check,
+  // exactly like the QMV's nt, so MAT_NT must divide the tile count. Every
+  // tensor class of the checkpoint has an out_features that is a multiple of
+  // 128, so this only excludes shapes nobody packs.
+  if ((w.out_features / 16) % mat_nt_knob() != 0) return false;
+  return true;
+}
+
+MatGeom pick_mat_geom(int k_tiles, int n_tiles, int rows) {
+  // Rows per threadgroup: 16 is the narrowest width a matrix op pays for, 32
+  // the widest whose accumulator array (MAT_MB/8 x 2 fragments, 2 f32 per lane
+  // each) still sits comfortably beside the staging loop's live values. A wider
+  // block stages the tile once for more rows, which is the whole point.
+  int mb = rows > 16 ? 32 : 16;
+  // Output tiles per threadgroup == simdgroups per threadgroup. Both are
+  // experimentation knobs (EXL3_QMV_MAT_MB / EXL3_QMV_MAT_NT), never load-bearing
+  // for the arithmetic: the staged tile a simdgroup owns and the accumulator
+  // fragments it keeps are the same work in a different arrangement.
+  const int nt = mat_nt_knob();
+  if (env_int("EXL3_QMV_MAT_MB") > 0) mb = env_int("EXL3_QMV_MAT_MB");
+  if (mb < 8) mb = 8;
+  if (mb > 32) mb = 32;
+  // The staged kernel's own k-split count: one warp per output tile means the
+  // QMV's count (tuned for `n_tiles * 4` warps) leaves it with a quarter of the
+  // threadgroups it needs (see mat_split_count).
+  const int splits = mat_split_count(k_tiles, n_tiles, nt);
+  int pad_rows = ((rows + mb - 1) / mb) * mb;
+  if (pad_rows >= 64) pad_rows = ((pad_rows + 31) / 32) * 32;
+  return MatGeom{mb, nt, splits, pad_rows};
+}
+
+// Pad the activation's row axis (axis -2, which is axis 0 of the flat 2-D view a
+// fused single-tensor call passes in) up to `pad_rows` with zeros, so no kernel
+// needs a row bound.
+mx::array pad_rows_zeros(const mx::array& x, int rows, int pad_rows) {
+  if (pad_rows <= rows) return x;
+  mx::Shape zshape(x.shape().begin(), x.shape().end());
+  zshape[zshape.size() - 2] = pad_rows - rows;
+  return mx::concatenate({x, mx::zeros(zshape, mx::float16)}, (int)zshape.size() - 2);
+}
+
+// The QMV launch: one member (the fused single-tensor form) or n (the grouped
+// form). Returns (pad_rows, out) or (splits, pad_rows, out) fp32 for one member
+// and the same with a leading n when grouped; the caller sums the split axis.
+mx::array qmv_scalar_run(const std::vector<TrellisWeight>& ws, const mx::array& xin, const Geom& g) {
+  const int n = (int)ws.size();
+  const int in = ws[0].in_features, out = ws[0].out_features;
+  const int n_tiles = out / 16;
+  Config cfg{in, out, ws[0].K, ws[0].codebook, g.nt, g.sg, g.mb, g.splits, g.pad_rows, n,
+             ws[0].aligned ? 1 : 0};
+  std::vector<mx::Shape> shapes;
+  if (n > 1) {
+    shapes = g.splits > 1 ? std::vector<mx::Shape>{mx::Shape{n, g.splits, g.pad_rows, out}}
+                          : std::vector<mx::Shape>{mx::Shape{n, g.pad_rows, out}};
+  } else {
+    shapes = g.splits > 1 ? std::vector<mx::Shape>{mx::Shape{g.splits, g.pad_rows, out}}
+                          : std::vector<mx::Shape>{mx::Shape{g.pad_rows, out}};
+  }
+  std::vector<mx::array> args;
+  args.reserve((size_t)n + 1);
+  args.push_back(xin);
+  for (const auto& w : ws) args.push_back(w.packed);
+  std::lock_guard<std::mutex> lk(g_mutex); // kernel map only; never held while launching more
+  const auto& kernel = kernel_for(cfg);
+  auto outs = kernel(args, shapes, {mx::float32},
+                     {n_tiles / g.nt * g.sg * 32, g.pad_rows / g.mb, g.splits * n},
+                     {g.sg * 32, 1, 1},
+                     std::vector<std::pair<std::string, mx::fast::TemplateArg>>{}, std::nullopt,
+                     false, mx::default_device());
+  return outs[0];
+}
+
+// The same convention for the staged matrix kernel (one member only - its only
+// callers are the single-tensor entry points; see matmul_group_impl for why the
+// grouped forms stay on the QMV). Its own geometry is rows per threadgroup
+// (mg.mb) and mg.nt output tiles per threadgroup.
+mx::array qmv_mat_run(const TrellisWeight& w, const mx::array& xin, const MatGeom& mg) {
+  const int out = w.out_features;
+  const int n_tiles = out / 16;
+  MatConfig cfg{w.in_features, out, w.K, w.codebook, mg.mb, mg.nt, mg.splits, mg.pad_rows, 1,
+                w.aligned ? 1 : 0};
+  std::vector<mx::Shape> shapes =
+      mg.splits > 1 ? std::vector<mx::Shape>{mx::Shape{mg.splits, mg.pad_rows, out}}
+                    : std::vector<mx::Shape>{mx::Shape{mg.pad_rows, out}};
+  std::lock_guard<std::mutex> lk(g_mutex);
+  const auto& kernel = mat_kernel_for(cfg);
+  auto outs = kernel({xin, w.packed}, shapes, {mx::float32},
+                     {n_tiles / mg.nt * mg.nt * 32, mg.pad_rows / mg.mb, mg.splits},
+                     {mg.nt * 32, 1, 1},
+                     std::vector<std::pair<std::string, mx::fast::TemplateArg>>{}, std::nullopt,
+                     false, mx::default_device());
+  return outs[0];
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -499,6 +914,12 @@ static TrellisTuning& tuning_state() {
     out.nt = env_int("EXL3_QMV_NT");
     out.sg = env_int("EXL3_QMV_SG");
     out.mb = env_int("EXL3_QMV_MB");
+    // The staged path is on by default at the row counts a request-level batch
+    // reaches (16, the width a simdgroup matrix op wants); EXL3_QMV_MAT_MIN_ROWS
+    // moves or disables it (0), EXL3_QMV_MAT_MAX_ROWS caps it.
+    const char* mat = std::getenv("EXL3_QMV_MAT_MIN_ROWS");
+    out.mat_min_rows = mat ? std::atoi(mat) : 16;
+    out.mat_max_rows = env_int("EXL3_QMV_MAT_MAX_ROWS");
     return out;
   }();
   return t;
@@ -508,41 +929,61 @@ void trellis_set_tuning(const TrellisTuning& t) { tuning_state() = t; }
 
 TrellisTuning trellis_get_tuning() { return tuning_state(); }
 
+TrellisPathInfo trellis_path_info(const TrellisWeight& w, int rows) {
+  const int k_tiles = w.in_features / 16, n_tiles = w.out_features / 16;
+  if (mat_path_ok(rows, w)) {
+    const MatGeom mg = pick_mat_geom(k_tiles, n_tiles, rows);
+    return TrellisPathInfo{true, mg.mb, mg.pad_rows, mg.pad_rows / mg.mb, mg.splits, mg.nt};
+  }
+  const Geom g = pick_geom(k_tiles, n_tiles, rows);
+  return TrellisPathInfo{false, g.mb, g.pad_rows, g.pad_rows / g.mb, g.splits, g.nt};
+}
+
 // ---------------------------------------------------------------------------
 // Forward
 // ---------------------------------------------------------------------------
 
+// EXL3_QMV_MAT_DEBUG=1 traces every dispatch: which path, and the activation's
+// shape that chose it (the shape is the whole scope rule, so a mis-scoped call
+// - a prefill on the staged path - shows up here by name).
+static void mat_debug(const mx::array& x, int rows, int in, int out, bool mat) {
+  if (!std::getenv("EXL3_QMV_MAT_DEBUG")) return;
+  std::fprintf(stderr, "MAT rows=%d in=%d out=%d ndim=%zu shape=", rows, in, out,
+               (size_t)x.ndim());
+  for (auto d : x.shape()) std::fprintf(stderr, "%d,", d);
+  std::fprintf(stderr, " -> %s\n", mat ? "STAGED" : "qmv");
+}
+
 mx::array trellis_matmul_raw(const TrellisWeight& w, const mx::array& xhat) {
   const int in = w.in_features;
   const int out = w.out_features;
-  const int rows = (int)xhat.shape(0);
+  // The activations are (…, rows, in); a flat 2-D call is the common case and
+  // any leading dimensions are restored on the way out, like trellis_linear.
+  const int64_t rows = xhat.size() / in;
+  if (rows * in != (int64_t)xhat.size()) {
+    throw std::invalid_argument("trellis_matmul_raw: input feature size mismatch");
+  }
   const int k_tiles = in / 16;
   const int n_tiles = out / 16;
 
+  const bool mat = decode_shaped(xhat) && mat_path_ok((int)rows, w);
+  mat_debug(xhat, rows, in, out, mat);
   const Geom g = pick_geom(k_tiles, n_tiles, rows);
-  const int mb = g.mb, nt = g.nt, sg = g.sg, splits = g.splits, pad_rows = g.pad_rows;
-  mx::array xin = xhat;
-  if (pad_rows > rows) {
-    xin = mx::concatenate(
-        {xhat, mx::zeros(mx::Shape{pad_rows - rows, in}, mx::float16)}, 0);
-  }
+  const MatGeom mg = pick_mat_geom(k_tiles, n_tiles, rows);
+  // The path's own splits and padded rows: the caller's split sum and its slice
+  // are part of the path, not of the tensor (the two geometries differ).
+  const int splits = mat ? mg.splits : g.splits;
+  const int pad_rows = mat ? mg.pad_rows : g.pad_rows;
+  mx::array xin = pad_rows_zeros(xhat, (int)rows, pad_rows);
 
-  Config cfg{in, out, w.K, w.codebook, nt, sg, mb, splits, pad_rows, 1, w.aligned ? 1 : 0};
-  std::vector<mx::Shape> shapes;
-  if (splits > 1) shapes = {mx::Shape{splits, pad_rows, out}};
-  else shapes = {mx::Shape{pad_rows, out}};
-  mx::array y = mx::array(0.0f);
-  {
-    std::lock_guard<std::mutex> lk(g_mutex); // kernel map only; never held while launching more
-    const auto& kernel = kernel_for(cfg);
-    auto outs = kernel({xin, w.packed}, shapes, {mx::float32},
-                       {n_tiles / nt * sg * 32, pad_rows / mb, splits}, {sg * 32, 1, 1},
-                       std::vector<std::pair<std::string, mx::fast::TemplateArg>>{}, std::nullopt,
-                       false, mx::default_device());
-    y = outs[0];
-  }
+  mx::array y = mat ? qmv_mat_run(w, xin, mg) : qmv_scalar_run({w}, xin, g);
   if (splits > 1) y = mx::sum(y, std::vector<int>{0}, false);
-  if (pad_rows > rows) y = mx::slice(y, {0, 0}, {rows, out});
+  if (pad_rows > rows) y = mx::slice(y, {0, 0}, {(int)rows, out});
+  if (xhat.ndim() != 2) {
+    mx::Shape yshape(xhat.shape().begin(), xhat.shape().end());
+    yshape[yshape.size() - 1] = out;
+    y = mx::reshape(y, yshape);
+  }
   return y;
 }
 
@@ -575,31 +1016,19 @@ mx::array matmul_group_impl(const std::vector<TrellisWeight>& ws, const mx::arra
     }
   }
   const int k_tiles = in / 16, n_tiles = out / 16;
+  // The grouped forms stay on the QMV, deliberately: their activation is
+  // (n, rows, in) with the sequence axis already flattened into `rows`, so the
+  // decode-shaped test (the scope of the staged path - see decode_shaped) cannot
+  // be made, and the two callers that reach rows >= the threshold with members
+  // are the routed experts of the model's MoE (rows = 1 per member, which the
+  // threshold excludes) and moe_layer's general path, whose (K, B*L, H) shaped
+  // activation includes the single-sequence prefill. Guessing there would take
+  // the staged path into every prefill through the back door.
   const Geom g = pick_geom(k_tiles, n_tiles, rows, n);
-  const int mb = g.mb, nt = g.nt, sg = g.sg, splits = g.splits, pad_rows = g.pad_rows;
+  const int splits = g.splits, pad_rows = g.pad_rows;
 
-  mx::array xin = x;
-  if (pad_rows > rows) xin = mx::concatenate({x, mx::zeros({n, pad_rows - rows, in}, mx::float16)}, 1);
-
-  Config cfg{in, out, ws[0].K, ws[0].codebook, nt, sg, mb, splits, pad_rows, n,
-             ws[0].aligned ? 1 : 0};
-  std::vector<mx::Shape> shapes;
-  if (splits > 1) shapes = {mx::Shape{n, splits, pad_rows, out}};
-  else shapes = {mx::Shape{n, pad_rows, out}};
-  std::vector<mx::array> args;
-  args.reserve((size_t)n + 1);
-  args.push_back(xin);
-  for (const auto& w : ws) args.push_back(w.packed);
-  mx::array y = mx::array(0.0f);
-  {
-    std::lock_guard<std::mutex> lk(g_mutex);
-    const auto& kernel = kernel_for(cfg);
-    auto outs = kernel(args, shapes, {mx::float32},
-                       {n_tiles / nt * sg * 32, pad_rows / mb, splits * n}, {sg * 32, 1, 1},
-                       std::vector<std::pair<std::string, mx::fast::TemplateArg>>{}, std::nullopt,
-                       false, mx::default_device());
-    y = outs[0];
-  }
+  mx::array xin = pad_rows_zeros(x, rows, pad_rows);
+  mx::array y = qmv_scalar_run(ws, xin, g);
   if (splits > 1) y = mx::sum(y, std::vector<int>{1}, false); // (n, pad_rows, out)
   // One batched output Hadamard: the members' svh vectors concatenated give the
   // per-member scale (the kernel's block index runs member-major over rows).
@@ -731,33 +1160,18 @@ mx::array trellis_linear(const TrellisWeight& w, const mx::array& x) {
   // yhat = xhat @ W_hat, split rows padded so the kernel needs no row bound.
   const int k_tiles = in / 16;
   const int n_tiles = out / 16;
+  const bool mat = decode_shaped(x) && mat_path_ok((int)rows, w);
+  mat_debug(x, (int)rows, in, out, mat);
   const Geom g = pick_geom(k_tiles, n_tiles, (int)rows);
-  const int mb = g.mb, nt = g.nt, sg = g.sg, splits = g.splits, pad_rows = g.pad_rows;
-  mx::array xin = xhat;
-  if (pad_rows > rows) {
-    mx::Shape zshape(xhat.shape().begin(), xhat.shape().end());
-    const int row_axis = (int)zshape.size() - 2;
-    zshape[row_axis] = pad_rows - (int)rows;
-    xin = mx::concatenate({xhat, mx::zeros(zshape, mx::float16)}, row_axis);
-  }
+  const MatGeom mg = pick_mat_geom(k_tiles, n_tiles, (int)rows);
+  const int splits = mat ? mg.splits : g.splits;
+  const int pad_rows = mat ? mg.pad_rows : g.pad_rows;
+  mx::array xin = pad_rows_zeros(xhat, (int)rows, pad_rows);
 
-  Config cfg{in, out, w.K, w.codebook, nt, sg, mb, splits, pad_rows, 1, w.aligned ? 1 : 0};
-  std::vector<mx::Shape> shapes;
-  if (splits > 1) shapes = {mx::Shape{splits, pad_rows, out}};
-  else shapes = {mx::Shape{pad_rows, out}};
-  mx::array y = mx::array(0.0f);
-  {
-    std::lock_guard<std::mutex> lk(g_mutex);
-    const auto& kernel = kernel_for(cfg);
-    auto outs = kernel({xin, w.packed}, shapes, {mx::float32},
-                       {n_tiles / nt * sg * 32, pad_rows / mb, splits}, {sg * 32, 1, 1},
-                       std::vector<std::pair<std::string, mx::fast::TemplateArg>>{}, std::nullopt,
-                       false, mx::default_device());
-    y = outs[0];
-  }
   // The k-split partials are summed in f32 exactly as before (MLX's reduction
   // order is its own; reordering it here moved the model's logits), then
   // y = (H128 y / sqrt(128)) . svh with the f16 rounding inside the kernel.
+  mx::array y = mat ? qmv_mat_run(w, xin, mg) : qmv_scalar_run({w}, xin, g);
   if (splits > 1) y = mx::sum(y, std::vector<int>{0}, false);
   y = hadamard_run(y, w.svh, out / 128, /*pre=*/false, mx::Shape{pad_rows, out});
   if (pad_rows > rows) y = mx::slice(y, {0, 0}, {(int)rows, out});

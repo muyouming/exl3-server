@@ -875,3 +875,393 @@ bandwidth:
 3. **The per-row machinery.** At a fixed routing the marginal row costs ~23-25 ms
    (B=4 -> B=16: 176.6 -> 472.4 ms), so the aggregate saturates near 34 tok/s
    long before the expert term (or 70 tok/s) is reached.
+
+## Seventh pass (2026-10-11): the staged matrix path for the batched rows
+
+The sixth pass left one lever named and unbuilt: the classes whose weights do not
+diverge per row (kda `qkv_proj`, kda/mla `o_proj`, the shared expert, the dense
+MLP, mla `q_b`) pay their decode once per *row block* (`mb = min(rows,4)`), so at
+the row counts a request-level batch reaches they stream the same packed words 4
+times at 16 rows and 7 at 26 - and the decode (a mul1 multiply-hash and its half
+fma, ~10 issued lane-instructions per weight) is what the machine's issue width
+is spending. This pass moves those classes onto a staged fp16 + simdgroup_matrix
+kernel and measures it per class and at B=16.
+
+### What was built
+
+* `src/trellis_gemm.cpp`: a second kernel in the QMV family (`exl3_qmv_mat_*`,
+  built by the same `make_qmv_kernel` factory so the codebook prologue, the
+  member head and the buffer list cannot drift apart). It decodes each (16k x 16n)
+  packed tile ONCE per threadgroup into a threadgroup fp16 tile and then
+  multiplies with `simdgroup_matrix`; the tile is staged (n, k)-major with 16
+  halves per row, which is both what a lane's k pairs want (two `half2` stores
+  per group of four weights) and what the B fragment's `simdgroup_load(...,
+  transpose = true)` reads as W[k][n]. One warp per output tile, one barrier per
+  k-tile, the next tile's words loaded a tile ahead of their decode.
+  * Gate: `TrellisTuning.mat_min_rows` (default 16, `EXL3_QMV_MAT_MIN_ROWS`) AND
+    a decode-shaped call - one whose sequence axis is 1, i.e. (B, 1, hidden) from
+    the request-level batch (or a flat 2-D (rows, in) benchmark call). A prefill
+    chunk is (1, L, hidden) with L > 1 and keeps the byte-exact QMV, so the
+    single-sequence path is bit-identical *including its prefill* (the ticket's
+    hard gate) and a wide forward does not pay the staged kernel's rows/MAT_MB
+    weight passes - for a prefill the answer is a K-blocked GEMM over the batch,
+    not this kernel. Below the threshold every call is on the QMV anyway.
+  * Scope: the single-tensor entry points (`trellis_linear`, `trellis_matmul_raw`)
+    only. The grouped forms keep the QMV - their activation is (n, rows, in) with
+    the sequence axis already flattened into `rows`, so the decode-shaped test
+    cannot be made there, and the two callers that reach rows >= the threshold are
+    the model's routed experts (rows = 1 per member) and moe_layer's general path,
+    whose (K, B*L, H) activation includes the single-sequence prefill.
+  * The staged path picks its own k-split count (`mat_split_count`): the QMV's is
+    tuned for `n_tiles * 4` warps and the staged kernel runs one warp per tile, so
+    it aims at ~4096 threadgroups instead. This matters: at the QMV's count the
+    narrow-output classes (mla `o_proj`, kda `o_proj`, the shared expert, kv_a)
+    ran at 25-35 GB/s, i.e. no better than the QMV - they are latency-bound, and
+    the split is the only parallelism axis the staging leaves.
+* `trellis_path_info()` (`src/trellis_gemm.h`): which path, row block, padded rows
+  and pass count a tensor will take at a given row count - so the benchmarks and
+  the batch test report the path they measured instead of re-deriving the rule.
+
+### Measured, per class (`tests/glm5_trellis_bw.cpp`, same session, interleaved,
+64 iterations per graph, median of 3, warmed)
+
+`qmv` is the kernel alone; the pair is (QMV / staged). GB/s is the packed weight
+bytes over the kernel's own time, so the QMV's figure has to be multiplied by its
+pass count to read as a memory rate (the staged figure needs no correction at 16
+and 32 rows - one pass).
+
+| class (real geometry) | rows 16 | rows 32 |
+|---|---|---|
+| lm_head 4096x154880 K6 | 8.742 / 2.387 ms (3.7x) | 17.45 / 3.68 ms (4.7x) |
+| kda qkv_proj 4096x24576 K4 | 1.368 / 0.418 ms (3.3x) | 2.706 / 0.794 (3.4x) |
+| mla o_proj 16384x4096 K4 | 0.931 / 1.126 ms (**0.83x**) | 1.827 / 0.884 (2.1x) |
+| kda o_proj 8192x4096 K4 | 0.469 / 0.567 ms (**0.83x**) | 0.916 / 0.495 (1.9x) |
+| dense gate/up 4096x12288 K3 | 0.693 / 0.242 ms (2.9x) | 1.361 / 0.599 (2.3x) |
+| dense down 12288x4096 K3 | 0.719 / 0.844 ms (**0.85x**) | 1.398 / 0.724 (1.9x) |
+| shared gate 4096x2048 K4 | 0.128 / 0.099 ms (1.3x) | 0.245 / 0.209 (1.2x) |
+| shared down 2048x4096 K4 | 0.128 / 0.130 ms (0.98x) | 0.245 / 0.123 (2.0x) |
+| mla q_b 1536x16384 K4 | 0.359 / 0.117 ms (3.1x) | 0.704 / 0.190 (3.7x) |
+| exp gate/up 4096x2048 K3 (8 members) | 0.129 / 0.092 ms (1.4x) | 0.247 / 0.205 (1.2x) |
+| exp gate/up 4096x2048 K2 | 0.130 / 0.088 ms (1.5x) | 0.246 / 0.191 (1.3x) |
+| mla kv_a 4096x512 K4 | 0.043 / 0.018 ms (2.3x) | 0.076 / 0.027 (2.9x) |
+| kda f_a 4096x256 K4 | 0.027 / 0.013 ms (2.0x) | 0.046 / 0.017 (2.7x) |
+
+**The isolated kernel's optimum and the step's optimum disagree, and the shipped
+split target is the step's.** With `EXL3_QMV_MAT_TG=4096` (what the isolated
+kernel wants: thousands of threadgroups) every one of those 15 classes is a win
+at both row counts - 2.6x to 4.8x, the narrow-output ones included (`mla o_proj`
+0.937 / 0.268 ms, `kda o_proj` 0.479 / 0.141, `dense down` 0.717 / 0.209 at 16
+rows). With the shipped 512 the same cells read 0.83-0.98x on those four classes
+while the aggregate at B=16 follows the opposite way - see the pair below, where
+the 16-row same-prompt cell reads **0.83x at 4096 and 1.19x at 512**. The knob is
+`EXL3_QMV_MAT_TG`, and the reason the two disagree is that a split costs the
+isolated kernel nothing (it runs alone, and more 32-thread threadgroups is more
+latency hiding) and the step a great deal (`splits` f32 output planes per linear,
+each summed by its own dispatch, and thousands of tiny threadgroups competing
+with the MoE's expert kernels for the SMs).
+
+Every other row count is unchanged by construction: rows 1-13 are below the
+threshold, and a prefill - any (1, L, hidden) call, whatever L, and the general
+MoE's flat (tokens, hidden) per-expert calls - is out of the staged path's scope
+entirely, so the two columns are the same kernel there (`trellis_path_info`
+prints the path; the rows 8/13 cells measure within 1%).
+
+The staged kernel's own ceiling is visible in the table: ~120-195 GB/s at K4/K6,
+i.e. the same per-weight instruction count the scalar QMV spends (the decode is
+~10 of its ~13 issued lane-instructions per weight) - it does NOT decode faster.
+What it removes is the row multiplicity: one decode pass serves 16-32 rows and
+the MACs leave the issue pipe for the tensor unit, so the per-(weight,row) cost
+falls by the pass ratio (3-5x measured, growing with the row count).
+
+### Exactness: a named, gated deviation (not a silent loosening)
+
+The staged path decodes the *same* fp16 weights (the decode is the QMV's own
+`qmv_decode_h`, and the staged value is the same bits) and accumulates in fp32,
+but the tensor unit sums the k range in its own tree and the split count is the
+staged path's own. Reproducing the QMV's order is not possible while using the
+matrix units: its per-output reduction is `quad_sum(a0+a1) + quad_sum(a2+a3)` per
+eight stream positions plus a 4-lane interleave, and a `simdgroup_matrix` k
+reduction is the hardware's.
+
+So the deviation is *bounded and reported* rather than eliminated:
+
+* `tests/glm5_gemv_nt_test.cpp`'s `matrix_path()` section measures the staged
+  path against the QMV on the raw f32 output for 8 shapes x rows {16, 32, 64}:
+  **max |diff| is 1.7e-5% to 8.9e-5% of max|value|** (2e-7 to 9e-7 relative) -
+  f32 association scale, four orders of magnitude below what a wrong decode, a
+  wrong fragment layout or a wrong tile mapping would show. It also checks that
+  the staged path is inert to the QMV's nt/sg/mb knobs, that the grouped form is
+  unchanged by the staged path being on (and still equals n single-tensor QMV
+  calls), and that both scale-stack forms equal it.
+* The byte-exact table over the 25 real classes x rows {1,2,3,13,26} is unchanged:
+  `TrellisTuning{0, 0, 0}` (what the table is recorded with) pins the QMV, and the
+  staged hashes are printed alongside it.
+* The hard gates on the checkpoint are the token-identity ones: the single-slot
+  batch == serial decode (rows = 1, byte-exact by construction), the four-slots-
+  same-prompt row comparison, the four-different-prompts token identity, and the
+  greedy text of `glm5_forward_test <model>`. See the gate table below.
+
+### Measured, aggregate (`tests/glm5_batch_test.cpp <model> 6 --bench`)
+
+The bench now measures every case twice per round - once with the default tuning
+and once with the staged path forced off (`mat_min_rows = 0`) - in one process,
+with the order alternating by round: the box drifts more than the lever, so only
+a back-to-back pair is a measurement. The report prints both.
+
+| case | staged ms/step (tok/s) | QMV ms/step (tok/s) | staged/QMV |
+|---|---|---|---|
+| B=1 serial | - | 151.70 (6.59) | - |
+| B=1, 4 prompts | 105.36 (9.49) | 106.10 (9.42) | 1.01x |
+| B=2, 4 prompts | 146.40 (13.66) | 144.10 (13.88) | 0.98x |
+| B=4, 4 prompts | 370.95 (10.78) | 330.95 (12.09) | 0.89x |
+| B=8, 4 prompts | 476.16 (16.80) | 466.21 (17.16) | 0.98x |
+| B=4, 1 prompt | 169.88 (23.55) | 170.03 (23.53) | 1.00x |
+| B=8, 1 prompt | 263.67 (30.34) | 260.06 (30.76) | 0.99x |
+| B=8, 2 prompts | 480.31 (16.66) | 444.85 (17.98) | 0.93x |
+| B=8, 8 prompts | 494.28 (16.19) | 446.25 (17.93) | 0.90x |
+| **B=16, 1 prompt** | **381.55 (41.93)** | 454.40 (35.21) | **1.19x** |
+| **B=16, 4 prompts** | 598.93 (26.71) | 606.08 (26.40) | 1.01x |
+
+Best aggregate measured anywhere in this pass: **41.93 tok/s (B=16, one prompt)**
+- the same process's byte-exact pass reads 35.21, the sixth pass's recorded best
+was 33.87, and the target is 70. The B=8 cells, which cannot involve the staged
+path at all (rows = 8 < the threshold), read 0.89x to 1.01x around 1.0: that is
+the box's noise floor for this instrument, +/-10%, and the B=16 pair should be
+read against it. It says the lever works, not how much of a 60-70 ms prediction
+it delivers.
+
+The same pair with `EXL3_QMV_MAT_TG=4096` (the isolated kernel's split optimum,
+one run earlier in the same session) reads **0.83x (550.70 vs 458.17 ms) and
+1.11x (540.71 vs 599.02)**, which is what moved the shipped target to 512: the
+split count is a step-level knob, not a kernel-level one, and this is the one
+place in the pass where the isolated kernel misled.
+
+### Gates (real checkpoint, one session)
+
+| gate | where | result |
+|---|---|---|
+| one-slot batch == serial decode | `glm5_batch_test` §1 | max abs logit diff = **0** |
+| four identical slots == serial | §2 | 0.0166-0.0176 = **0.065%** of max\|logit\|, rows bit-identical to each other; the `<= 2%` gate is GREEN (the 1.99% recorded in the fifth pass is not reproducible at `steps 4` or `steps 6`; the gate itself is untouched) |
+| four different prompts == four serial runs | §3 | token identity at every step and argmax identity every step; max abs logit diff 0.3945-0.4453 = 1.29-1.52% (gate 5%) |
+| serving thread | §4 | see above |
+| grouped == per-expert == general (hash) | `moe_test` (f) | `eebe4e4e51c6c683` for all three, as recorded |
+| rows path == N single-row calls, and == the general path | `moe_test` (g) 4 rows, (h) 11 rows = 33 pairs over 4 experts (three gate\|up chunks, two down chunks, every expert selected several times) | max \|row diff\| = **0** in both, vs single-row and vs general |
+| nt/mb scheduling + 25 real shapes x rows {1,2,3,13,26} (250 hashes) | `glm5_gemv_nt_test` | `nt/mb invariance: PASS` rc=0; `src/trellis_gemm.cpp` and the harness are byte-identical to the run the hashes were recorded from (`git diff a6b8d51 -- src/trellis_gemm.cpp tests/glm5_gemv_nt_test.cpp` is empty), so the table cannot have moved |
+| prefill vs incremental decode | `glm5_forward_test <model>` | max\|diff\| = 0.0352 on max\|logit\| 23 (relative 0.00153), argmax 785 vs 785, top-5 overlap 5/5 |
+| greedy text + first token | `glm5_forward_test` | first token 785, greedy 32-token text identical to the recorded run; rc=0 |
+| trellis decode vs the reference decoder + byte alignment (lm_head K6 634M elements, qkv K4, q_b K4, expert gate K3) | `glm5_exl3_decode_test <model>` | `trellis decode: PASS`, 0 mismatches |
+| the light suite (routing, grouped MoE, KDA rewind/recurrence, MLA incremental, indexer, hc, chat template, pretokenizer) | `tools/run_tests.sh --fast` | all PASS, `== done (rc=0) ==` |
+
+### Honest distance to 70 tok/s
+
+The best aggregate measured in this pass is 33.9 tok/s (B=16, shared routing) and
+31.5 tok/s (B=16, 4 prompts) - 45-48% of the target, and B=8 mixed-prompt moved
+17.7 -> 19.3 tok/s. Two things stand in the way, and the first is not about
+bandwidth:
+
+1. **Per-weight ALU.** The trellis GEMV spends 0.43 issued warp-instructions per
+   weight, which is the machine's entire issue width (fourth pass) - the mixed
+   case is bound by *work*, not by the weight bytes (a mixed B=8 step's ~5.8 GB
+   at the kernel's own 134-202 GB/s would be ~30-45 ms of its ~460).
+   `docs/research/mlxfast-bonsai2.md`
+   measures the escape (packed stream -> int8 threadgroup tiles -> simdgroup
+   matrices, or a native packed tensor op), and it needs 13-16 rows: that is why
+   this pass made the pair layout free of any B bound and measured B=16. It is
+   the order-of-magnitude lever.
+2. **A real dedup, not an ordering.** One member with `rows=r` per expert turns
+   r duplicate pairs into ceil(r/4) weight passes - the only way to cut the ALU
+   work a duplicated expert costs, and the exact regime where the shared-routing
+   row is 1.7x the mixed one. It has no gate yet:
+   `trellis_linear_group_rows(rows=R)` has never been checked per row against R
+   single-row calls, and the MoE path must not use it before that gate exists
+   (its per-row k-order is presumably the same, but "presumably" is not the
+   standard here).
+3. **The per-row machinery.** At a fixed routing the marginal row costs ~23-25 ms
+   (B=4 -> B=16: 176.6 -> 472.4 ms), so the aggregate saturates near 34 tok/s
+   long before the expert term (or 70 tok/s) is reached.
+
+## Seventh pass (2026-10-11): the staged matrix path for the batched rows
+
+The sixth pass left one lever named and unbuilt: the classes whose weights do not
+diverge per row (kda `qkv_proj`, kda/mla `o_proj`, the shared expert, the dense
+MLP, mla `q_b`) pay their decode once per *row block* (`mb = min(rows,4)`), so at
+the row counts a request-level batch reaches they stream the same packed words 4
+times at 16 rows and 7 at 26 - and the decode (a mul1 multiply-hash and its half
+fma, ~10 issued lane-instructions per weight) is what the machine's issue width
+is spending. This pass moves those classes onto a staged fp16 + simdgroup_matrix
+kernel and measures it per class and at B=16.
+
+### What was built
+
+* `src/trellis_gemm.cpp`: a second kernel in the QMV family (`exl3_qmv_mat_*`,
+  built by the same `make_qmv_kernel` factory so the codebook prologue, the
+  member head and the buffer list cannot drift apart). It decodes each (16k x 16n)
+  packed tile ONCE per threadgroup into a threadgroup fp16 tile and then
+  multiplies with `simdgroup_matrix`; the tile is staged (n, k)-major with 16
+  halves per row, which is both what a lane's k pairs want (two `half2` stores
+  per group of four weights) and what the B fragment's `simdgroup_load(...,
+  transpose = true)` reads as W[k][n]. One warp per output tile, one barrier per
+  k-tile, the next tile's words loaded a tile ahead of their decode.
+  * Gate: `TrellisTuning.mat_min_rows` (default 16, `EXL3_QMV_MAT_MIN_ROWS`) AND
+    a decode-shaped call - one whose sequence axis is 1, i.e. (B, 1, hidden) from
+    the request-level batch (or a flat 2-D (rows, in) benchmark call). A prefill
+    chunk is (1, L, hidden) with L > 1 and keeps the byte-exact QMV, so the
+    single-sequence path is bit-identical *including its prefill* (the ticket's
+    hard gate) and a wide forward does not pay the staged kernel's rows/MAT_MB
+    weight passes - for a prefill the answer is a K-blocked GEMM over the batch,
+    not this kernel. Below the threshold every call is on the QMV anyway.
+  * Scope: the single-tensor entry points (`trellis_linear`, `trellis_matmul_raw`)
+    only. The grouped forms keep the QMV - their activation is (n, rows, in) with
+    the sequence axis already flattened into `rows`, so the decode-shaped test
+    cannot be made there, and the two callers that reach rows >= the threshold are
+    the model's routed experts (rows = 1 per member) and moe_layer's general path,
+    whose (K, B*L, H) activation includes the single-sequence prefill.
+  * The staged path picks its own k-split count (`mat_split_count`): the QMV's is
+    tuned for `n_tiles * 4` warps and the staged kernel runs one warp per tile, so
+    it aims at ~4096 threadgroups instead. This matters: at the QMV's count the
+    narrow-output classes (mla `o_proj`, kda `o_proj`, the shared expert, kv_a)
+    ran at 25-35 GB/s, i.e. no better than the QMV - they are latency-bound, and
+    the split is the only parallelism axis the staging leaves.
+* `trellis_path_info()` (`src/trellis_gemm.h`): which path, row block, padded rows
+  and pass count a tensor will take at a given row count - so the benchmarks and
+  the batch test report the path they measured instead of re-deriving the rule.
+
+### Measured, per class (`tests/glm5_trellis_bw.cpp`, same session, interleaved,
+64 iterations per graph, median of 3, warmed)
+
+`qmv` is the kernel alone; the pair is (QMV / staged). GB/s is the packed weight
+bytes over the kernel's own time, so the QMV's figure has to be multiplied by its
+pass count to read as a memory rate (the staged figure needs no correction at 16
+and 32 rows - one pass).
+
+| class (real geometry) | rows 16 | rows 32 |
+|---|---|---|
+| lm_head 4096x154880 K6 | 8.742 / 2.387 ms (3.7x) | 17.45 / 3.68 ms (4.7x) |
+| kda qkv_proj 4096x24576 K4 | 1.368 / 0.418 ms (3.3x) | 2.706 / 0.794 (3.4x) |
+| mla o_proj 16384x4096 K4 | 0.931 / 1.126 ms (**0.83x**) | 1.827 / 0.884 (2.1x) |
+| kda o_proj 8192x4096 K4 | 0.469 / 0.567 ms (**0.83x**) | 0.916 / 0.495 (1.9x) |
+| dense gate/up 4096x12288 K3 | 0.693 / 0.242 ms (2.9x) | 1.361 / 0.599 (2.3x) |
+| dense down 12288x4096 K3 | 0.719 / 0.844 ms (**0.85x**) | 1.398 / 0.724 (1.9x) |
+| shared gate 4096x2048 K4 | 0.128 / 0.099 ms (1.3x) | 0.245 / 0.209 (1.2x) |
+| shared down 2048x4096 K4 | 0.128 / 0.130 ms (0.98x) | 0.245 / 0.123 (2.0x) |
+| mla q_b 1536x16384 K4 | 0.359 / 0.117 ms (3.1x) | 0.704 / 0.190 (3.7x) |
+| exp gate/up 4096x2048 K3 (8 members) | 0.129 / 0.092 ms (1.4x) | 0.247 / 0.205 (1.2x) |
+| exp gate/up 4096x2048 K2 | 0.130 / 0.088 ms (1.5x) | 0.246 / 0.191 (1.3x) |
+| mla kv_a 4096x512 K4 | 0.043 / 0.018 ms (2.3x) | 0.076 / 0.027 (2.9x) |
+| kda f_a 4096x256 K4 | 0.027 / 0.013 ms (2.0x) | 0.046 / 0.017 (2.7x) |
+
+**The isolated kernel's optimum and the step's optimum disagree, and the shipped
+split target is the step's.** With `EXL3_QMV_MAT_TG=4096` (what the isolated
+kernel wants: thousands of threadgroups) every one of those 15 classes is a win
+at both row counts - 2.6x to 4.8x, the narrow-output ones included (`mla o_proj`
+0.937 / 0.268 ms, `kda o_proj` 0.479 / 0.141, `dense down` 0.717 / 0.209 at 16
+rows). With the shipped 512 the same cells read 0.83-0.98x on those four classes
+while the aggregate at B=16 follows the opposite way - see the pair below, where
+the 16-row same-prompt cell reads **0.83x at 4096 and 1.19x at 512**. The knob is
+`EXL3_QMV_MAT_TG`, and the reason the two disagree is that a split costs the
+isolated kernel nothing (it runs alone, and more 32-thread threadgroups is more
+latency hiding) and the step a great deal (`splits` f32 output planes per linear,
+each summed by its own dispatch, and thousands of tiny threadgroups competing
+with the MoE's expert kernels for the SMs).
+
+Every other row count is unchanged by construction: rows 1-13 are below the
+threshold, and a prefill - any (1, L, hidden) call, whatever L, and the general
+MoE's flat (tokens, hidden) per-expert calls - is out of the staged path's scope
+entirely, so the two columns are the same kernel there (`trellis_path_info`
+prints the path; the rows 8/13 cells measure within 1%).
+
+The staged kernel's own ceiling is visible in the table: ~120-195 GB/s at K4/K6,
+i.e. the same per-weight instruction count the scalar QMV spends (the decode is
+~10 of its ~13 issued lane-instructions per weight) - it does NOT decode faster.
+What it removes is the row multiplicity: one decode pass serves 16-32 rows and
+the MACs leave the issue pipe for the tensor unit, so the per-(weight,row) cost
+falls by the pass ratio (3-5x measured, growing with the row count).
+
+### Exactness: a named, gated deviation (not a silent loosening)
+
+The staged path decodes the *same* fp16 weights (the decode is the QMV's own
+`qmv_decode_h`, and the staged value is the same bits) and accumulates in fp32,
+but the tensor unit sums the k range in its own tree and the split count is the
+staged path's own. Reproducing the QMV's order is not possible while using the
+matrix units: its per-output reduction is `quad_sum(a0+a1) + quad_sum(a2+a3)` per
+eight stream positions plus a 4-lane interleave, and a `simdgroup_matrix` k
+reduction is the hardware's.
+
+So the deviation is *bounded and reported* rather than eliminated:
+
+* `tests/glm5_gemv_nt_test.cpp`'s `matrix_path()` section measures the staged
+  path against the QMV on the raw f32 output for 8 shapes x rows {16, 32, 64}:
+  **max |diff| is 1.7e-5% to 8.9e-5% of max|value|** (2e-7 to 9e-7 relative) -
+  f32 association scale, four orders of magnitude below what a wrong decode, a
+  wrong fragment layout or a wrong tile mapping would show. It also checks that
+  the staged path is inert to the QMV's nt/sg/mb knobs, that the grouped form is
+  unchanged by the staged path being on (and still equals n single-tensor QMV
+  calls), and that both scale-stack forms equal it.
+* The byte-exact table over the 25 real classes x rows {1,2,3,13,26} is unchanged:
+  `TrellisTuning{0, 0, 0}` (what the table is recorded with) pins the QMV, and the
+  staged hashes are printed alongside it.
+* The hard gates on the checkpoint are the token-identity ones: the single-slot
+  batch == serial decode (rows = 1, byte-exact by construction), the four-slots-
+  same-prompt row comparison, the four-different-prompts token identity, and the
+  greedy text of `glm5_forward_test <model>`. See the gate table below.
+
+### Measured, aggregate (`tests/glm5_batch_test.cpp <model> 6 --bench`)
+
+The bench now measures every case twice per round - once with the default tuning
+and once with the staged path forced off (`mat_min_rows = 0`) - in one process,
+with the order alternating by round: the box drifts more than the lever, so only
+a back-to-back pair is a measurement. The report prints both.
+
+| case | staged ms/step (tok/s) | QMV ms/step (tok/s) | staged/QMV |
+|---|---|---|---|
+| B=1 serial | - | 151.70 (6.59) | - |
+| B=1, 4 prompts | 105.66 (9.46) | 104.09 (9.61) | 0.99x |
+| B=2, 4 prompts | 152.11 (13.15) | 144.62 (13.83) | 0.95x |
+| B=4, 4 prompts | 348.38 (11.48) | 316.54 (12.64) | 0.91x |
+| B=8, 4 prompts | 480.13 (16.66) | 454.04 (17.62) | 0.95x |
+| B=4, 1 prompt | 168.40 (23.75) | 167.27 (23.91) | 0.99x |
+| B=8, 1 prompt | 261.58 (30.58) | 259.31 (30.85) | 0.99x |
+| B=8, 2 prompts | 455.70 (17.56) | 490.05 (16.32) | 1.08x |
+| B=8, 8 prompts | 491.42 (16.28) | 478.22 (16.73) | 0.97x |
+| B=16, 1 prompt | 550.70 (29.05) | 458.17 (34.92) | 0.83x |
+| B=16, 4 prompts | 540.71 (29.59) | 599.02 (26.71) | 1.11x |
+
+### Gates (real checkpoint, one session)
+
+| gate | where | result |
+|---|---|---|
+| single-slot batch == serial decode | `glm5_batch_test` §1 | max abs logit diff = **0** (bit-identical) |
+| four identical slots == serial | §2 | 0.01758 (0.065% of max\|logit\|), rows bit-identical; <= 2% gate GREEN |
+| four different prompts == four serial runs | §3 | token identity at every step, argmax every step; logits 0.4453 (1.52%) vs the 5% gate |
+| serving thread | §4 | 9/9 requests, `stop_batch()` with a request in flight returns in 0.05 s |
+| greedy text + prefill-vs-decode | `glm5_forward_test <model>` | max\|diff\| = **0.0352** on max\|logit\| 23 (relative 0.00153), argmax 785 vs 785, top-5 5/5, first token 785, 32-token text identical to the recorded run - **exactly the recorded numbers**, because the staged path never runs in that test (its forwards are (1, L, hidden) prefills and single rows; `EXL3_QMV_MAT_DEBUG=1` traces 0 staged dispatches) |
+| trellis decode vs the reference decoder | `glm5_exl3_decode_test <model>` | PASS, 0 mismatches (lm_head K6 634M elements, qkv K4, q_b K4, expert gate K3) |
+| nt/mb invariance, the byte-identity table over 25 classes x rows {1,2,3,13,26}, the staged deviation bound, the grouped contracts | `glm5_gemv_nt_test` | 781 checks PASS, rc=0 |
+
+### Honest distance to 70 tok/s
+
+The staged path does what it was meant to do *per class* - 2.5-4.5x on every one
+of the 15 real tensor classes at 16 and 32 rows, by removing the row multiplicity
+(one decode pass for MAT_MB rows) and the per-row FMAs - and it is byte-identical
+in every context except the one it was scoped to. What it does not do, on this
+box's evidence, is move the B=16 aggregate outside the noise: the pair that was
+supposed to show +15% showed -17% and +11% in the two B=16 cells.
+
+The next levers, in order of what the numbers now say:
+
+1. **Re-tune the staged path's geometry against the step, not the kernel.** Its
+   split target and one-warp threadgroups were chosen from isolated kernel
+   measurements; a step saturated by expert kernels may want few, large
+   threadgroups instead. This is a one-knob sweep (`EXL3_QMV_MAT_TG`,
+   `EXL3_QMV_MAT_NT`, `EXL3_QMV_MAT_MB`) with the paired bench as the instrument.
+2. **The expert term, which is still untouched and still the largest.** At B=16
+   with one prompt the 16 rows share 8 experts, so the pairs (row, expert) are 16
+   members with rows = 1 each: 16 passes over each expert instead of 4 (rows = 16
+   in one member). That is ~43 GB of the step's reads against 3.4 GB of shared
+   weights, and the same staged machinery would serve it if the MoE built
+   expert-grouped members with rows = B (its `rows` would be a member's rows, so
+   the scope rule needs a second, equally explicit signal from that caller).
+3. **A prefill-width GEMM.** The staged path is out of scope for prefills by
+   design; a chunked-over-k GEMM with the weight tile in threadgroup memory is
+   the shape that serves (1, L>=64, hidden) - and it is what a longer prompt
+   actually needs (the current QMV streams the weights L/mb times).

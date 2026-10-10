@@ -107,12 +107,58 @@ mx::array trellis_linear_group_rows_scaled(const std::vector<TrellisWeight>& ws,
 
 // Tuning knobs (also used by the CLI/benchmark): output tiles and simdgroups per
 // threadgroup, and rows per threadgroup block for batched prefill.
+//
+// The last two select the STAGED MATRIX path (src/trellis_gemm.cpp, "the staged
+// matrix path"): a linear whose row count is at least `mat_min_rows` decodes its
+// packed tiles once per threadgroup into a threadgroup fp16 tile and multiplies
+// with simdgroup_matrix, instead of decoding once per row block and FMAs on the
+// issue pipe. It exists for the batched forward (rows = sequences); below the
+// threshold - and for every single-sequence call - the byte-exact QMV runs.
+//
+// The staged path is additionally scoped to a DECODE-SHAPED call: a 3-D (or
+// higher) activation whose sequence axis is 1, which is what the request-level
+// batch passes ((B, 1, hidden)), and is what a benchmark passes to measure it. A
+// prefill keeps the byte-exact QMV on every one of its shapes - (1, L, hidden)
+// for the trunk, and the general MoE's per-expert path's flat (tokens, hidden) -
+// so the single-sequence path, its prefill included, is untouched, and a wide
+// forward does not pay the staged kernel's rows/MAT_MB weight passes.
+//
+// `mat_min_rows` is a row threshold: 0 (or negative) turns the staged path off
+// - which is the deliberate spelling of an explicit `TrellisTuning{0, 0, 0}`, so
+// a caller that pins the tuning pins the byte-exact kernel - and any positive
+// value is the row count at which the staged path takes over (the default, when
+// nothing is set, is EXL3_QMV_MAT_MIN_ROWS or 16). `mat_max_rows` > 0 caps it
+// (0 = no cap); it is the escape hatch for row counts that are a prefill chunk
+// rather than a batch.
+//
+// nt/sg/mb are QMV geometry knobs and are inert on the staged path (which has
+// its own row blocking, tile count and k-split count, so it keys its kernels
+// separately); EXL3_QMV_SPLITS overrides the split count of both paths.
 struct TrellisTuning {
-  int nt = 0;   // 0 = pick automatically
-  int sg = 0;   // 0 = pick automatically
-  int mb = 0;   // 0 = pick automatically
+  int nt = 0;           // 0 = pick automatically
+  int sg = 0;           // 0 = pick automatically
+  int mb = 0;           // 0 = pick automatically
+  int mat_min_rows = 0; // 0 = staged matrix path off; see above
+  int mat_max_rows = 0; // 0 = no upper row bound for the staged path
 };
 void trellis_set_tuning(const TrellisTuning& t);
 TrellisTuning trellis_get_tuning();
+
+// What the current tuning will do for one tensor at `rows` rows: which path runs
+// (the byte-exact QMV or the staged matrix kernel), the row block it uses, the
+// padded row count, and how many times a forward therefore streams the weight
+// bytes (pad_rows / rows_per_block, i.e. what a GB/s figure has to be multiplied
+// by to read as a memory rate). For the benchmarks, the CLI's dump, and any
+// caller that wants to know whether a shape is on the staged path without
+// re-deriving the rule.
+struct TrellisPathInfo {
+  bool staged;
+  int rows_per_block;
+  int pad_rows;
+  int passes;
+  int splits;
+  int tiles_per_threadgroup;
+};
+TrellisPathInfo trellis_path_info(const TrellisWeight& w, int rows);
 
 } // namespace exl3
