@@ -107,6 +107,73 @@ struct Shape {
     {"kda qkv     4096x24576  K4", 4096, 24576, 4},
 };
 
+// Every EXL3 tensor class the checkpoint's shard headers declare: 25 distinct
+// (in, out, K) triples over the text tower, the visual tower excluded (`h6` in
+// the model name is the last layer's K=6 set). The count column is how many
+// tensors of the checkpoint carry that class.
+struct RealShape {
+  const char* name;
+  int in, out, K, count;
+} kRealShapes[] = {
+    {"lm_head              4096x154880 K6", 4096, 154880, 6, 1},
+    {"kda qkv_proj          4096x24576  K4", 4096, 24576, 4, 34},
+    {"mla o_proj           16384x4096   K6", 16384, 4096, 6, 1},
+    {"mla o_proj           16384x4096   K4", 16384, 4096, 4, 11},
+    {"mtp eh_proj           8192x4096   K5", 8192, 4096, 5, 1},
+    {"dense down           12288x4096   K3", 12288, 4096, 3, 3},
+    {"dense gate/up         4096x12288  K3", 4096, 12288, 3, 6},
+    {"mla q_b               1536x16384  K6", 1536, 16384, 6, 1},
+    {"kda o_proj            8192x4096   K4", 8192, 4096, 4, 34},
+    {"mla q_b               1536x16384  K4", 1536, 16384, 4, 11},
+    {"shared down           2048x4096   K6", 2048, 4096, 6, 1},
+    {"shared gate/up        4096x2048   K6", 4096, 2048, 6, 2},
+    {"indexer wq_b          1536x4096   K6", 1536, 4096, 6, 1},
+    {"indexer wq_b          4096x1536   K6", 4096, 1536, 6, 1},
+    {"shared down           2048x4096   K4", 2048, 4096, 4, 330},
+    {"shared gate/up        4096x2048   K4", 4096, 2048, 4, 660},
+    {"exp down              2048x4096   K3", 2048, 4096, 3, 5760},
+    {"exp gate/up           4096x2048   K3", 4096, 2048, 3, 11520},
+    {"indexer wq_b          1536x4096   K4", 1536, 4096, 4, 11},
+    {"indexer wq_b          4096x1536   K4", 4096, 1536, 4, 11},
+    {"exp down              2048x4096   K2", 2048, 4096, 2, 6336},
+    {"exp gate/up           4096x2048   K2", 4096, 2048, 2, 12672},
+    {"mla kv_a              4096x512    K6", 4096, 512, 6, 1},
+    {"mla kv_a              4096x512    K5", 4096, 512, 5, 2},
+    {"mla kv_a              4096x512    K4", 4096, 512, 4, 9},
+};
+
+static uint64_t fnv1a(const std::vector<char>& b) {
+  uint64_t h = 1469598103934665603ull;
+  for (unsigned char c : b) {
+    h ^= c;
+    h *= 1099511628211ull;
+  }
+  return h;
+}
+
+// The byte-identity table: for every real tensor class and row count, the hash
+// of the raw QMV output and of the whole trellis_linear. Two builds of this
+// file must print the same table; that is the "no output byte moved" gate for
+// the geometry rule (the per-config sweep above is the same claim at a finer
+// grain, and moe_test.cpp's grouped == per-expert == general is the gate for
+// the grouped launch).
+static void hash_table() {
+  std::printf("=== kernel output hashes over the real tensor classes x rows ===\n");
+  for (auto& sh : kRealShapes) {
+    exl3::TrellisWeight tw = make_trellis(sh.in, sh.out, sh.K, 13u * sh.in + sh.out);
+    for (int rows : {1, 2, 3, 13, 26}) {
+      mx::array x = rand_f16(rows, sh.in, 3u * rows + sh.out);
+      mx::array xhat = rand_f16(rows, sh.in, 5u * rows + sh.out);
+      exl3::trellis_set_tuning(exl3::TrellisTuning{0, 0, 0});
+      const uint64_t h_raw = fnv1a(bytes_of(exl3::trellis_matmul_raw(tw, xhat)));
+      const uint64_t h_lin = fnv1a(bytes_of(exl3::trellis_linear(tw, x)));
+      std::printf("hash %-32s rows %2d x%5d raw %016llx lin %016llx\n", sh.name, rows, sh.count,
+                  (unsigned long long)h_raw, (unsigned long long)h_lin);
+      std::fflush(stdout);
+    }
+  }
+}
+
 int main() {
   std::printf("=== trellis GEMV: nt/mb scheduling must not move a byte ===\n");
   for (auto& sh : kShapes) {
@@ -168,5 +235,6 @@ int main() {
     }
   }
   std::printf("trellis GEMV nt/mb invariance: %s\n", g_fail ? "FAIL" : "PASS");
+  hash_table();
   return g_fail ? 1 : 0;
 }
