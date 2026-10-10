@@ -295,10 +295,29 @@ index_scores.masked_fill(~valid_candidates, min)            # then top-k over po
                                                             # expanded back to token ids
 ```
 
-Still to read in the reference before implementing: `get_pooled_states` (how
-`index_kpool_compress_ape` (4, 128) and the gate enter the in-pool reduction),
-`get_visible_tokens`, the top-k + tail-pool expansion (`index_kpool_always_select_tail`),
-and the cache update `update_indexer`. The returned indices are int32 (B, S, topk)
+Pooling and visibility (both verified verbatim):
+
+```
+# get_pooled_states (935): pooling starts at the FIRST VALID token, not slot 0
+first_key  = first valid position per row (seq_len if none)
+pool_off   = arange(n_pools * 4).view(n_pools, 4)          # n_pools = ceil(seq_len / 4)
+pool_idx   = first_key[:, None, None] + pool_off           # [P,P,A,B,C,D..] behaves as [A,B,C,D..]
+safe       = pool_idx.clamp(0, seq_len - 1)
+gv         = valid[safe] & (pool_idx < seq_len)
+pool_valid = gv.all(-1)                                    # a pool needs ALL 4 slots valid
+logits     = gate_scores[safe] + index_kpool_compress_ape   # ape is (4, 128): per-slot, per-dim
+logits[~gv] = -inf
+probs      = nan_to_num(softmax(logits, dim=2))             # over the 4 slots, per dim
+pool_keys  = (probs * keys[safe]).sum(dim=2)                # per-dim weighted average
+pool_idx   = pool_idx.masked_fill(~gv, -1)
+
+# get_visible_tokens (915)
+q_pos    = current_length - q_length + arange(q_length)     # absolute query positions
+visible  = (kv_positions[None,None,:] <= q_pos[None,:,None]) & valid_keys[:,None,:]
+```
+
+Remaining to read before implementing: the top-k + tail-pool expansion
+(`index_kpool_always_select_tail`) and the cache update `update_indexer`. The returned indices are int32 (B, S, topk)
 with `-1` meaning invalid, which is exactly what `mla_layer`'s mask builder consumes.
 
 ## MoE (verified from Glm5NextTextMLP / Experts / TopkRouter)
