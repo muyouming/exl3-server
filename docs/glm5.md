@@ -117,6 +117,36 @@ carry `linear_attn.*` instead of `self_attn.*` with `q_proj`, `k_proj`, `v_proj`
 `forget_gate.{f_a_proj,f_b_proj,dt_bias,A_log}` (names to confirm against a
 completed shard containing a KDA layer).
 
+## Tokenizer (verified from the checkpoint's tokenizer.json)
+
+BPE, vocab 154820 + 36 added tokens, decoder ByteLevel. Special ids:
+
+```
+154820 <|endoftext|>   154821 [MASK]      154822 [gMASK]     154823 [sMASK]
+154824 <sop>           154825 <eop>       154826 <|system|>  154827 <|user|>
+154828 <|assistant|>   154829 <|observation|>                154841 <think> 154842 </think>
+154843 <tool_call>     154844 </tool_call> 154845 <tool_response> 154846 </tool_response>
+154847 <arg_key> ...   (image/video/audio and code-fence markers in between)
+```
+
+`eos_token_id` = `[154820, 154827, 154829]` (end-of-text, user, observation) per the config.
+
+Pre-tokenizer chain (single stage, unlike the MiniCPM5 checkpoint):
+
+```
+0  Split(Regex "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}|
+           ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+", Isolated)
+1  ByteLevel(add_prefix_space=false, use_regex=false)
+```
+
+**Required engine change**: `Tokenizer::encode` currently hardcodes the two-stage
+split used by MiniCPM5 (a separate `\p{N}{1,3}` stage followed by the word regex).
+GLM collapses that into one alternation in a single Split stage, so the tokenizer
+must interpret the `pre_tokenizer` chain from `tokenizer.json` (Split with the
+given regex + ByteLevel, in order) instead of hardcoding the stage layout. The
+GPT-4 alternation itself - including the `\p{N}{1,3}` branch - is already
+implemented in the matcher, so this is a plumbing change, not new regex work.
+
 ## Chat template (from the checkpoint's `chat_template.jinja`)
 
 `[gMASK]<sop>` prompt prefix, `<|system|>Reasoning Effort: {Low|High|Max}` for a
