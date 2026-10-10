@@ -116,7 +116,8 @@ mx::array g5_hc_mix(const mx::array& block_out, const mx::array& post,
                     const mx::array& comb, const mx::array& residual);
 
 // Expands a [..., D] tensor into `mult` identical streams [..., mult, D]
-// (model level, reference 1493).
+// (model level, reference 1493; materialised, like the reference's
+// `.expand(-1,-1,N,-1).contiguous()`).
 mx::array g5_hc_expand(const mx::array& x, int mult);
 
 // Final unweighted collapse of the streams: mean over the stream axis

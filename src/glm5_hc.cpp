@@ -109,7 +109,8 @@ mx::array g5_hc_expand(const mx::array& x, int mult) {
   for (int i = 0; i + 1 < (int)shp.size(); ++i) target.push_back(shp[i]);
   target.push_back(mult); // ..., mult, D
   target.push_back(shp[shp.size() - 1]);
-  return mx::broadcast_to(mx::expand_dims(x, -2), target);
+  // materialised, like the reference's `.expand(...).contiguous()` (1493)
+  return mx::contiguous(mx::broadcast_to(mx::expand_dims(x, -2), target));
 }
 
 mx::array g5_hc_head(const mx::array& streams) {

@@ -39,6 +39,8 @@ add_executable(exl3-server
   src/glm5.cpp
   src/glm5_kda.cpp
   src/glm5_attn.cpp
+  src/glm5_hc.cpp
+  src/glm5_moe.cpp
   src/model.cpp
   src/tokenizer.cpp
   src/engine.cpp
