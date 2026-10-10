@@ -71,11 +71,6 @@ int main() {
     maxdiff = std::max(maxdiff, std::fabs(a - b));
     if (std::fabs(a - b) > 2e-3) bad++;
   }
-  {
-    const float* pr = pre.data<float>();
-    double md0 = 0, md2 = 0;
-    for (int j = 0; j < 2 * Hd; ++j) md0 = std::max(md0, std::fabs((double)f[j] - (double)pr[j]));
-    for (int j = 0; j < 2 * Hd; ++j) md2 = std::max(md2, std::fabs((double)f[2 * Hd + j] - (double)pr[2 * Hd + j]));
   std::printf("MLA prefill-vs-incremental: max|diff| = %.3g, mismatches = %d / %d, non-finite = %d\n",
               maxdiff, bad, Hd, nan);
   return bad == 0 && nan == 0 ? 0 : 1;
