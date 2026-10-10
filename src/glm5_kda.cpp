@@ -1,5 +1,6 @@
 #include "glm5_kda.h"
 
+#include <algorithm>
 #include <cmath>
 
 #include "util.h"
@@ -13,32 +14,41 @@ mx::array kda_l2norm(const mx::array& x, float eps) {
   return mx::multiply(xf, inv);
 }
 
-mx::array kda_decay(const mx::array& fg, const mx::array& dt_bias, const mx::array& a_log) {
-  mx::array g = mx::add(mx::astype(fg, mx::float32), mx::reshape(mx::astype(dt_bias, mx::float32),
-                                                                {1, 1, -1}));
+mx::array kda_decay(const mx::array& fg, const mx::array& dt_bias, const mx::array& a_log,
+                    float bound) {
+  const int H = (int)a_log.size();
+  mx::array g = mx::add(mx::astype(fg, mx::float32),
+                        mx::reshape(mx::astype(dt_bias, mx::float32), {1, 1, H, -1}));
+  mx::array rate = mx::reshape(mx::astype(a_log, mx::float32), {1, 1, H, 1});
+  if (bound != 0.0f) {
+    // fla's USE_LOWER_BOUND arm (config `linear_attn_config.gate_lower_bound`):
+    // g = bound * sigmoid(exp(A_log) * (fg + dt_bias)), decay in (exp(bound), 1).
+    return mx::multiply(mx::sigmoid(mx::multiply(mx::exp(rate), g)),
+                        mx::array(bound, mx::float32));
+  }
   // softplus with the reference's overflow guard: softplus(x) = x for x > 20
   mx::array sp = mx::where(mx::greater(g, mx::array(20.0f, mx::float32)),
                            g, mx::log(mx::add(mx::exp(g), mx::array(1.0f, mx::float32))));
-  mx::array decay = mx::exp(mx::reshape(mx::astype(a_log, mx::float32), {1, 1, -1}));
-  return mx::negative(mx::multiply(decay, sp));
+  return mx::negative(mx::multiply(mx::exp(rate), sp));
 }
 
 mx::array kda_conv1d(const mx::array& x, const mx::array& w, const mx::array& b) {
   // x (B, L, C); convolve over L with a depthwise kernel (C, k)
-  const int L = (int)x.shape(1), C = (int)x.shape(2);
+  const int B = (int)x.shape(0), L = (int)x.shape(1), C = (int)x.shape(2);
   const int k = (int)w.shape(w.ndim() - 1);
   mx::array x32 = mx::astype(x, mx::float32);
   std::vector<mx::array> taps;
   taps.reserve((size_t)k);
   for (int t = 0; t < k; ++t) {
-    // x shifted so that tap t multiplies x[i - (k-1-t)]
+    // x shifted so that tap t multiplies x[i - (k-1-t)]; the missing left
+    // context is zero - also when the whole sequence is shorter than k.
     const int shift = k - 1 - t;
-    mx::array shifted = mx::zeros(mx::Shape{1, 1, C}, mx::float32);
+    mx::array shifted = mx::zeros(mx::Shape{B, L, C}, mx::float32);
     if (shift == 0) {
       shifted = x32;
-    } else {
-      mx::array head = mx::zeros(mx::Shape{1, shift, C}, mx::float32);
-      mx::array body = mx::slice(x32, {0, 0, 0}, {(int)x.shape(0), L - shift, C});
+    } else if (shift < L) {
+      mx::array head = mx::zeros(mx::Shape{B, shift, C}, mx::float32);
+      mx::array body = mx::slice(x32, {0, 0, 0}, {B, L - shift, C});
       shifted = mx::concatenate({head, body}, 1);
     }
     mx::array wc = mx::astype(mx::reshape(w, {C, k}), mx::float32);
@@ -47,7 +57,9 @@ mx::array kda_conv1d(const mx::array& x, const mx::array& w, const mx::array& b)
   }
   mx::array acc = taps[0];
   for (size_t i = 1; i < taps.size(); ++i) acc = mx::add(acc, taps[i]);
-  if (b.size() > 0) acc = mx::add(acc, mx::reshape(mx::astype(b, mx::float32), {1, 1, C}));
+  if (b.size() == (size_t)C) {
+    acc = mx::add(acc, mx::reshape(mx::astype(b, mx::float32), {1, 1, C}));
+  }
   // SiLU
   return mx::multiply(acc, mx::sigmoid(acc));
 }
@@ -85,8 +97,11 @@ mx::array kda_recurrence(const mx::array& q, const mx::array& k, const mx::array
     outs.push_back(mx::sum(mx::multiply(S, mx::expand_dims(q_i, -1)), std::vector<int>{-2}, false));
   }
   if (state) *state = S;
-  mx::array out = outs[0];
-  for (size_t i = 1; i < outs.size(); ++i) out = mx::concatenate({out, outs[i]}, 1);
+  // Each step's read-out is (B, H, vd); the sequence axis is added here so a
+  // single-step call is still (B, 1, H, vd) like every other shape in the layer.
+  mx::array out = mx::expand_dims(outs[0], 1);
+  for (size_t i = 1; i < outs.size(); ++i)
+    out = mx::concatenate({out, mx::expand_dims(outs[i], 1)}, 1);
   return out;
 }
 
@@ -107,38 +122,44 @@ mx::array g5_linear(const G5Linear& lin, const mx::array& x) {
 
 mx::array kda_layer(const G5Layer& l, const ModelConfig& cfg, const mx::array& h, KdaState& state) {
   const int B = (int)h.shape(0), L = (int)h.shape(1);
-  const int H = cfg.layer_plan.empty() ? 0 : (l.kda_q.out_features / 128);
-  const int kd = 128;
-  // 1) q,k,v projections and the causal conv over their concatenation
-  mx::array mixed = mx::concatenate(
-      {g5_linear(l.kda_q, h), g5_linear(l.kda_k, h), g5_linear(l.kda_v, h)}, -1); // (B,L,3*H*kd)
+  const int H = l.kda_heads, kd = l.kda_head_dim, qkv = H * kd;
+  // 1) ONE fused q|k|v projection (the checkpoint stores them concatenated as
+  //    q | k | v) and the causal conv over that concatenation.
+  mx::array mixed = g5_linear(l.kda_qkv, h); // (B, L, 3*H*kd)
   const int C = (int)mixed.shape(2);
   const int klen = (int)l.conv1d_w.shape(l.conv1d_w.ndim() - 1);
   mx::array conv_in = mixed;
   if (state.conv_window.size() > 1) {
     conv_in = mx::concatenate({state.conv_window, mx::astype(mixed, mx::float32)}, 1);
   }
+  // Rolling window of the last klen-1 columns (a shorter prefill leaves a
+  // shorter window; exact decode needs at least klen-1 prefilled tokens).
+  const int wlen = std::min(klen - 1, (int)conv_in.shape(1));
   state.conv_window =
-      mx::slice(conv_in, {0, (int)conv_in.shape(1) - (klen - 1), 0}, {B, (int)conv_in.shape(1), C});
-  mx::array conved = mx::astype(kda_conv1d(conv_in, l.conv1d_w, l.conv1d_b), mixed.dtype());
+      mx::slice(conv_in, {0, (int)conv_in.shape(1) - wlen, 0}, {B, (int)conv_in.shape(1), C});
+  mx::array conved = mx::astype(
+      kda_conv1d(conv_in, l.conv1d_w, l.conv1d_has_bias ? l.conv1d_b : mx::array(0.0f)),
+      mixed.dtype());
   conved = mx::slice(conved, {0, (int)conved.shape(1) - L, 0}, {B, (int)conved.shape(1), C});
-  const int qkv = H * kd;
   auto part = [&](int which) {
     return mx::reshape(mx::slice(conved, {0, 0, which * qkv}, {B, L, (which + 1) * qkv}),
                        {B, L, H, kd});
   };
   mx::array q = part(0), k = part(1), v = part(2);
-  // 2) forget-gate decay and beta
-  mx::array fg = g5_linear(l.kda_f_b, g5_linear(l.kda_f_a, h)); // (B,L,H*kd)
-  mx::array g = mx::reshape(
-      kda_decay(fg, l.dt_bias, l.a_log), {B, L, H, kd});         // per (head,dim) decay
-  mx::array beta = mx::reshape(mx::astype(g5_linear(l.kda_b, h), mx::float32), {B, L, H, 1});
+  // 2) forget-gate decay (per head,dim) and beta = sigmoid(b_proj(h)) (per head)
+  mx::array fg = mx::reshape(g5_linear(l.kda_f_b, g5_linear(l.kda_f_a, h)), {B, L, H, kd});
+  mx::array g = kda_decay(fg, l.dt_bias, l.a_log, l.kda_gate_lower_bound);
+  mx::array beta =
+      mx::reshape(mx::astype(mx::sigmoid(g5_linear(l.kda_b, h)), mx::float32), {B, L, H, 1});
   // 3) delta-rule recurrence
   mx::array core = kda_recurrence(q, k, v, g, beta, &state.recurrent); // (B,L,H,kd)
-  // 4) output gate and projection
+  // 4) output gate and projection (gated norm eps = rms_norm_eps, per the reference)
   mx::array gate = mx::reshape(g5_linear(l.kda_g_b, g5_linear(l.kda_g_a, h)), {B, L, H, kd});
-  mx::array out = rms_norm_gated(core, l.o_norm, gate, 1e-6f);
-  return g5_linear(l.kda_o, mx::reshape(out, {B, L, H * kd}));
+  mx::array out = rms_norm_gated(core, l.o_norm, gate, cfg.rms_norm_eps);
+  // The reference's RMSNormGated returns to the input dtype (`x.to(input_dtype)`),
+  // and the EXL3 o_proj only takes fp16 activations.
+  out = mx::astype(out, h.dtype());
+  return g5_linear(l.kda_o, mx::reshape(out, {B, L, qkv}));
 }
 
 } // namespace exl3

@@ -10,10 +10,15 @@
 namespace exl3 {
 
 mx::array rms_norm(const mx::array& x, const mx::array& weight, float eps) {
+  // Glm5NextTextRMSNorm: fp32 math, then back to the input dtype (the reference
+  // returns `weight * hidden_states.to(input_dtype)`), which is also what the
+  // fp16-only EXL3 projections downstream expect.
+  const mx::Dtype dt = x.dtype();
   mx::array xf = mx::astype(x, mx::float32);
   mx::array var = mx::mean(mx::multiply(xf, xf), std::vector<int>{-1}, true);
   mx::array y = mx::multiply(xf, mx::rsqrt(mx::add(var, mx::array(eps, mx::float32))));
-  return mx::multiply(y, mx::astype(weight, mx::float32));
+  y = mx::multiply(mx::astype(y, dt), mx::astype(weight, dt));
+  return y;
 }
 
 mx::array layer_norm(const mx::array& x, const mx::array& weight, const mx::array& bias, float eps) {
@@ -131,15 +136,21 @@ mx::array indexer_select(const IndexerPools& pl, const std::vector<char>& visibl
       }
     }
     if (!tail_w) continue;
-    // the current incomplete pool: visible tokens past the last COMPLETE pool
-    // (the pool count includes the partial one, but only complete pools can be
-    // selected, so the tail is what remains after floor((Ltot-first)/kp)*kp)
+    // The row's current incomplete pool (reference `append_visible_tail`, 1010):
+    // visible_count = the row's visible key count, tail_count = visible_count % kp,
+    // tail_start = first_key + visible_count - tail_count, so query rows earlier
+    // than the first full pool still select their own (short) tail.
+    int visible_count = 0;
+    for (int t = 0; t < Ltot; ++t)
+      if (visible[(size_t)l * Ltot + t]) ++visible_count;
+    if (visible_count == 0) continue;
     const int first = pl.indices.empty() ? 0 : std::max(0, pl.indices[0]);
-    const int n_full = std::max(0, (Ltot - first) / kp);
-    const int covered = first + n_full * kp;
-    for (int t = covered; t < Ltot && w < width; ++t) {
-      if (!visible[(size_t)l * Ltot + t]) continue;
-      out[(size_t)l * width + w++] = t;
+    const int tail_count = visible_count % kp;
+    const int tail_start = first + visible_count - tail_count;
+    for (int j = 0; j < tail_w; ++j) {
+      if (j >= tail_count || w >= width) break;
+      const int t = tail_start + j;
+      if (t >= 0 && t < Ltot && visible[(size_t)l * Ltot + t]) out[(size_t)l * width + w++] = t;
     }
   }
   auto* h = new std::vector<int32_t>(std::move(out));
@@ -156,12 +167,10 @@ mx::array indexer_topk(const G5Layer& l, const ModelConfig& cfg, const mx::array
   const int B = (int)h.shape(0), L = (int)h.shape(1);
   if (B != 1) throw std::runtime_error("GLM indexer implemented for batch 1");
   const int Nh = cfg.index_n_heads;                                  // 32
-  const int D = (int)l.idx_wk.shape(0);                              // 128
+  const int D = (int)l.idx_wk.shape(1); // index_head_dim; idx_wk is (in, out) = the loader's layout
   const int kp = cfg.index_kpool;                                    // 4
-  // raw indexer weights are stored (out, in) on disk
-  auto proj = [](const mx::array& w, const mx::array& x) {
-    return mx::matmul(x, mx::transpose(w));
-  };
+  // The loader already transposes the raw (out, in) indexer weights to (in, out).
+  auto proj = [](const mx::array& w, const mx::array& x) { return mx::matmul(x, w); };
   mx::array q = mx::reshape(g5_linear(l.idx_wq_b, q_resid), {L, Nh, D});
   mx::array key = layer_norm(proj(l.idx_wk, h), l.idx_k_norm_w, l.idx_k_norm_b);
   mx::array gate = proj(l.idx_gate, h);

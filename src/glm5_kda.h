@@ -14,13 +14,18 @@ namespace mx = mlx::core;
 // l2norm(x) = x / sqrt(sum(x^2) + eps)   (reference l2norm, NOT F.normalize)
 mx::array kda_l2norm(const mx::array& x, float eps = 1e-6f);
 
-// forget-gate decay: -exp(A_log) * softplus(fg + dt_bias)
-//   fg      (B, L, heads * head_dim)
-//   dt_bias (heads * head_dim)   a_log (heads)
-mx::array kda_decay(const mx::array& fg, const mx::array& dt_bias, const mx::array& a_log);
+// Forget-gate log-decay (the value the recurrence exponentiates), fp32:
+//   bound == 0: -exp(A_log) * softplus(fg + dt_bias)              (softplus arm)
+//   bound != 0:  bound * sigmoid(exp(A_log) * (fg + dt_bias))     (fla USE_LOWER_BOUND)
+// `linear_attn_config.gate_lower_bound` selects the arm; this checkpoint sets
+// -5.0, so the bounded sigmoid replaces the softplus rather than clamping it.
+//   fg      (B, L, heads, head_dim)   dt_bias (heads * head_dim)   a_log (heads)
+mx::array kda_decay(const mx::array& fg, const mx::array& dt_bias, const mx::array& a_log,
+                    float bound = 0.0f);
 
 // Depthwise causal conv1d over the sequence axis, kernel `k`, SiLU activation.
-//   x (B, L, C), w (C, 1, k) or (C, k), b (C) optional
+//   x (B, L, C), w (C, 1, k) or (C, k), b (C) optional (ignored when it does not
+//   have exactly C elements, i.e. when the checkpoint stores no conv bias)
 mx::array kda_conv1d(const mx::array& x, const mx::array& w, const mx::array& b);
 
 // Delta-rule recurrence (recurrent_kimi_delta_attention), all math in fp32:
@@ -45,9 +50,10 @@ struct KdaState {
 // Apply one linear (EXL3 trellis or plain f16 weight) to x.
 mx::array g5_linear(const G5Linear& lin, const mx::array& x);
 
-// One full KDA layer (Glm5NextTextLinearAttention.forward): conv1d over
-// concat(q,k,v) with rolling state, forget-gate decay, delta-rule recurrence,
-// gated output norm and the output projection. h is (B, L, hidden).
+// One full KDA layer (Glm5NextTextLinearAttention.forward): ONE fused q|k|v
+// projection (`kda_qkv`, sliced q | k | v in that order), the causal conv1d over
+// that concatenation with rolling state, the forget-gate decay, the delta-rule
+// recurrence, the gated output norm and the output projection. h is (B, L, hidden).
 mx::array kda_layer(const G5Layer& l, const ModelConfig& cfg, const mx::array& h, KdaState& state);
 
 } // namespace exl3

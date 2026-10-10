@@ -395,8 +395,11 @@ mx::array trellis_linear(const TrellisWeight& w, const mx::array& x) {
   if (rows * in != (int64_t)x.size()) {
     throw std::invalid_argument("trellis_linear: input feature size mismatch");
   }
+  // The kernels work on a flat (rows, in) view; any leading dimensions of x are
+  // restored on the way out (mx::matmul semantics).
+  mx::array x2 = x.ndim() == 2 ? x : mx::reshape(x, {(int)rows, in});
   // xhat = ((x . suh) H128 / sqrt(128)), one fused kernel, shapes preserved.
-  mx::array xhat = hadamard_scale(x, w.suh, in / 128, /*pre=*/true);
+  mx::array xhat = hadamard_scale(x2, w.suh, in / 128, /*pre=*/true);
 
   // yhat = xhat @ W_hat, split rows padded so the kernel needs no row bound.
   const int k_tiles = in / 16;
@@ -440,7 +443,16 @@ mx::array trellis_linear(const TrellisWeight& w, const mx::array& x) {
   if (pad_rows > rows) y = mx::slice(y, {0, 0}, {(int)rows, out});
   // y = (yhat H128 / sqrt(128)) . svh
   y = mx::astype(y, mx::float16);
-  return hadamard_scale(y, w.svh, out / 128, /*pre=*/false);
+  y = hadamard_scale(y, w.svh, out / 128, /*pre=*/false);
+  // Rows above were flattened to x.size()/in, so restore x's leading dimensions
+  // with the feature dim replaced by `out` (mx::matmul semantics) - a no-op for
+  // the 2-D callers, and what the 3-D ones (KDA/MLA activations) need.
+  if (x.ndim() != 2) {
+    mx::Shape yshape(x.shape().begin(), x.shape().end());
+    yshape[yshape.size() - 1] = out;
+    y = mx::reshape(y, yshape);
+  }
+  return y;
 }
 
 } // namespace exl3

@@ -1,9 +1,19 @@
 #include "glm5.h"
 
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <climits>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <map>
+#include <memory>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "fp16.h"
 #include "nlohmann/json.hpp"
@@ -16,10 +26,48 @@ namespace {
 
 namespace fs = std::filesystem;
 
+// ---------------------------------------------------------------------------
+// Zero-copy plumbing
+// ---------------------------------------------------------------------------
+
+// A private, writable mapping of a file range. It is kept alive by the MLX
+// arrays that view it (each array's deleter owns a shared_ptr to it), so the
+// pages are unmapped only once the last view is gone. PROT_WRITE + MAP_PRIVATE
+// means MLX never sees a read-only mapping (see the "MLX pitfalls" note in
+// glm5.h) and a hypothetical write would land in a private copy of the page,
+// never in the checkpoint.
+struct Mapping {
+  void* base = nullptr;
+  size_t len = 0;
+  ~Mapping() {
+    if (base) ::munmap(base, len);
+  }
+};
+
+int64_t page_bytes() {
+  static const int64_t p = [] {
+    long v = ::sysconf(_SC_PAGESIZE);
+    return v > 0 ? (int64_t)v : (int64_t)16384;
+  }();
+  return p;
+}
+
 struct Store {
-  std::vector<SafetensorsFile> files;
+  std::vector<SafetensorsFile> files; // header + mapping used for addressing
+  std::vector<int> fds;               // O_RDONLY fds, used to create views
   std::unordered_map<std::string, int> where;
-  int64_t bytes = 0;
+  int64_t bytes = 0; // total bytes mapped across all shards
+  float gate_lower_bound = 0.0f; // linear_attn_config.gate_lower_bound
+
+  // Accounting: which tensors were consumed, and how many bytes they hold.
+  mutable std::unordered_set<std::string> used;
+  mutable int64_t used_tensors = 0;
+  mutable int64_t used_bytes = 0;
+
+  ~Store() {
+    for (int fd : fds)
+      if (fd >= 0) ::close(fd);
+  }
 
   bool open(const std::string& dir, std::string& err) {
     std::vector<std::string> shards;
@@ -40,6 +88,12 @@ struct Store {
       bytes += f.map_size;
       int idx = (int)files.size();
       for (auto& [name, t] : f.tensors) where.emplace(name, idx);
+      int fd = ::open(s.c_str(), O_RDONLY);
+      if (fd < 0) {
+        err = "cannot open " + s;
+        return false;
+      }
+      fds.push_back(fd);
       files.push_back(std::move(f));
     }
     return true;
@@ -50,10 +104,95 @@ struct Store {
     return it == where.end() ? nullptr : &files[(size_t)it->second];
   }
 
+  int shard_of(const std::string& name) const {
+    auto it = where.find(name);
+    return it == where.end() ? -1 : it->second;
+  }
+
   bool has(const std::string& name) const { return where.count(name) != 0; }
+
+  // Records a consumed tensor (and its byte count).
+  void mark(const std::string& name) const {
+    if (!used.insert(name).second) return;
+    const SafetensorsFile* f = file_for(name);
+    if (!f) return;
+    ++used_tensors;
+    used_bytes += f->tensor(name).nbytes;
+  }
 };
 
-// Loads any tensor as f16 or f32 in (in, out) order for 2-D tensors.
+// Wraps [off, off + n) of shard `fi` in a single uint8 MLX array. The mapping
+// is page aligned (required for MLX's no-copy path: a foreign pointer that is
+// not page aligned is copied into a Metal buffer instead) and padded up to a
+// page, which is why the caller slices the tensor out of it.
+bool map_range(const Store& st, int fi, int64_t off, int64_t n, mx::array& out, std::string& err) {
+  const int64_t page = page_bytes();
+  const int64_t start = off - (off % page);
+  const int64_t end = ((off + n + page - 1) / page) * page;
+  const int64_t len = end - start;
+  if (len <= 0 || len > (int64_t)INT_MAX) {
+    err = "range too large for a zero-copy view";
+    return false;
+  }
+  auto mp = std::make_shared<Mapping>();
+  void* base = ::mmap(nullptr, (size_t)len, PROT_READ | PROT_WRITE, MAP_PRIVATE, st.fds[(size_t)fi],
+                      (off_t)start);
+  if (base == MAP_FAILED) {
+    err = "mmap failed for " + st.files[(size_t)fi].path;
+    return false;
+  }
+  mp->base = base;
+  mp->len = (size_t)len;
+  // The deleter owns the mapping: MLX runs it when the last array (and every
+  // view that shares the buffer) is destroyed.
+  out = mx::array(base, mx::Shape{(int)len}, mx::uint8, [mp](void*) {});
+  return true;
+}
+
+// Zero-copy typed view of a tensor: (in, out) is not applied here, the caller
+// passes the target dtype and shape, whose byte size must match the tensor.
+bool tensor_view(const Store& st, const std::string& name, mx::Dtype dt, const mx::Shape& shape,
+                 mx::array& out, std::string& err) {
+  const int fi = st.shard_of(name);
+  if (fi < 0) {
+    err = "missing tensor " + name;
+    return false;
+  }
+  const SafetensorsFile& f = st.files[(size_t)fi];
+  const STTensor& info = f.tensor(name);
+  const int64_t off = f.header_len + info.offset;
+  int64_t numel = 1;
+  for (auto d : info.shape) numel *= d;
+  if (numel <= 0 || info.nbytes % numel != 0) {
+    err = "unsupported byte layout for " + name;
+    return false;
+  }
+  const int64_t align = info.nbytes / numel; // 2 for f16, 4 for f32/u32
+  if (info.nbytes % align != 0 || off % align != 0) {
+    err = "unaligned data for " + name;
+    return false;
+  }
+  int64_t want = 1;
+  for (auto d : shape) want *= d;
+  // The view covers the same *bytes*; a dtype reinterpretation (the I16 trellis
+  // words read as uint32) halves the element count, so compare bytes, not
+  // elements.
+  if (want <= 0 || info.nbytes % want != 0) {
+    err = "view shape does not match " + name;
+    return false;
+  }
+  mx::array raw = mx::array(0.0f);
+  if (!map_range(st, fi, off, info.nbytes, raw, err)) return false;
+  const int pad = (int)(off % page_bytes());
+  const int nbytes = (int)info.nbytes;
+  mx::array bytes = mx::slice(raw, {pad}, {pad + nbytes});
+  out = mx::reshape(mx::view(bytes, dt), shape);
+  return true;
+}
+
+// Loads any tensor as f16 or f32 in (in, out) order for 2-D tensors. Tensors
+// whose file bytes already have the requested dtype and layout are loaded as
+// zero-copy views; everything else (bf16, transposes) is materialized.
 mx::array load_any(const Store& st, const std::string& name, bool transpose, bool as_f32,
                    std::string& err, bool required = true) {
   const SafetensorsFile* f = st.file_for(name);
@@ -62,6 +201,22 @@ mx::array load_any(const Store& st, const std::string& name, bool transpose, boo
     return mx::array(0.0f);
   }
   const STTensor& info = f->tensor(name);
+  st.mark(name);
+  mx::Shape shape;
+  for (auto d : info.shape) shape.push_back((int)d);
+
+  const bool exact = !transpose && ((as_f32 && info.dtype == DT::F32) ||
+                                    (!as_f32 && info.dtype == DT::F16));
+  if (exact) {
+    mx::array out = mx::array(0.0f);
+    std::string view_err;
+    if (tensor_view(st, name, as_f32 ? mx::float32 : mx::float16, shape, out, view_err)) {
+      mx::eval(out);
+      return out;
+    }
+    // not viewable (unaligned / oversized): fall through to a copy
+  }
+
   int64_t numel = 1;
   for (auto d : info.shape) numel *= d;
   const uint8_t* src = f->map_base + f->header_len + info.offset;
@@ -89,8 +244,6 @@ mx::array load_any(const Store& st, const std::string& name, bool transpose, boo
     h16.resize((size_t)numel);
     for (int64_t i = 0; i < numel; ++i) h16[(size_t)i] = to_f16(i);
   }
-  mx::Shape shape;
-  for (auto d : info.shape) shape.push_back((int)d);
   if (transpose && shape.size() == 2) {
     const int64_t out_f = shape[0], in_f = shape[1];
     if (as_f32) {
@@ -108,10 +261,14 @@ mx::array load_any(const Store& st, const std::string& name, bool transpose, boo
   }
   if (as_f32) {
     auto* holder = new std::vector<float>(std::move(h32));
-    return mx::array((void*)holder->data(), shape, mx::float32, [holder](void*) { delete holder; });
+    mx::array out((void*)holder->data(), shape, mx::float32, [holder](void*) { delete holder; });
+    mx::eval(out);
+    return out;
   }
   auto* holder = new std::vector<uint16_t>(std::move(h16));
-  return mx::array((void*)holder->data(), shape, mx::float16, [holder](void*) { delete holder; });
+  mx::array out((void*)holder->data(), shape, mx::float16, [holder](void*) { delete holder; });
+  mx::eval(out);
+  return out;
 }
 
 // EXL3 linear (trellis + suh/svh + codebook marker) or a plain .weight tensor.
@@ -120,11 +277,18 @@ G5Linear load_linear(const Store& st, const std::string& key, std::string& err) 
   if (st.has(key + ".trellis")) {
     const SafetensorsFile* f = st.file_for(key + ".trellis");
     const STTensor& info = f->tensor(key + ".trellis");
-    if (info.shape.size() != 3) { err = key + ".trellis must be 3-dimensional"; return lin; }
-    const uint16_t* src = (const uint16_t*)f->i16_data(key + ".trellis", err);
-    if (!src) return lin;
+    if (info.shape.size() != 3) {
+      err = key + ".trellis must be 3-dimensional";
+      return lin;
+    }
+    if (st.has(key + ".mul1")) st.mark(key + ".mul1");
+    if (st.has(key + ".mcg")) st.mark(key + ".mcg");
+    st.mark(key + ".trellis");
     const int64_t kt = info.shape[0], nt = info.shape[1], words16 = info.shape[2];
-    if (words16 % 16 != 0) { err = key + ": trellis width not a multiple of 16"; return lin; }
+    if (words16 % 16 != 0) {
+      err = key + ": trellis width not a multiple of 16";
+      return lin;
+    }
     lin.quantized = true;
     lin.tw.K = (int)(words16 / 16);
     lin.tw.codebook = st.has(key + ".mul1") ? 2 : (st.has(key + ".mcg") ? 1 : 0);
@@ -132,11 +296,22 @@ G5Linear load_linear(const Store& st, const std::string& key, std::string& err) 
     lin.out_features = (int)(nt * 16);
     lin.tw.in_features = lin.in_features;
     lin.tw.out_features = lin.out_features;
-    auto* holder = new std::vector<uint32_t>((size_t)(kt * nt * words16 / 2));
-    std::memcpy(holder->data(), src, holder->size() * 4);
-    lin.tw.words = mx::array((void*)holder->data(),
-                             mx::Shape{(int)kt, (int)nt, (int)(words16 / 2)}, mx::uint32,
-                             [holder](void*) { delete holder; });
+    // The packed words are used straight out of the mapping (uint32 words, the
+    // file stores them as I16 pairs).
+    mx::array words = mx::array(0.0f);
+    std::string view_err;
+    if (!tensor_view(st, key + ".trellis", mx::uint32,
+                     mx::Shape{(int)kt, (int)nt, (int)(words16 / 2)}, words, view_err)) {
+      // fall back to a copy of the packed weights
+      const uint16_t* src = (const uint16_t*)f->i16_data(key + ".trellis", err);
+      if (!src) return lin;
+      auto* holder = new std::vector<uint32_t>((size_t)(kt * nt * words16 / 2));
+      std::memcpy(holder->data(), src, holder->size() * 4);
+      words = mx::array((void*)holder->data(), mx::Shape{(int)kt, (int)nt, (int)(words16 / 2)},
+                        mx::uint32, [holder](void*) { delete holder; });
+    }
+    mx::eval(words);
+    lin.tw.words = words;
     lin.tw.suh = load_any(st, key + ".suh", false, false, err);
     lin.tw.svh = load_any(st, key + ".svh", false, false, err);
   } else if (st.has(key + ".weight")) {
@@ -156,6 +331,39 @@ G5Linear load_linear(const Store& st, const std::string& key, std::string& err) 
   return lin;
 }
 
+// --- metadata assertions: the checkpoint must match the loader's model ---------
+
+bool expect_lin(const G5Linear& l, int in, int out, const std::string& what, std::string& err) {
+  if (l.in_features != in || l.out_features != out) {
+    err = what + ": expected (in=" + std::to_string(in) + ", out=" + std::to_string(out) +
+          "), got (in=" + std::to_string(l.in_features) + ", out=" + std::to_string(l.out_features) +
+          ")";
+    return false;
+  }
+  return true;
+}
+
+bool expect_vec(const mx::array& a, int64_t n, const std::string& what, std::string& err) {
+  if ((int64_t)a.size() != n) {
+    err = what + ": expected " + std::to_string(n) + " elements, got " + std::to_string(a.size());
+    return false;
+  }
+  return true;
+}
+
+// `text_config.linear_attn_config.gate_lower_bound` (a checkpoint property the
+// engine needs to pick the forget-gate arm; see G5Layer::kda_gate_lower_bound).
+float read_gate_lower_bound(const std::string& dir) {
+  nlohmann::json j;
+  std::string err;
+  if (!parse_json_file(dir + "/config.json", j, err)) return 0.0f;
+  if (j.contains("text_config") && j["text_config"].is_object()) j = j["text_config"];
+  if (!j.contains("linear_attn_config") || !j["linear_attn_config"].is_object()) return 0.0f;
+  const auto& la = j["linear_attn_config"];
+  if (!la.contains("gate_lower_bound") || !la["gate_lower_bound"].is_number()) return 0.0f;
+  return la["gate_lower_bound"].get<float>();
+}
+
 } // namespace
 
 bool load_glm5(const std::string& dir, const ModelConfig& cfg, Glm5Weights& out, std::string& err,
@@ -165,21 +373,31 @@ bool load_glm5(const std::string& dir, const ModelConfig& cfg, Glm5Weights& out,
     err = "load_glm5: config architecture is not glm5_next";
     return false;
   }
+  const int64_t t0 = now_ms();
   Store st;
   if (!st.open(dir, err)) return false;
+  st.gate_lower_bound = read_gate_lower_bound(dir);
+  if (verbose) {
+    std::fprintf(stderr, "glm5: %zu shards, %zu tensors, %.1f GB mapped in %.1fs\n",
+                 st.files.size(), st.where.size(), st.bytes / 1e9, (now_ms() - t0) / 1000.0);
+  }
 
   const std::string p = cfg.tensor_prefix; // "model.language_model."
   out.embed = load_any(st, p + "embed_tokens.weight", false, false, err);
   out.final_norm = load_any(st, p + "norm.weight", false, false, err);
   out.lm_head = load_linear(st, "lm_head", err);
   if (!err.empty()) return false;
+  if (verbose) {
+    std::fprintf(stderr, "glm5: embed + lm_head loaded in %.1fs\n", (now_ms() - t0) / 1000.0);
+  }
 
   out.layers.resize((size_t)cfg.num_layers);
-  int64_t tensors_before = 0;
   for (int i = 0; i < cfg.num_layers; ++i) {
     const std::string lp = p + "layers." + std::to_string(i) + ".";
     G5Layer& l = out.layers[(size_t)i];
     l.plan = cfg.layer_plan[(size_t)i];
+    const int64_t layer_bytes0 = st.used_bytes;
+    const int64_t layer_t0 = now_ms();
     l.input_norm = load_any(st, lp + "input_layernorm.weight", false, false, err);
     l.post_norm = load_any(st, lp + "post_attention_layernorm.weight", false, false, err);
     l.hc_attn_base = load_any(st, lp + "hc_attn_base", false, true, err);
@@ -191,22 +409,45 @@ bool load_glm5(const std::string& dir, const ModelConfig& cfg, Glm5Weights& out,
     if (!err.empty()) return false;
 
     if (l.plan.linear_attention) {
-      const std::string a = lp + "linear_attn.";
-      l.kda_q = load_linear(st, a + "q_proj", err);
-      l.kda_k = load_linear(st, a + "k_proj", err);
-      l.kda_v = load_linear(st, a + "v_proj", err);
+      // KDA: the module is `self_attn` (not `linear_attn`), q|k|v are fused into
+      // `qkv_proj`, and A_log/dt_bias hang directly off `self_attn`.
+      const std::string a = lp + "self_attn.";
+      l.kda_qkv = load_linear(st, a + "qkv_proj", err);
       l.kda_b = load_linear(st, a + "b_proj", err);
       l.kda_g_a = load_linear(st, a + "g_a_proj", err);
       l.kda_g_b = load_linear(st, a + "g_b_proj", err);
+      l.kda_f_a = load_linear(st, a + "f_a_proj", err);
+      l.kda_f_b = load_linear(st, a + "f_b_proj", err);
       l.kda_o = load_linear(st, a + "o_proj", err);
-      l.kda_f_a = load_linear(st, a + "forget_gate.f_a_proj", err);
-      l.kda_f_b = load_linear(st, a + "forget_gate.f_b_proj", err);
       l.conv1d_w = load_any(st, a + "conv1d.weight", false, false, err);
-      l.conv1d_b = load_any(st, a + "conv1d.bias", false, false, err, false);
+      l.conv1d_b = load_any(st, a + "conv1d.bias", false, false, err, /*required=*/false);
       l.o_norm = load_any(st, a + "o_norm.weight", false, false, err);
-      l.dt_bias = load_any(st, a + "forget_gate.dt_bias", false, true, err);
-      l.a_log = load_any(st, a + "forget_gate.A_log", false, true, err);
+      l.dt_bias = load_any(st, a + "dt_bias", false, true, err);
+      l.a_log = load_any(st, a + "A_log", false, true, err);
+      if (!err.empty()) return false;
+      l.kda_gate_lower_bound = st.gate_lower_bound;
+      // Geometry comes from the checkpoint itself (A_log/dt_bias).
+      l.kda_heads = (int)l.a_log.size();
+      l.kda_head_dim = l.kda_heads > 0 ? (int)(l.dt_bias.size() / (size_t)l.kda_heads) : 0;
+      const int H = l.kda_heads, kd = l.kda_head_dim, qkv = H * kd;
+      l.conv1d_has_bias = (int64_t)l.conv1d_b.size() == (int64_t)3 * qkv;
+      if (!expect_lin(l.kda_qkv, cfg.hidden_size, 3 * qkv, a + "qkv_proj", err) ||
+          !expect_lin(l.kda_b, cfg.hidden_size, H, a + "b_proj", err) ||
+          !expect_lin(l.kda_g_a, cfg.hidden_size, kd, a + "g_a_proj", err) ||
+          !expect_lin(l.kda_g_b, kd, qkv, a + "g_b_proj", err) ||
+          !expect_lin(l.kda_f_a, cfg.hidden_size, kd, a + "f_a_proj", err) ||
+          !expect_lin(l.kda_f_b, kd, qkv, a + "f_b_proj", err) ||
+          !expect_lin(l.kda_o, qkv, cfg.hidden_size, a + "o_proj", err) ||
+          !expect_vec(l.o_norm, kd, a + "o_norm.weight", err) ||
+          !expect_vec(l.dt_bias, qkv, a + "dt_bias", err)) {
+        return false;
+      }
+      if (l.conv1d_w.ndim() != 3 || l.conv1d_w.shape(0) != 3 * qkv || l.conv1d_w.shape(2) < 1) {
+        err = a + "conv1d.weight: expected (" + std::to_string(3 * qkv) + ", 1, kernel)";
+        return false;
+      }
     } else {
+      // MLA + DSA indexer.
       const std::string a = lp + "self_attn.";
       l.q_a = load_linear(st, a + "q_a_proj", err);
       l.q_a_norm = load_any(st, a + "q_a_layernorm.weight", false, false, err);
@@ -223,6 +464,32 @@ bool load_glm5(const std::string& dir, const ModelConfig& cfg, Glm5Weights& out,
       l.idx_weights_proj = load_any(st, ix + "weights_proj.weight", true, false, err);
       l.idx_ape = load_any(st, ix + "index_kpool_compress_ape", false, true, err);
       l.idx_gate = load_any(st, ix + "index_kpool_compress_gate", true, false, err);
+      if (!err.empty()) return false;
+      const int qk = cfg.qk_head_dim, vd = cfg.v_head_dim, nh = cfg.num_heads;
+      if (!expect_lin(l.q_a, cfg.hidden_size, cfg.q_lora_rank, a + "q_a_proj", err) ||
+          !expect_lin(l.q_b, cfg.q_lora_rank, nh * qk, a + "q_b_proj", err) ||
+          !expect_lin(l.kv_a, cfg.hidden_size, cfg.kv_lora_rank, a + "kv_a_proj_with_mqa", err) ||
+          !expect_lin(l.kv_b, cfg.kv_lora_rank, nh * (qk + vd), a + "kv_b_proj", err) ||
+          !expect_lin(l.attn_o, nh * vd, cfg.hidden_size, a + "o_proj", err) ||
+          !expect_vec(l.q_a_norm, cfg.q_lora_rank, a + "q_a_layernorm.weight", err) ||
+          !expect_vec(l.kv_a_norm, cfg.kv_lora_rank, a + "kv_a_layernorm.weight", err) ||
+          !expect_lin(l.idx_wq_b, cfg.q_lora_rank, cfg.index_n_heads * cfg.index_head_dim,
+                      ix + "wq_b", err) ||
+          !expect_vec(l.idx_k_norm_w, cfg.index_head_dim, ix + "k_norm.weight", err) ||
+          !expect_vec(l.idx_k_norm_b, cfg.index_head_dim, ix + "k_norm.bias", err)) {
+        return false;
+      }
+      if (l.idx_wk.ndim() != 2 || l.idx_wk.shape(0) != cfg.hidden_size ||
+          l.idx_wk.shape(1) != cfg.index_head_dim ||
+          l.idx_weights_proj.ndim() != 2 || l.idx_weights_proj.shape(0) != cfg.hidden_size ||
+          l.idx_weights_proj.shape(1) != cfg.index_n_heads ||
+          l.idx_ape.ndim() != 2 || l.idx_ape.shape(0) != cfg.index_kpool ||
+          l.idx_ape.shape(1) != cfg.index_head_dim ||
+          l.idx_gate.ndim() != 2 || l.idx_gate.shape(0) != cfg.hidden_size ||
+          l.idx_gate.shape(1) != cfg.index_head_dim) {
+        err = a + "indexer: unexpected shape for weights_proj/ape/gate";
+        return false;
+      }
     }
     if (!err.empty()) return false;
 
@@ -249,13 +516,71 @@ bool load_glm5(const std::string& dir, const ModelConfig& cfg, Glm5Weights& out,
       l.dense_down = load_linear(st, m + "down_proj", err);
     }
     if (!err.empty()) return false;
-    tensors_before += 1;
-    if (verbose && (i % 8 == 7 || i + 1 == cfg.num_layers)) {
-      std::fprintf(stderr, "glm5: loaded %d/%d layers (%zu experts)\n", i + 1, cfg.num_layers,
-                   out.expert_count());
+    if (verbose) {
+      std::fprintf(stderr, "glm5: layer %2d %-18s %-17s %8.1f MB %6.0f ms\n", i,
+                   l.plan.linear_attention ? "linear_attention" : "sparse_attention",
+                   l.moe ? (std::to_string(l.experts.size() / 3) + " MoE experts").c_str() : "dense MLP",
+                   (st.used_bytes - layer_bytes0) / 1048576.0, (double)(now_ms() - layer_t0));
     }
   }
+
+  // --- explicit skip sets ---------------------------------------------------
+  const int64_t t_skip = now_ms();
+  std::map<std::string, int64_t> skipped;
+  std::vector<std::string> unexpected;
+  const std::string layers_p = p + "layers.";
+  for (auto& [name, fi] : st.where) {
+    (void)fi;
+    if (st.used.count(name)) continue;
+    if (name.rfind("model.visual.", 0) == 0) {
+      skipped["model.visual. (vision tower, text-only engine)"]++;
+      continue;
+    }
+    if (name.rfind("mtp.", 0) == 0 || name.rfind("model.mtp.", 0) == 0) {
+      skipped["mtp. (MTP draft block, not wired yet)"]++;
+      continue;
+    }
+    if (name.rfind(layers_p, 0) == 0) {
+      const char* num = name.c_str() + layers_p.size();
+      char* end = nullptr;
+      long idx = std::strtol(num, &end, 10);
+      if (end != num && *end == '.' && idx >= cfg.num_layers) {
+        skipped[layers_p + "{i>=" + std::to_string(cfg.num_layers) +
+                "} (MTP draft layer, not wired yet)"]++;
+        continue;
+      }
+    }
+    unexpected.push_back(name);
+  }
+  if (!unexpected.empty()) {
+    std::sort(unexpected.begin(), unexpected.end());
+    err = "load_glm5: " + std::to_string(unexpected.size()) +
+          " checkpoint tensors are not handled (first: " + unexpected.front() + ")";
+    return false;
+  }
+  for (auto& [label, count] : skipped) {
+    std::fprintf(stderr, "glm5: skipped %lld tensors: %s\n", (long long)count, label.c_str());
+  }
+
   out.bytes = st.bytes;
+  out.used_bytes = st.used_bytes;
+  out.used_tensors = st.used_tensors;
+  out.total_tensors = (int64_t)st.where.size();
+  for (auto& [label, count] : skipped) out.skipped.emplace_back(label, count);
+  if (verbose) {
+    int kda = 0, dsa = 0, moe = 0;
+    for (auto& l : out.layers) {
+      kda += l.plan.linear_attention;
+      dsa += l.plan.sparse_attention;
+      moe += l.moe;
+    }
+    std::fprintf(stderr,
+                 "glm5: %d layers (%d KDA / %d DSA, %d dense + %d MoE), %lld tensors of %lld "
+                 "loaded, %.1f GB used of %.1f GB mapped, index scan %.1fs, total %.1fs\n",
+                 cfg.num_layers, kda, dsa, cfg.num_layers - moe, moe, (long long)out.used_tensors,
+                 (long long)out.total_tensors, st.used_bytes / 1e9, st.bytes / 1e9,
+                 (now_ms() - t_skip) / 1000.0, (now_ms() - t0) / 1000.0);
+  }
   return true;
 }
 

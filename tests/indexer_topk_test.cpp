@@ -35,9 +35,12 @@ int main() {
   std::mt19937 rng(5);
   exl3::G5Layer l;
   l.idx_wq_b = lin(Nh * D, Nh * D, rng);       // (in, out): wq_b maps q_lora_rank -> Nh*D
-  l.idx_wk = mat(D, Hd, rng);             // raw, stored (out, in)
-  l.idx_gate = mat(D, Hd, rng);
-  l.idx_weights_proj = mat(Nh, Hd, rng);
+  // The loader already transposes the raw (out, in) disk layout, so the layer
+  // holds (in, out) matrices: wk/gate are (hidden, index_head_dim) and
+  // weights_proj is (hidden, index_n_heads).
+  l.idx_wk = mat(Hd, D, rng);
+  l.idx_gate = mat(Hd, D, rng);
+  l.idx_weights_proj = mat(Hd, Nh, rng);
   l.idx_k_norm_w = mat(1, D, rng, 0.1f);
   l.idx_k_norm_b = mat(1, D, rng, 0.1f);
   l.idx_ape = mat(kp, D, rng, 0.2f);

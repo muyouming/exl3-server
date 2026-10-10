@@ -1,11 +1,22 @@
 #pragma once
 // GLM-5-Next (glm5_next_text / GLM-5.3-Flash) weight loading.
 //
-// Text-only: vision tensors (`model.visual.*`) and the `mtp.*` draft block are
-// not loaded here yet. Linears are mixed-quantization: most are EXL3 (trellis +
-// suh/svh + mul1 marker), while `kv_b_proj`, the indexer's small matrices, the
-// hyper-connection parameters and the router bias are plain F16/BF16/F32.
+// Text-only. The vision tower (`model.visual.*`) and the MTP draft block
+// (stored as the extra layer `model.language_model.layers.{num_layers}.*` in
+// this checkpoint, or under `mtp.*` in other exports) are *explicitly* skipped:
+// the loader prints every skipped prefix with its tensor count and fails on any
+// tensor it does not recognize, so nothing is ever dropped silently.
 //
+// Tensors are mixed-quantization: most are EXL3 (trellis + suh/svh + mul1
+// marker), while `kv_b_proj`, the indexer's small matrices, the KDA gate
+// projections, the hyper-connection parameters and the router bias are plain
+// F16/BF16/F32.
+//
+// Tensors whose file bytes can be consumed as they are (f16/f32, no transpose)
+// are NOT copied: they become MLX views of a private, writable mapping of the
+// safetensors shard, so the 105 GB checkpoint loads without a 105 GB heap copy
+// (and without MLX having to copy each weight into a Metal buffer first, which
+// is what happens for any foreign pointer that is not page aligned).
 // See docs/glm5.md for the verified per-layer tensor list.
 
 #include <mlx/mlx.h>
@@ -39,10 +50,21 @@ struct G5Layer {
             hc_attn_scale = mx::array(0.0f);                            // f32
   mx::array hc_ffn_base = mx::array(0.0f), hc_ffn_fn = mx::array(0.0f),
             hc_ffn_scale = mx::array(0.0f);                             // f32
-  // KDA (linear_attention layers)
-  G5Linear kda_q, kda_k, kda_v, kda_b, kda_g_a, kda_g_b, kda_f_a, kda_f_b, kda_o;
-  mx::array conv1d_w = mx::array(0.0f), conv1d_b = mx::array(0.0f);
+  // KDA (`linear_attention` layers). The checkpoint fuses q|k|v into ONE EXL3
+  // tensor `self_attn.qkv_proj`, concatenated as q | k | v, each `heads *
+  // head_dim` wide (the reference projects them separately and then does
+  // cat([q_proj(h), k_proj(h), v_proj(h)], -1)).
+  G5Linear kda_qkv, kda_b, kda_g_a, kda_g_b, kda_f_a, kda_f_b, kda_o;
+  mx::array conv1d_w = mx::array(0.0f);  // (3*heads*head_dim, 1, kernel)
+  mx::array conv1d_b = mx::array(0.0f);  // absent in this checkpoint (bias=False)
+  bool conv1d_has_bias = false;
   mx::array o_norm = mx::array(0.0f), dt_bias = mx::array(0.0f), a_log = mx::array(0.0f);
+  int kda_heads = 0;     // len(A_log)
+  int kda_head_dim = 0;  // len(dt_bias) / heads
+  // `linear_attn_config.gate_lower_bound`: non-zero selects fla's USE_LOWER_BOUND
+  // forget gate (-bound * sigmoid(...)) instead of the softplus form. This
+  // checkpoint sets -5.0.
+  float kda_gate_lower_bound = 0.0f;
   // MLA + DSA indexer (sparse_attention layers)
   G5Linear q_a, q_b, kv_a, kv_b, attn_o, idx_wq_b;
   mx::array q_a_norm = mx::array(0.0f), kv_a_norm = mx::array(0.0f);
@@ -63,7 +85,12 @@ struct Glm5Weights {
   mx::array final_norm = mx::array(0.0f); // f16 (hidden)
   G5Linear lm_head;
   std::vector<G5Layer> layers;
-  int64_t bytes = 0;
+  int64_t bytes = 0;                      // bytes of all safetensors shards (mmap'd)
+  int64_t used_bytes = 0;                 // bytes of the tensors actually loaded
+  int64_t used_tensors = 0;               // tensors actually loaded
+  int64_t total_tensors = 0;              // tensors present in the checkpoint
+  // Explicit skip sets: prefix label -> tensor count (vision tower, MTP block).
+  std::vector<std::pair<std::string, int64_t>> skipped;
   size_t expert_count() const {
     size_t n = 0;
     for (auto& l : layers) n += l.experts.size() / 3;
@@ -73,6 +100,8 @@ struct Glm5Weights {
 
 // Loads the language-model weights described by `cfg` (arch must be Glm5Next).
 // Missing optional tensors are reported but only required ones fail the load.
+// Tensors outside the loader's knowledge (other than the documented skip sets)
+// fail the load rather than being dropped silently.
 bool load_glm5(const std::string& dir, const ModelConfig& cfg, Glm5Weights& out, std::string& err,
                int threads = 0, bool verbose = false);
 

@@ -244,12 +244,18 @@ model.language_model.norm.weight
 model.visual.*                                     # 957 tensors, skipped (text-only engine)
 ```
 
-**There are no `mtp.*` tensors in this checkpoint** even though the config says
-`num_nextn_predict_layers = 1`: the quantiser did not convert a next-token
-prediction block. Speculative decoding for this model therefore has to use the
-existing n-gram drafter (`--draft-ngram`), not an MTP head. Other config facts:
-`dtype` (of the unquantised source) bfloat16, `hidden_act` silu,
-`tie_word_embeddings` false, `index_head_dim` 128, `head_dim` 0 (unused).
+The next-token-prediction block IS present, but NOT under an `mtp.` prefix -
+it is stored as **layer 45** (`model.language_model.layers.45.*`, 3508 tensors,
+with its own self_attn/linear_attn/mlp). Total 151554 tensors = 147039 used +
+`model.visual.*` 1007 (skipped) + `layers.45.*` 3508 (MTP, kept for later).
+Other config facts: `dtype` (of the unquantised source) bfloat16,
+`hidden_act` silu, `tie_word_embeddings` false, `index_head_dim` 128,
+`head_dim` 0 (unused). `linear_attn_config` gives the per-layer type lists:
+`kda_layers` = 34 entries [0,1,2,4,...] and `full_attn_layers` = 11
+[3,7,11,15,...,43], plus `num_heads 64, head_dim 128, gate_lower_bound
+and **`gate_lower_bound = -5.0`**, i.e. the KDA forget gate uses fla's
+USE_LOWER_BOUND arm (`-5 * sigmoid(exp(A_log) * g)`), NOT the softplus arm -
+the loader passes it to kda_decay.
 
 ## VERIFIED on-disk tensor names (from model.safetensors.index.json, real checkpoint)
 
@@ -344,7 +350,11 @@ so the mask is exactly the top-k set.
 Status: `mla_layer()` implements this against the loader's `G5Layer`; the
 prefill/incremental invariant is verified by `tests/mla_incremental_test.cpp`
 (decode after a n-1 prefill reproduces the n-token prefill's last row to
-6e-08). Numeric agreement with HF is still pending real weights.
+6e-08). On the real checkpoint, layer 3 runs on shape (1,1,4096) producing
+finite non-zero output (absmax 1.81), and with the real DSA topk it matches the
+dense causal path exactly for a single token. `rms_norm` returns the INPUT
+dtype, as the reference does - returning fp32 made every following EXL3
+projection fail to build a Metal kernel.
 
 ## DSA indexer (Glm5NextTextIndexer, 795-885+) - verified core
 
