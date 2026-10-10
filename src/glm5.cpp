@@ -333,6 +333,18 @@ G5Linear load_linear(const Store& st, const std::string& key, std::string& err) 
     if (tensor_view(st, key + ".trellis", mx::uint8,
                      mx::Shape{(int)kt, (int)nt, (int)(words16 * 2)}, packed, view_err)) {
       lin.tw.aligned = ((f->header_len + info.offset) % 4) == 0;
+      // Resolve the view HERE, on the loading thread. `tensor_view` builds a
+      // lazy slice->view->reshape chain over the shard's page-aligned mapping;
+      // every step of it is a metadata-only no-copy op (mlx's slice/view/
+      // reshape share the buffer), so this costs nothing and allocates nothing -
+      // but leaving it unresolved stores a graph whose primitives carry the
+      // LOADING thread's stream, and MLX refuses to evaluate a primitive on a
+      // stream that was not created in the current thread ("There is no
+      // Stream(gpu, 0) in current thread"). The HTTP server loads on main and
+      // serves on its own threads, so an unresolved weight view made every
+      // served request throw (reproduced: see tests/glm5_batch_test.cpp's
+      // serving-thread gate and docs/perf.md).
+      mx::eval(packed);
     } else {
       const uint8_t* src = f->data(key + ".trellis", err);
       if (!src) return lin;

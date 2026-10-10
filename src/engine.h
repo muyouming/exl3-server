@@ -109,13 +109,27 @@ class Engine {
   // step (rows = sequences) instead of queueing behind each other. The
   // scheduler owns a worker thread that pulls requests off a queue, prefills
   // the new ones through the ordinary single-sequence path and then advances
-  // every live request by one token per step. `start_batch(0)` disables it.
+  // every live request by one token per step.
+  //
+  // `start_batch(N)` starts the scheduler for N > 0 (up to N concurrent
+  // sequences in one fused step) and for N == 0 the *serial* mode, which still
+  // owns the thread but runs one request at a time through generate(). `N < 0`
+  // means "no scheduler" (the CLI and the tests call generate() directly).
+  //
+  // Every request that reaches submit_batch() is built and evaluated on that
+  // one thread, which is a *correctness* requirement and not just tidiness: MLX
+  // binds a stream to the thread that created it and refuses to evaluate a
+  // primitive on a stream created elsewhere ("There is no Stream(gpu, N) in
+  // current thread"), so a request built on one HTTP worker thread and evaluated
+  // on another - or on a graph another thread left in the engine's shared state
+  // - throws and, before the fix, wedged the server (see docs/perf.md and the
+  // serving-thread gate in tests/glm5_batch_test.cpp).
   //
   // Batching is GLM-5-Next only (the Llama path has one shared KV cache and no
   // per-slot state): for any other architecture submit_batch() is generate().
   void start_batch(int max_batch);
   void stop_batch();
-  bool batch_running() const { return batch_max_ > 0; }
+  bool batch_running() const { return worker_.joinable(); }
   int batch_max() const { return batch_max_; }
   // Submits one request and blocks until it is done. `on_delta` is called from
   // the scheduler thread while this call is blocked (the HTTP handlers rely on
@@ -142,6 +156,11 @@ class Engine {
   std::deque<std::shared_ptr<Pending>> queue_;
   std::thread worker_;
   std::atomic<bool> batch_stop_{false};
+  // True while the scheduler thread is running. Cleared under qmu_ by the
+  // thread's own exit path, which also answers everything still queued, so a
+  // submitter either enqueues into a live scheduler or falls back to the serial
+  // path - it can never wait on a condition variable nobody will notify.
+  std::atomic<bool> worker_alive_{false};
   int batch_max_ = 0;
 };
 

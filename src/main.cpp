@@ -208,8 +208,12 @@ int main(int argc, char** argv) {
     // Batching is on by default for GLM-5-Next (a concurrent request then shares
     // the decode step instead of queueing behind the one in flight); the Llama
     // path has a single shared KV cache and no per-slot state, so it stays off.
+    // `--batch 0` still starts the scheduler, in its serial mode: the point is
+    // that every request is built and evaluated on ONE thread, because MLX
+    // streams are thread-local and a request served on an HTTP worker thread
+    // cannot evaluate weights the loader left as views on main (see engine.h).
     const int max_batch = batch >= 0 ? batch : (engine.model().glm5() ? 8 : 0);
-    if (max_batch > 0) engine.start_batch(max_batch);
+    engine.start_batch(max_batch);
     exl3::ServerOptions so;
     so.host = host;
     so.port = port;

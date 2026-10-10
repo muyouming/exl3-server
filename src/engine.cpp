@@ -376,7 +376,7 @@ struct Engine::Pending {
 
 void Engine::start_batch(int max_batch) {
   stop_batch();
-  if (max_batch <= 0) return;
+  if (max_batch < 0) return; // no scheduler: the CLI and the tests call generate()
   if (!model_.glm5()) {
     // Only the GLM-5-Next path keeps per-slot state; the Llama path has one
     // shared KV cache, so there is nothing to batch.
@@ -384,7 +384,11 @@ void Engine::start_batch(int max_batch) {
     return;
   }
   batch_stop_.store(false);
+  // 0 is the scheduler's serial mode: one request at a time through generate(),
+  // but on this thread rather than on whichever HTTP worker picked the request
+  // up (MLX streams are thread-local - see the header).
   batch_max_ = max_batch;
+  worker_alive_.store(true);
   worker_ = std::thread([this] { batch_worker(); });
 }
 
@@ -393,6 +397,7 @@ void Engine::stop_batch() {
     batch_stop_.store(true);
     qcv_.notify_all();
     worker_.join();
+    worker_alive_.store(false);
   }
   batch_max_ = 0;
   std::deque<std::shared_ptr<Pending>> left;
@@ -410,21 +415,30 @@ void Engine::stop_batch() {
 
 GenerateResult Engine::submit_batch(const std::vector<int>& prompt, const GenerateOptions& opt,
                                     const DeltaFn& on_delta, const CancelFn& cancelled) {
-  // Speculative decoding and a batch of one are the serial path's job; a
-  // request that asks for the MTP drafter must not go through the batch (its
-  // draft-row state is per sequence and not batched).
-  if (batch_max_ <= 0 || !worker_.joinable() || !model_.glm5() || opt.draft_tokens > 1 ||
-      prompt.empty())
-    return generate(prompt, opt, on_delta, cancelled);
+  // No scheduler (the CLI, the tests, or a checkpoint batching cannot serve):
+  // the caller's thread runs the ordinary serial path.
+  if (!worker_.joinable()) return generate(prompt, opt, on_delta, cancelled);
   auto p = std::make_shared<Pending>();
   p->prompt = prompt;
   p->opt = opt;
   p->on_delta = on_delta;
   p->cancelled = cancelled;
   p->result.prompt_tokens = (int)prompt.size();
+  bool queued = false;
   {
+    // The liveness check and the enqueue are one critical section against the
+    // scheduler's own exit path (which clears the flag and swaps the queue under
+    // the same lock), so a request either lands in a live queue - and is then
+    // guaranteed an answer - or is served here, on the caller's thread.
     std::lock_guard<std::mutex> lk(qmu_);
-    queue_.push_back(p);
+    if (worker_alive_.load()) {
+      queue_.push_back(p);
+      queued = true;
+    }
+  }
+  if (!queued) {
+    std::fprintf(stderr, "engine: batch scheduler is not running; serving request serially\n");
+    return generate(prompt, opt, on_delta, cancelled);
   }
   qcv_.notify_all();
   std::unique_lock<std::mutex> lk(p->m);
@@ -436,8 +450,8 @@ void Engine::batch_worker() {
   try {
     batch_worker_loop();
   } catch (const std::exception& e) {
-    // A failure inside a step must not take the process down: release whatever
-    // the batch held and let the next request start from a clean state.
+    // batch_worker_loop answers everything it held before it returns; this is
+    // only the last-resort net for a throw from outside its own cycle handling.
     std::fprintf(stderr, "engine: batch worker stopped: %s\n", e.what());
     batch_stop_.store(true);
   }
@@ -472,7 +486,105 @@ void Engine::batch_worker_loop() {
     r.p->cv.notify_all();
   };
 
+  // Answer everything the queue still holds (as "cancelled"). When the
+  // scheduler is going away rather than failing one cycle, also clear
+  // worker_alive_ in the same critical section as the queue swap, so
+  // submit_batch() can never enqueue into a scheduler that has already left.
+  auto answer_queued = [&](bool stopping) {
+    std::deque<std::shared_ptr<Pending>> left;
+    {
+      std::lock_guard<std::mutex> lk(qmu_);
+      if (stopping) worker_alive_.store(false);
+      left.swap(queue_);
+    }
+    for (auto& p : left) {
+      std::lock_guard<std::mutex> lk(p->m);
+      p->result.finish_reason = "cancelled";
+      p->done = true;
+      p->cv.notify_all();
+    }
+  };
+
+  // A failed step (an allocation, a wrong state, a bug) must not strand anyone:
+  // every live request is answered, the batch state is dropped, and the queued
+  // requests are answered too so their submitters never hang. The scheduler
+  // itself stays alive for the next request.
+  auto fail_cycle = [&](const char* why) {
+    std::fprintf(stderr, "engine: batch cycle failed: %s\n", why);
+    for (auto& r : live) {
+      finish_req(r, "cancelled");
+      publish(r);
+    }
+    live.clear();
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      model_.glm5()->batch_reset();
+    }
+    answer_queued(/*stopping=*/false);
+  };
+
+  // The scheduler's own exit path. A request in flight, or queued but not yet
+  // admitted, must not be left waiting on a condition variable nobody will
+  // notify - the previous version left the queue unanswered, so the next
+  // submitter blocked in p->cv.wait() forever once the worker had stopped (this
+  // is what made tools/batch_server_bench.sh produce nothing for 25 minutes:
+  // one request failed, the scheduler was gone, every later one hung).
+  auto shutdown = [&](const char* why) {
+    std::fprintf(stderr, "engine: batch scheduler stopped: %s\n", why);
+    for (auto& r : live) {
+      finish_req(r, "cancelled");
+      publish(r);
+    }
+    live.clear();
+    // The live slots' state has to go with the scheduler: a shutdown must leave
+    // the model as clean as a finished request does, or the next user of
+    // batch_step() sees a batch whose slot count no longer matches its feed
+    // (reproduced by this file's own serving-thread gate: without this reset the
+    // benchmark's first batch_step throws "expected one token per live slot").
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      model_.glm5()->batch_reset();
+    }
+    answer_queued(/*stopping=*/true);
+  };
+
+  // The scheduler's serial mode (`--batch 0`): one request at a time through the
+  // ordinary generation path, but built and evaluated on THIS thread. An MTP
+  // request (its draft-row state is per sequence) and an empty prompt also come
+  // here - both used to run on whichever thread called submit_batch().
+  auto serve_serial = [&](const std::shared_ptr<Pending>& p) {
+    GenerateResult r;
+    try {
+      r = generate(p->prompt, p->opt, p->on_delta, p->cancelled);
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "engine: serial request failed: %s\n", e.what());
+      r.finish_reason = "cancelled";
+      r.prompt_tokens = (int)p->prompt.size();
+    }
+    std::lock_guard<std::mutex> lk(p->m);
+    p->result = std::move(r);
+    p->done = true;
+    p->cv.notify_all();
+  };
+
+  try {
   while (!batch_stop_.load()) {
+    if (batch_max_ <= 0) {
+      // Serial mode: take one request and finish it before the next.
+      std::shared_ptr<Pending> p;
+      {
+        std::unique_lock<std::mutex> lk(qmu_);
+        qcv_.wait(lk, [&] { return batch_stop_.load() || !queue_.empty(); });
+        if (!queue_.empty()) {
+          p = queue_.front();
+          queue_.pop_front();
+        }
+      }
+      if (!p) continue; // stopped with an empty queue
+      serve_serial(p);
+      continue;
+    }
+    try {
     // ---- admit waiting requests (prefill + first token, as the serial path) --
     std::vector<std::shared_ptr<Pending>> incoming;
     {
@@ -487,6 +599,13 @@ void Engine::batch_worker_loop() {
       }
     }
     for (auto& p : incoming) {
+      if (p->opt.draft_tokens > 1 || p->prompt.empty()) {
+        // Not batchable: speculative decoding keeps the draft rows (and the
+        // rewind bookkeeping) per sequence, and an empty prompt has nothing to
+        // prefill. Served alone, on this thread.
+        serve_serial(p);
+        continue;
+      }
       Req r;
       r.p = p;
       r.history = p->prompt;
@@ -567,6 +686,15 @@ void Engine::batch_worker_loop() {
         r.next = tok;
       }
     }
+    } catch (const std::exception& e) {
+      fail_cycle(e.what());
+    }
+  }
+  shutdown("the batch scheduler stopped");
+  } catch (const std::exception& e) {
+    // A throw from the loop's own bookkeeping (not from a step) must leave
+    // nobody behind either.
+    shutdown(e.what());
   }
 }
 
