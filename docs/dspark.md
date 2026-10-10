@@ -84,10 +84,17 @@ Next, in order:
    target's `lm_head`, then the markov rollout
    `logits_i = base_logits[:, i, :] + markov_w2 @ markov_w1[prev]`, argmax per step.
 2. **Draft attention context** (needs the reference, do not guess): SGLang's DFlash
-   design supplies the draft's per-layer KV from the target's hidden states
-   (`write_target_hidden_kv` in `python/sglang/srt/speculative/dflash_worker_v2.py`
-   / `dflash_utils.py`) rather than recomputing them with the draft. Guessing this
-   silently degrades acceptance, so port it from the reference.
+   design supplies the draft's per-layer KV from the target's hidden states rather
+   than recomputing them with the draft. Confirmed in
+   `python/sglang/srt/speculative/dflash_worker_v2.py`:
+   `KVLocPlan` + `_draft_write_ids` + `_append_target_hidden_to_draft_kv_by_loc`
+   ("Materialize target context features into the draft KV cache at explicit
+   slots", with prefix-valid commits and fused-vs-private draft pools).
+   The block-side counterparts live in `dflash_utils.py` (mask token handling,
+   `sample_from_anchor`), and the model side in `srt/models/dspark.py`
+   (`DSparkDraftMixin.forward_embed`, `attach_shared_modules`, the markov
+   `sample_block` / `run_markov_block` rollout already ported in spirit above).
+   Guessing this silently degrades acceptance, so port it from the reference.
 3. **Draft KV from taps**: store the 5 per-position taps during every target
    forward (20 KB/token at 5x2048 f16) so the draft can attend over the whole
    context without running itself over the prompt.
