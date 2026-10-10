@@ -235,6 +235,33 @@ Notes that matter for a faithful port:
 - MLX exposes `fast::gated_delta_update`, but the reference above is the exact
   formula to validate against before trusting the primitive.
 
+## VERIFIED on-disk tensor names (from model.safetensors.index.json, real checkpoint)
+
+`layer_types` (45): layers 0,1,2 are `linear_attention` **and dense** MLP
+(`first_k_dense_replace = 3`); from layer 3 on every layer is MoE
+(`mlp.experts.*` present) regardless of attention type; 11 of them are
+`deepseek_sparse_attention` (e.g. 3, 11, 15) and the rest `linear_attention`.
+
+KDA layers (e.g. layer 0/4/14) - note the attention module is `self_attn`, NOT
+`linear_attn`, and q/k/v are FUSED:
+
+```
+model.language_model.layers.{i}.self_attn.qkv_proj.{trellis,suh,svh,mul1}   # EXL3, fused [q;k;v]
+model.language_model.layers.{i}.self_attn.f_a_proj.weight                   # plain
+model.language_model.layers.{i}.self_attn.f_b_proj.weight
+model.language_model.layers.{i}.self_attn.A_log                             # (heads,)  - directly under self_attn
+model.language_model.layers.{i}.self_attn.dt_bias                           # (heads*head_dim,)
+model.language_model.layers.{i}.self_attn.b_proj.weight
+model.language_model.layers.{i}.self_attn.conv1d.weight                     # NO conv1d.bias in this checkpoint
+model.language_model.layers.{i}.self_attn.o_norm.weight
+model.language_model.layers.{i}.self_attn.g_a_proj.weight / g_b_proj.weight
+model.language_model.layers.{i}.self_attn.o_proj.{trellis,suh,svh,mul1}     # EXL3
+```
+
+The fused qkv ordering follows the reference's
+`cat([q_proj(h), k_proj(h), v_proj(h)], -1)`, i.e. q | k | v, each
+`num_heads * head_dim` wide.
+
 ## KDA layer wiring (from `Glm5NextTextLinearAttention.forward`, 660-772)
 
 ```
