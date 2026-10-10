@@ -105,7 +105,7 @@ on an M3 Ultra)" (`README.md:84-88`).
 
 | mechanism | what it does | evidence | measured effect |
 |---|---|---|---|
-| Verify-shape QMM kernels | Stock MLX qmm is tuned for M=1 and large M; at M=3..6 it pays a per-row penalty. oMLX writes split-K / multi-simdgroup kernels for M=3..6 and an `mma` tile kernel for 7..24 rows "which dequantizes 16-column weight tiles into threadgroup memory once and multiplies them against every row with simdgroup matrices, **so a batch of rows costs one pass over the weights**"; `sg8` handles 4-8-row blocks | `patches/qwen35_verify_qmm.py:9-26,38-42,57-62` | "measured on Qwen3.6-27B/M3 Ultra the lm_head scales linearly (1.2 ms at M=1 → 4.3 ms at M=4) and the summed MLP/GDN projections add ~15 ms per verify call" (`:24-26`) |
+| Verify-shape QMM kernels | Stock MLX qmm is tuned for M=1 and large M; at M=3..6 it pays a per-row penalty. oMLX writes split-K / multi-simdgroup kernels for M=3..6 and an `mma` tile kernel for 7..24 rows "which dequantizes 16-column weight tiles into threadgroup memory once and multiplies them against every row with simdgroup matrices, **so a batch of rows costs one pass over the weights**"; `sg8` handles 4-8-row blocks | `patches/qwen35_verify_qmm.py:9-26,38-42,57-62` | "measured on Qwen3.6-27B/M3 Ultra the lm_head scales linearly (1.2 ms at M=1 → 4.3 ms at M=4) and the summed MLP/GDN projections add ~15 ms per verify call" (`:24-26`) — **in-file self-report, dense 27B target, no in-repo harness**; see §3-Z. It is the closest published number for this trade, not our model's |
 | Row-exact multi-row projection | One threadgroup computes one `2*RPS`-column tile for `ROWS` rows: "each weight block is decoded once and applied to all of them"; each row still sums K in `qmv_fast` order, so row `r` equals a serial 1-row decode bit for bit; `MAX_ROWS = 16`; the one-row call uses the same tile | `patches/row_exact_qmv.py:1-21,36` | — |
 | Weight stream read once for M rows (`qmv_wide`) | 2-bit weights at M>=3: "amortises the weight stream across all M vectors (1 read vs M reads)" | `custom_kernels/bonsai/fast.py:264-278` | "yielding 1.3-1.5x on large projections (benchmarked: gate/up/down_proj M=5 → 71→104 GB/s on g16s)" |
 | Expert-ordered verify gather | Replaces `gather_qmm`'s one-matvec-per-(row,expert)-pair in routing order — "the same expert weights are fetched from DRAM once per row that selects them" — with one launch in expert order so "pairs that share an expert then run back to back and read the expert tile from cache"; one threadgroup per pair+tile, rank-based pair discovery in-kernel; bit-identical transcription of MLX 0.32.2 `quantized.h` | `patches/moe_verify_gather.py:4-15,205-221,340-341` | — |
@@ -229,7 +229,8 @@ kernel must tolerate arbitrary index order (our current fast path assumes all ro
 
 **T3 — Amortize the verify pass over rows properly.**
 Our MTP gives +30-50%, but per `docs/perf.md` the verify rows currently cost "their own ~4.6 GB" at the floor.
-oMLX's numbers show *why* stock multi-row kernels fail (lm_head 1.2 ms at M=1 → 4.3 ms at M=4), and its fixes are
+oMLX's numbers show *why* stock multi-row kernels fail (their own file's measurement on **Qwen3.6-27B/M3 Ultra**, a
+dense 27B target: lm_head 1.2 ms at M=1 → 4.3 ms at M=4, self-reported, no in-repo harness — `qwen35_verify_qmm.py:23-26`). Its fixes are
 portable as designs: a tiled kernel that dequantizes a weight tile once per threadgroup and multiplies all rows
 against it; and — for MoE — **expert-ordered pair execution** so that at rows×top_k pairs the same expert's tile is
 read once instead of once per pair (`moe_verify_gather.py:4-15`), plus `MAX_ROWS=16` row-blocked tiles
