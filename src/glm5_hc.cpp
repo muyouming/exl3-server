@@ -52,8 +52,24 @@ const char* kHcSource = R"METAL(
   threadgroup float sm_post[HC_N];
 
   // --- pass 1: RMSNorm denominator ----------------------------------------
+  // Four loads are issued before their four dependent FMAs, which is the same
+  // arithmetic in the same order (i, i+T, i+2T, i+3T ...) with four requests in
+  // flight per lane instead of one: the pass is latency-bound, not bandwidth-
+  // bound (one threadgroup, N*D elements), and a single lane's dependent chain
+  // leaves the memory system idle.
   float ss = 0.0f;
-  for (uint i = tid; i < nd; i += uint(TGSIZE)) {
+  uint i;
+  for (i = tid; i + 3u * uint(TGSIZE) < nd; i += 4u * uint(TGSIZE)) {
+    float v0 = float(streams[off + i]);
+    float v1 = float(streams[off + i + uint(TGSIZE)]);
+    float v2 = float(streams[off + i + 2u * uint(TGSIZE)]);
+    float v3 = float(streams[off + i + 3u * uint(TGSIZE)]);
+    ss = fma(v0, v0, ss);
+    ss = fma(v1, v1, ss);
+    ss = fma(v2, v2, ss);
+    ss = fma(v3, v3, ss);
+  }
+  for (; i < nd; i += uint(TGSIZE)) {
     float v = float(streams[off + i]);
     ss = fma(v, v, ss);
   }
@@ -71,8 +87,22 @@ const char* kHcSource = R"METAL(
   // --- pass 2: one projection output per warp ------------------------------
   if (warp < uint(NW)) {
     const device float* fj = fn + warp * nd;
+    // Same 4-deep load pipeline as pass 1: identical accumulation order, four
+    // times the memory-level parallelism (this pass is the site's cost - it
+    // streams one (NW, N*D) f32 matrix per position through a single warp).
     float d = 0.0f;
-    for (uint i = lane; i < nd; i += 32u) d = fma(float(streams[off + i]) * rms, fj[i], d);
+    uint i2 = lane;
+    for (; i2 + 96u < nd; i2 += 128u) {
+      float s0 = float(streams[off + i2]), f0 = fj[i2];
+      float s1 = float(streams[off + i2 + 32u]), f1 = fj[i2 + 32u];
+      float s2 = float(streams[off + i2 + 64u]), f2 = fj[i2 + 64u];
+      float s3 = float(streams[off + i2 + 96u]), f3 = fj[i2 + 96u];
+      d = fma(s0 * rms, f0, d);
+      d = fma(s1 * rms, f1, d);
+      d = fma(s2 * rms, f2, d);
+      d = fma(s3 * rms, f3, d);
+    }
+    for (; i2 < nd; i2 += 32u) d = fma(float(streams[off + i2]) * rms, fj[i2], d);
     d += simd_shuffle_xor(d, ushort(16));
     d += simd_shuffle_xor(d, ushort(8));
     d += simd_shuffle_xor(d, ushort(4));

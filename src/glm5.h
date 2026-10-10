@@ -26,6 +26,7 @@
 
 #include <mlx/mlx.h>
 
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -45,6 +46,30 @@ struct G5Linear {
   bool has_bias = false;
   int in_features = 0;
   int out_features = 0;
+};
+
+// Per-layer decode preparation for the MoE, built once from the loaded experts
+// (glm5_moe.cpp) and then reused by every decode step. Everything in here is a
+// pure re-layout of the checkpoint's own values - the byte-for-byte tensors the
+// grouped launch needs, so the per-token path does not rebuild them:
+//
+//   router_w_f32 router.weight cast to f32 (what the router's matmul consumes;
+//                the reference re-casts the whole (E, hidden) matrix per layer)
+//   suh_*/svh_*  one (experts, in|out) f16 stack per projection class (gate|up
+//                merged into one, in that member order), so the eight routed
+//                scale vectors of a step are one device-side `mx::take` away
+//                instead of an eight-way concatenate.
+//
+// `valid` is false when the layer's experts are not uniform in the way the
+// grouped path needs; moe_layer then takes the per-expert path.
+struct G5MoePrep {
+  mx::array router_w_f32 = mx::array(0.0f);
+  // The merged gate|up launch's scale stack: rows 0..E-1 are the gate experts,
+  // E..2E-1 the up ones (so the merged member list and its ids line up), then
+  // the down projection's own stack.
+  mx::array suh_gu = mx::array(0.0f), svh_gu = mx::array(0.0f);
+  mx::array suh_d = mx::array(0.0f), svh_d = mx::array(0.0f);
+  bool valid = false;
 };
 
 struct G5Layer {
@@ -81,6 +106,8 @@ struct G5Layer {
   std::vector<G5Linear> experts; // 3 per expert: gate, up, down (row-major)
   G5Linear shared_gate, shared_up, shared_down;
   mx::array router_w = mx::array(0.0f), router_bias = mx::array(0.0f);
+  // Lazily built by moe_layer's first decode call (see G5MoePrep).
+  mutable std::shared_ptr<G5MoePrep> moe_prep;
   // dense MLP (first_k_dense_replace layers)
   G5Linear dense_gate, dense_up, dense_down;
 };

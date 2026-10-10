@@ -76,39 +76,157 @@ mx::array dense_mlp(const G5Layer& l, const ModelConfig& cfg, const mx::array& h
   return swiglu(l.dense_gate, l.dense_up, l.dense_down, h, cfg.swiglu_limit);
 }
 
+namespace {
+
+// The layer's decode preparation (G5MoePrep in glm5.h), built on first use:
+// the router weight in the layout its matmul consumes, and one stacked scale
+// vector per projection class. Returns nullptr when the experts are not uniform
+// in the way the grouped forms need, in which case moe_layer takes the
+// per-expert path (the arithmetic is the same either way). The build is a pure
+// re-layout of the layer's own tensors; nothing here is per token.
+const G5MoePrep* moe_prep_of(const G5Layer& l, const ModelConfig& cfg) {
+  // EXL3_MOE_OLDPREP forces the pre-prepared path (the grouped launches built
+  // from the members' own scale vectors) so the two can be compared.
+  if (std::getenv("EXL3_MOE_OLDPREP")) return nullptr;
+  // Lazily built, without a lock: the decode path is single-threaded
+  // (Engine::generate holds the engine's mutex), and a raced build would only
+  // waste work, never produce a wrong result - the cache is written once, last.
+  if (l.moe_prep && l.moe_prep->valid) return l.moe_prep.get();
+  if (!l.moe || l.router_w.size() == 0) return nullptr;
+  const int E = cfg.n_routed_experts;
+  if (E <= 0 || (int)l.experts.size() != (size_t)E * 3) return nullptr;
+  // Every expert of a class must share the shape/quantization its neighbours
+  // have, otherwise a grouped launch cannot be geometrically uniform.
+  auto same = [](const G5Linear& a, const G5Linear& b) {
+    return a.quantized && b.quantized && !a.has_bias && !b.has_bias && a.tw.K == b.tw.K &&
+           a.tw.codebook == b.tw.codebook && a.tw.in_features == b.tw.in_features &&
+           a.tw.out_features == b.tw.out_features && a.tw.aligned == b.tw.aligned;
+  };
+  for (int e = 0; e < E; ++e) {
+    if (!same(l.experts[0], l.experts[(size_t)(e * 3 + 0)]) ||
+        !same(l.experts[1], l.experts[(size_t)(e * 3 + 1)]) ||
+        !same(l.experts[2], l.experts[(size_t)(e * 3 + 2)])) {
+      return nullptr;
+    }
+  }
+  auto prep = std::make_shared<G5MoePrep>();
+  // One (E*classes, width) stack per side: `which` lists the projection classes
+  // in member order (the merged launch's gate rows then up rows).
+  auto stack = [&](const std::vector<int>& which, bool in_side, mx::array& out) {
+    std::vector<mx::array> v;
+    v.reserve((size_t)E * which.size());
+    for (int w : which) {
+      for (int e = 0; e < E; ++e) {
+        const G5Linear& lin = l.experts[(size_t)(e * 3 + w)];
+        v.push_back(in_side ? lin.tw.suh : lin.tw.svh);
+      }
+    }
+    const G5Linear& ref = l.experts[(size_t)which[0]];
+    out = mx::reshape(mx::concatenate(v, 0),
+                      {(int)which.size() * E,
+                       in_side ? ref.tw.in_features : ref.tw.out_features});
+  };
+  // Only the cast is hoisted; the matmul keeps the operand graph it had (a
+  // transposed f32 view). Hoisting the cast alone is bit-safe - the prepared
+  // router and the per-token expression agree to 0.0 and select the same
+  // experts (tests/moe_bench.cpp prints that check) - and it removes the
+  // (E, hidden) f16->f32 cast, 14 MB of traffic, from every layer's step.
+  prep->router_w_f32 = mx::astype(l.router_w, mx::float32);
+  stack({0, 1}, true, prep->suh_gu);   // gate rows, then up rows
+  stack({0, 1}, false, prep->svh_gu);
+  stack({2}, true, prep->suh_d);
+  stack({2}, false, prep->svh_d);
+  mx::eval(prep->router_w_f32, prep->suh_gu, prep->svh_gu, prep->suh_d, prep->svh_d);
+  prep->valid = true;
+  l.moe_prep = prep;
+  return prep.get();
+}
+
+} // namespace
+
 mx::array moe_layer(const G5Layer& l, const ModelConfig& cfg, const mx::array& h) {
   const int B = (int)h.shape(0), L = (int)h.shape(1), H = (int)h.shape(2);
   const int N = B * L;
   const int E = cfg.n_routed_experts;
   const int K = cfg.num_experts_per_tok;
 
-  // Router logits in fp32 exactly as the reference (norm is folded into the
-  // preceding layer by the caller).
+  // The shared expert takes the same input and does not depend on the router,
+  // so it is built (and dispatched) before the routed path: the MoE's one host
+  // round trip - reading the selected ids back - then waits on a GPU that
+  // already has this work queued instead of on an idle one.
+  mx::array shared = swiglu(l.shared_gate, l.shared_up, l.shared_down, h, cfg.swiglu_limit);
+
+  // Router logits in fp32 exactly as the reference; the cast the expression
+  // below spells out per token is the prepared one when the layer has a prep.
+  const G5MoePrep* prep = moe_prep_of(l, cfg);
   mx::array x = mx::reshape(mx::astype(h, mx::float32), {N, H});
-  mx::array logits = mx::matmul(x, mx::transpose(mx::astype(l.router_w, mx::float32)));
+  mx::array logits = prep ? mx::matmul(x, mx::transpose(prep->router_w_f32))
+                          : mx::matmul(x, mx::transpose(mx::astype(l.router_w, mx::float32)));
   auto [weights, indices] = moe_topk_route(logits, l.router_bias, cfg.n_group, cfg.topk_group, K,
-                                           cfg.norm_topk_prob, cfg.routed_scaling_factor);
+                                          cfg.norm_topk_prob, cfg.routed_scaling_factor);
+
+  mx::array routed = mx::array(0.0f);
+  // Both A/B switches (moe_test drives all three implementations) must keep
+  // their meaning: EXL3_MOE_GENERAL forces the general gather/scatter path and
+  // EXL3_MOE_NONGROUPED the per-expert one.
+  if (N == 1 && prep != nullptr && std::getenv("EXL3_MOE_NONGROUPED") == nullptr &&
+      std::getenv("EXL3_MOE_GENERAL") == nullptr) {
+    // Decode fast path with the layer's prepared scale stacks: every work item
+    // reads the SAME row, so the per-expert gather/scatter bookkeeping collapses
+    // into three grouped launches (gate|up merged into one, then down) plus the
+    // weighted sum. The arithmetic is the general path's: each expert output is
+    // scaled in f32, rounded to the streams' dtype, and the K terms are summed
+    // k = 0, 1, ... in the same order the general path accumulates them.
+    mx::eval(indices);
+    const int32_t* idx = indices.data<int32_t>();
+    // The merged launch's member order is the scale stacks' row order: every
+    // routed gate expert first, then every routed up expert (see moe_prep_of).
+    std::vector<TrellisWeight> wgu, wd;
+    wgu.reserve((size_t)(2 * K));
+    wd.reserve((size_t)K);
+    for (int k = 0; k < K; ++k) wgu.push_back(l.experts[(size_t)((int)idx[k] * 3 + 0)].tw);
+    for (int k = 0; k < K; ++k) wgu.push_back(l.experts[(size_t)((int)idx[k] * 3 + 1)].tw);
+    for (int k = 0; k < K; ++k) wd.push_back(l.experts[(size_t)((int)idx[k] * 3 + 2)].tw);
+    mx::array flat = mx::reshape(h, {N, H});
+    // The scale stacks hold every gate expert's rows first (0..E-1), then every
+    // up expert's (E..2E-1): the up half of the launch indexes the stack at
+    // E + id.
+    mx::array ids_up = mx::add(indices, mx::array((int)E, mx::int32));
+    mx::array ids2 = mx::concatenate({indices, ids_up}, 0); // gate ids, then up ids
+    const float limit = cfg.swiglu_limit;
+    mx::array gu = trellis_linear_group_scaled(wgu, flat, mx::take(prep->suh_gu, ids2, 0),
+                                               mx::take(prep->svh_gu, ids2, 0));
+    const int inn = (int)wd[0].in_features;
+    mx::array gate = mx::slice(gu, {0, 0, 0}, {K, N, (int)wd[0].out_features});
+    mx::array up = mx::slice(gu, {K, 0, 0}, {2 * K, N, (int)wd[0].out_features});
+    gate = mx::clip(gate, std::nullopt, mx::array(limit, gate.dtype()));
+    up = mx::clip(up, mx::array(-limit, up.dtype()), mx::array(limit, up.dtype()));
+    mx::array act = mx::multiply(gate, mx::sigmoid(gate));
+    mx::array actup = mx::multiply(act, up);
+    const int rows_per = (int)(actup.size() / ((int64_t)K * inn));
+    mx::array down = trellis_linear_group_rows_scaled(wd, actup, rows_per,
+                                                      mx::take(prep->suh_d, indices, 0),
+                                                      mx::take(prep->svh_d, indices, 0));
+    // (K, rows, H) -> (K, rows, 1, H) and the general path's weighted sum.
+    mx::array st = mx::reshape(down, {K, N, 1, H});
+    mx::array wt = mx::reshape(weights, {K, 1, 1, 1});
+    routed = mx::reshape(mx::sum(mx::astype(mx::multiply(st, wt), h.dtype()), 0), {B, L, H});
+    return mx::add(routed, shared);
+  }
+
   mx::eval(indices);
 
   // Group the (token, top-k) work items by expert, mirroring the reference's
   // per-expert loop (each expert's weights are applied in one matmul).
   const int32_t* idx = indices.data<int32_t>();
-  mx::array routed = mx::array(0.0f);
   // The single-row (decode) fast path is numerically the general path's; this
   // switch forces the general one so the two can be compared (moe_test).
   const bool moe_general = std::getenv("EXL3_MOE_GENERAL") != nullptr;
   if (N == 1 && !moe_general) {
-    // Decode fast path: every work item reads the SAME row, so the per-expert
-    // gather + scatter bookkeeping (an index upload, two takes, a broadcast, a
-    // scatter-add and an astype per expert) collapses into one stack plus a
-    // weighted sum. The arithmetic is the general path's: each expert output is
-    // scaled in f32, rounded to the streams' dtype, and the K terms are summed
-    // k = 0, 1, ... in the same order the general path accumulates them.
-    //
-    // Grouped form (EXL3_MOE_NONGROUPED disables it): the 8 routed experts are
-    // applied as three multi-buffer launches - gate, up and down - instead of
-    // 3*K single-tensor linears, each launch keeping every member's own scale
-    // vectors, split geometry and accumulation order (see
+    // Decode fallback (no prepared stacks, or EXL3_MOE_NONGROUPED): the 8
+    // routed experts are applied as three multi-buffer launches - gate, up and
+    // down - instead of 3*K single-tensor linears, each launch keeping every
+    // member's own scale vectors, split geometry and accumulation order (see
     // trellis_linear_group). The elementwise swiglu then runs on the stacked
     // (K, 1, out) arrays, which is the same arithmetic on the same values.
     bool grouped = std::getenv("EXL3_MOE_NONGROUPED") == nullptr;
@@ -195,7 +313,6 @@ mx::array moe_layer(const G5Layer& l, const ModelConfig& cfg, const mx::array& h
     }
     routed = mx::reshape(mx::sum(mx::reshape(acc, {N, K, H}), 1), {B, L, H});
   }
-  mx::array shared = swiglu(l.shared_gate, l.shared_up, l.shared_down, h, cfg.swiglu_limit);
   return mx::add(routed, shared);
 }
 
