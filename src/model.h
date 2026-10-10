@@ -14,7 +14,11 @@ namespace exl3 {
 
 namespace mx = mlx::core;
 
+enum class Arch { Llama, Glm5Next };
+
 struct ModelConfig {
+  Arch arch = Arch::Llama;
+  std::string tensor_prefix = "model."; // "model.language_model." for GLM-5 VL checkpoints
   int hidden_size = 0;
   int num_layers = 0;
   int num_heads = 0;
@@ -27,6 +31,36 @@ struct ModelConfig {
   float rope_theta = 10000.0f;
   int bos_token_id = -1;
   std::vector<int> eos_token_ids;
+
+  // --- GLM-5-Next / GLM-5.3-Flash ---
+  struct LayerPlan {
+    bool linear_attention = false; // KDA recurrent layer
+    bool sparse_attention = false; // MLA + DSA indexer
+    bool moe = false;
+  };
+  std::vector<LayerPlan> layer_plan;
+  int first_k_dense_replace = 0;
+  int n_routed_experts = 0;
+  int num_experts_per_tok = 0;
+  int moe_intermediate_size = 0;
+  int n_shared_experts = 0;
+  float routed_scaling_factor = 1.0f;
+  float swiglu_limit = 0.0f;
+  bool norm_topk_prob = false;
+  int q_lora_rank = 0;
+  int kv_lora_rank = 0;
+  int qk_head_dim = 0;   // MLA (nope-only: no rope dims in this checkpoint)
+  int v_head_dim = 0;
+  int index_n_heads = 0; // DSA lightning indexer
+  int index_head_dim = 0;
+  int index_topk = 0;
+  int index_kpool = 0;
+  bool index_kpool_compress = false;
+  bool index_kpool_always_select_tail = false;
+  bool mhc = false;      // hyper-connections
+  int hc_mult = 0;
+  int hc_sinkhorn_iters = 0;
+  int num_nextn_predict_layers = 0;
 
   static bool load(const std::string& dir, ModelConfig& out, std::string& err);
 };

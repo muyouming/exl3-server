@@ -81,6 +81,17 @@ bool ModelConfig::load(const std::string& dir, ModelConfig& out, std::string& er
   nlohmann::json j;
   if (!parse_json_file(dir + "/config.json", j, err)) return false;
   try {
+    const std::string model_type = j.value("model_type", std::string());
+    if (model_type.rfind("glm5", 0) == 0 || model_type.rfind("qwen3_5", 0) == 0) {
+      // VL-style checkpoints nest the text model parameters under text_config.
+      if (!j.contains("text_config")) {
+        err = "config.json: " + model_type + " expects a text_config object";
+        return false;
+      }
+      out.arch = Arch::Glm5Next;
+      out.tensor_prefix = "model.language_model.";
+      j = j["text_config"];
+    }
     out.hidden_size = j.at("hidden_size").get<int>();
     out.num_layers = j.at("num_hidden_layers").get<int>();
     out.num_heads = j.at("num_attention_heads").get<int>();
@@ -102,6 +113,54 @@ bool ModelConfig::load(const std::string& dir, ModelConfig& out, std::string& er
     if (j.contains("rope_scaling") && !j["rope_scaling"].is_null()) {
       err = "rope_scaling is not supported by this engine";
       return false;
+    }
+    if (out.arch == Arch::Glm5Next) {
+      const auto layers = j.at("layer_types");
+      const auto mlps = j.at("mlp_layer_types");
+      if (layers.size() != mlps.size() || (int)layers.size() != out.num_layers) {
+        err = "config.json: layer_types/mlp_layer_types do not match num_hidden_layers";
+        return false;
+      }
+      out.layer_plan.resize(layers.size());
+      for (size_t i = 0; i < layers.size(); ++i) {
+        const std::string lt = layers[i].get<std::string>();
+        out.layer_plan[i].linear_attention = lt.rfind("linear_attention", 0) == 0;
+        out.layer_plan[i].sparse_attention = lt.rfind("deepseek_sparse_attention", 0) == 0;
+        out.layer_plan[i].moe = mlps[i].get<std::string>() == "sparse";
+        if (!out.layer_plan[i].linear_attention && !out.layer_plan[i].sparse_attention) {
+          err = "config.json: unsupported layer_type " + lt;
+          return false;
+        }
+      }
+      out.first_k_dense_replace = j.value("first_k_dense_replace", 0);
+      out.n_routed_experts = j.value("n_routed_experts", 0);
+      out.num_experts_per_tok = j.value("num_experts_per_tok", 0);
+      out.moe_intermediate_size = j.value("moe_intermediate_size", 0);
+      out.n_shared_experts = j.value("n_shared_experts", 0);
+      out.routed_scaling_factor = j.value("routed_scaling_factor", 1.0f);
+      out.swiglu_limit = j.value("swiglu_limit", 0.0f);
+      out.norm_topk_prob = j.value("norm_topk_prob", false);
+      out.q_lora_rank = j.value("q_lora_rank", 0);
+      out.kv_lora_rank = j.value("kv_lora_rank", 0);
+      out.qk_head_dim = j.value("qk_head_dim", 0);
+      out.v_head_dim = j.value("v_head_dim", 0);
+      out.index_n_heads = j.value("index_n_heads", 0);
+      out.index_head_dim = j.value("index_head_dim", 0);
+      out.index_topk = j.value("index_topk", 0);
+      out.index_kpool = j.value("index_kpool", 0);
+      out.index_kpool_compress = j.value("index_kpool_compress", false);
+      out.index_kpool_always_select_tail = j.value("index_kpool_always_select_tail", false);
+      out.mhc = j.value("mhc", false);
+      out.hc_mult = j.value("hc_mult", 0);
+      out.hc_sinkhorn_iters = j.value("hc_sinkhorn_iters", 0);
+      out.num_nextn_predict_layers = j.value("num_nextn_predict_layers", 0);
+      // MLA heads: the nope-only checkpoints carry no rope dims.
+      out.head_dim = j.value("qk_nope_head_dim", 0) > 0 ? j.value("qk_nope_head_dim", 0)
+                                                        : out.head_dim;
+      if (j.value("qk_rope_head_dim", 0) != 0) {
+        err = "config.json: MLA with qk_rope_head_dim > 0 is not supported yet";
+        return false;
+      }
     }
   } catch (const std::exception& e) {
     err = std::string("config.json: ") + e.what();
