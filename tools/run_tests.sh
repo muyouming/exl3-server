@@ -68,7 +68,10 @@ if [ -n "$LIGHT" ]; then
 fi
 for n in $GLM; do
   echo "== GLM test (serial, 100 GB): $n =="
-  "$OUT/$n" 2>&1 | tail -6 | sed 's/^/    /' || rc=1
+  # The checkpoint tests take the model directory as their first argument; not
+  # passing it made every one of them print usage and exit 2 (so the runner
+  # reported rc=1 while running nothing).
+  "$OUT/$n" "$MODEL" 2>&1 | tail -8 | sed 's/^/    /' || rc=1
 done
 echo "== done (rc=$rc) =="
 exit $rc
