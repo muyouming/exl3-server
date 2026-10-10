@@ -184,3 +184,140 @@ graph, not the kernel (see the correction above).
   and runs them with full parallelism for the light tests while serialising the
   ones that map the 100 GB checkpoint (two of those would evict each other's
   pages on a 128 GB machine and be slower than running them one at a time).
+
+## Third pass (2026-10-10): the per-layer machinery, measured stage by stage
+
+This pass set out to remove the MoE's one-host-sync-per-layer and fuse the two
+Hadamards, and it starts by *measuring* rather than reasoning about the sync.
+Two things came out of that, one of which changes the whole picture:
+
+**The profiled breakdown is not the step.** `tests/glm5_bench.cpp`'s per-stage
+breakdown evaluates at every stage boundary, and in the real loop each of those
+~360 barriers costs ~0.3 ms: the instrumented run reports 274 ms/step where the
+uninstrumented one is 133-162 ms, and its component numbers are inflated by
+roughly the same factor (MoE 138 "ms" of which ~130 is not the MoE). It is still
+the right *relative* instrument, but absolute attribution needs a different
+one: `tests/moe_bench.cpp` times one component per (build graph -> eval) cycle
+with `reps` repetitions, and subtracts a "null" row (one elementwise op plus the
+same sync). Run it on the real checkpoint:
+
+```
+/tmp/moe_bench 20 1 <model_dir>   # a fresh process is up to 2x slower than the
+                                  # second one (Metal shader cache + DVFS), so
+                                  # every number here is from the second run
+```
+
+| component | ms per call | calls/token | ms/token | notes |
+|---|---|---|---|---|
+| `moe_layer` (MoE layers) | 0.83-0.95 | 42 | ~36 | layer 4 (K=3) and layer 12 (K=2) |
+| `kda_layer` | 0.73-0.80 | 34 | ~25 | qkv_proj alone is 50.3 MB |
+| `mla_layer` + `indexer_topk` + `mla_q_resid` | 1.45-2.0 | 11 | ~16 | the indexer is host CPU code plus two syncs |
+| `hc_prepare` (one site) | 0.194 -> **0.089** | 90 | 17.5 -> **8** | this pass |
+| `rms_norm` | 0.025 | 90 | 2.3 | |
+| `hc_mix` | 0.006 | 90 | 0.5 | |
+| `lm_head` (4096 -> 154880, 317 MB) | 2.68 | 1 | 2.7 | 118 GB/s: one kernel, one big tensor |
+
+The null row itself is 0.12-0.13 ms, i.e. one `mx::eval`, which is why the
+per-call numbers only mean anything after subtracting it.
+
+**Inside one MoE layer** (real weights, decode shape):
+
+| stage | ms | share |
+|---|---|---|
+| router: logits matmul + 25-op top-k + the ids eval | 0.10-0.14 | 12% |
+| 3 grouped expert launches (gate, up, down; 75 MB) | 0.49-0.51 | 60% |
+| shared expert (3 trellis linears, 12.6 MB) | 0.12-0.13 | 15% |
+| weighted sum + residual + the elementwise glue | ~0.1 | 12% |
+
+So the layer is ~72% weight reads at the QMV's own rate, and the machinery is
+the rest - not the other way round. The grouped expert launches read 25 MB in
+0.147-0.166 ms, i.e. **150-170 GB/s**; the same launch over eight *different*
+layers' experts (cold, 400 MB of distinct bytes) costs 3% more, and eight such
+launches in one eval scale linearly, so this is the kernel's issue-bound rate
+for these shapes, not the launch or the page cache. One big tensor (`lm_head`,
+317 MB, 9680 output tiles) gets 118 GB/s from the same kernel.
+
+**What the host sync actually costs.** With the ids handed over by the host
+(the shipped path minus the `mx::eval` and the host-side buffer list), the
+routed part of a layer drops from ~0.60 to ~0.50 ms: **~0.10 ms per layer,
+4.2 ms per token, ~3%**. Removing it is worth having, but it is not where the
+step goes.
+
+**Why the two suggested mechanisms for removing it are not viable here:**
+
+1. *A pointer table* (the kernel reading each member's weight address from a
+   device buffer) is impossible: a Metal buffer's GPU address is not the host
+   address MLX hands out, so a raw pointer stored in a buffer dereferences to
+   zero (`/tmp/ptr_probe.cpp`: an mmap-backed view *and* a `malloc`'d
+   `trellis_pack` buffer both read 0 through the table; MLX exposes no
+   `MTLBuffer.gpuAddress`).
+2. *An expert arena* needs 288 experts x 3 projections x 42 layers = 98.3 GB
+   contiguous, and the checkpoint's routed experts are exactly that much: an
+   anonymous copy is the 2x-loss case this file already measured (MoE
+   123 -> 257 ms), and a page-remap arena (MAP_FIXED over the shard pages, one
+   offset table per class, a per-member aligned/byte word-path split in the
+   kernel) is a large, high-risk change for those 4 ms.
+
+What *is* in the tree from this lever, all bit-identical by construction:
+
+- `G5MoePrep` (glm5.h + glm5_moe.cpp): per-layer, built once on the first
+  decode step - the router weight cast to f32 (the reference re-casts the whole
+  288x4096 f16 matrix per layer, 14 MB of traffic), and one (E, in|out) f16
+  stack per projection class (gate|up merged, in that member order) so the
+  step's scale vectors are one device-side `mx::take(stack, ids)` instead of two
+  eight-way concatenates.
+- the merged gate|up launch, so the two 4096->2048 QMVs and their two input
+  Hadamards become one launch each (member k of the merged launch keeps its own
+  weight buffer, scale vector, split geometry and k-order - the scale stack is
+  indexed at `E + id` for the up half, which is what the first version of this
+  change got wrong: the real-checkpoint identity check below is what caught it).
+- the shared expert is dispatched *before* the ids readback, so the GPU has that
+  work queued while the CPU waits for the router instead of idling.
+- `hc_prepare`'s kernel: four loads are issued before their four dependent FMAs
+  in pass 1 and pass 2. Same accumulation order, four requests in flight
+  instead of one: 2.2x on the site (0.194 -> 0.089 ms), which is 9 ms/token of
+  the step. The kernel is one threadgroup per position streaming a
+  (24, 16384) f32 matrix = 1.57 MB, i.e. it was ~8 GB/s of latency-bound
+  single-SM traffic; 8-deep gave nothing more.
+
+**Gates for this pass** (all green, same session as the numbers):
+
+- `tests/moe_test.cpp`'s (f) section hashes the grouped, per-expert and general
+  MoE against each other on quantized experts. It was silently vacuous before
+  this pass - the new path returned before consulting `EXL3_MOE_GENERAL`, so the
+  "general" hash was the new path again - and the three now genuinely differ.
+- `tests/moe_bench.cpp` prints an identity line on the *real* layer 4 (2.7 GB of
+  weights): `prepared == old-grouped == general`, byte for byte.
+- the greedy text of the end-to-end bench is unchanged, and `hc_test` /
+  `moe_test` / the rest of `tools/run_tests.sh` stay green.
+
+**Honest distance to 14.3 ms/step.** A token reads ~6 GB of trellis weights
+(the routed experts are 2.7 GB of it, qkv 1.7, o_proj 0.57, shared 0.53, the
+lm_head 0.32) and the trellis GEMV delivers 118-170 GB/s on the shapes this
+model uses, so the reads alone are 35-45 ms. 14.3 ms would need ~420 GB/s
+*and* the ~58 ms of per-layer machinery above to disappear; the machinery is
+per-layer *launches* (a `hc_prepare` site was 0.19 ms for one kernel launch,
+`lm_head` 2.7 ms), which is a different problem from the one this pass set out
+to solve. What this pass moved is the ~9 ms of `hc_prepare` and ~1-4 ms of
+per-token re-layout; the per-layer sync it was aimed at is worth 4 ms.
+
+### End to end, same session, interleaved, warm
+
+Three rounds of `before`/`after` alternating in one session (16 tokens per take,
+24 warm-up steps, best-of-3 repeats inside each run; every run's greedy text is
+identical, first token 785):
+
+| run | serial ms/step | serial tok/s | `--draft-mtp 4` ms/step | effective tok/s |
+|---|---|---|---|---|
+| before (HEAD) #1 / #2 / #3 | 125.8 / 172.3 / 146.0 | 7.95 / 5.80 / 6.85 | 88.0 / 134.4 / 119.5 | 11.36 / 7.44 / 8.37 |
+| after #1 / #2 / #3 | 140.8 / 116.0 / 161.0 | 7.10 / 8.62 / 6.21 | 110.1 / 87.8 / 128.8 | 9.08 / 11.39 / 7.77 |
+| **best** | **125.8 -> 116.0** | 7.95 -> 8.62 | **88.0 -> 87.8** | 11.36 -> 11.39 |
+| median | 146.0 -> 140.8 | | 119.5 -> 110.1 | |
+
+The spread between two runs of the *same* binary here is +-30% (125.8 to 172.3),
+so a 5-10% change is not resolvable end to end on this box; the changes are
+neutral-to-better on both the best and the median, and the component-level rows
+above (sub-second, single process) are the instrument that actually resolves a
+change of this size. (Both runs in the ticket's baseline came from a colder
+page cache: the earlier session measured 152.8/116.8 ms/step for the same binary
+that reads 125.8/88.0 here.)
