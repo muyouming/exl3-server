@@ -235,6 +235,22 @@ Notes that matter for a faithful port:
 - MLX exposes `fast::gated_delta_update`, but the reference above is the exact
   formula to validate against before trusting the primitive.
 
+## Non-layer tensors and MTP (verified from the real index.json, 151554 tensors)
+
+```
+lm_head.{trellis,suh,svh,mul1}                     # EXL3-quantised lm_head
+model.language_model.embed_tokens.weight
+model.language_model.norm.weight
+model.visual.*                                     # 957 tensors, skipped (text-only engine)
+```
+
+**There are no `mtp.*` tensors in this checkpoint** even though the config says
+`num_nextn_predict_layers = 1`: the quantiser did not convert a next-token
+prediction block. Speculative decoding for this model therefore has to use the
+existing n-gram drafter (`--draft-ngram`), not an MTP head. Other config facts:
+`dtype` (of the unquantised source) bfloat16, `hidden_act` silu,
+`tie_word_embeddings` false, `index_head_dim` 128, `head_dim` 0 (unused).
+
 ## VERIFIED on-disk tensor names (from model.safetensors.index.json, real checkpoint)
 
 `layer_types` (45): layers 0,1,2 are `linear_attention` **and dense** MLP
