@@ -44,10 +44,13 @@ class Tokenizer {
     std::string pending_;
   };
 
+  bool glm_style_ = false; // set by load() from the vocabulary
+
   // Render the model's chat template. `thinking` < 0 leaves the template's
   // enable_thinking undefined, 0 renders an empty think block, 1 opens one.
   std::string render_chat(const std::vector<ChatMessage>& messages,
-                          bool add_generation_prompt, int thinking = 0) const;
+                          bool add_generation_prompt = true, int thinking = -1,
+                          const std::string& reasoning_effort = "") const;
 
   int vocab_size() const { return (int)id_text_.size(); }
   int id_of(const std::string& token) const;

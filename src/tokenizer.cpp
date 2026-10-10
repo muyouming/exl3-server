@@ -459,6 +459,15 @@ bool Tokenizer::load(const std::string& dir, std::string& err) {
     return false;
   }
 
+  // The GLM checkpoints use a different chat template; pick the renderer from
+  // the vocabulary rather than a config flag (same file, same load path).
+  {
+    auto has = [&](const char* t) {
+      return std::find(id_text_.begin(), id_text_.end(), std::string(t)) != id_text_.end();
+    };
+    glm_style_ = has("[gMASK]") && has("<|user|>") && has("<|assistant|>");
+  }
+
   // Every byte must exist as a single-character token for byte-level BPE.
   const auto& b2c = byte_to_cp_table();
   for (int b = 0; b < 256; ++b) {
@@ -727,8 +736,62 @@ static std::string strip_ws(const std::string& s, bool left, bool right) {
   return s.substr(a, b - a);
 }
 
+// GLM-5 / GLM-4 chat template (chat_template.jinja in the checkpoint), which is
+// entirely different from the MiniCPM5/Qwen "<|im_start|>" layout. Rendered
+// paths: system (with the reasoning-effort line), user, assistant (think block
+// + content), tool observations. Not representable in ChatMessage and therefore
+// out of scope: the tools preamble, media placeholders, tool_call arguments and
+// tool-call-id based reordering of results (results are emitted in the order
+// given, which is the template's own fallback branch).
+static std::string render_chat_glm(const std::vector<ChatMessage>& messages,
+                                   bool add_generation_prompt, int thinking,
+                                   const std::string& reasoning_effort) {
+  std::string out = "[gMASK]<sop>";
+  std::string effort = "Max";
+  if (reasoning_effort == "low") effort = "Low";
+  else if (reasoning_effort == "high") effort = "High";
+  out += "<|system|>Reasoning Effort: " + effort;
+  const bool clear_thinking = (thinking == 0);
+  // index of the last user message (turns after it keep their thinking)
+  int last_user = -1;
+  for (size_t i = 0; i < messages.size(); ++i)
+    if (messages[i].role == "user") last_user = (int)i;
+  for (size_t i = 0; i < messages.size(); ++i) {
+    const ChatMessage& m = messages[i];
+    if (m.role == "user") {
+      out += "<|user|>" + m.content;
+    } else if (m.role == "assistant") {
+      out += "<|assistant|>";
+      // The template splits on the FIRST </think> and keeps the reasoning raw
+      // (content.split('</think>')[0].split('<think>')[-1]); only the remaining
+      // content is stripped.
+      std::string reasoning, rest = m.content;
+      size_t close = m.content.find("</think>");
+      if (close != std::string::npos) {
+        std::string head = m.content.substr(0, close);
+        size_t open = head.rfind("<think>");
+        reasoning = open == std::string::npos ? head : head.substr(open + 7);
+        rest = m.content.substr(close + 8);
+      }
+      const bool keep = !clear_thinking || (int)i > last_user;
+      if (keep && close != std::string::npos) out += "<think>" + reasoning + "</think>";
+      else out += "<think></think>";
+      out += strip_ws(rest, true, true);
+    } else if (m.role == "tool") {
+      if (i == 0 || messages[i - 1].role != "tool") out += "<|observation|>";
+      out += "<tool_response>" + m.content + "</tool_response>";
+    } else if (m.role == "system") {
+      out += "<|system|>" + m.content;
+    }
+  }
+  if (add_generation_prompt) out += "<|assistant|><think>";
+  return out;
+}
+
 std::string Tokenizer::render_chat(const std::vector<ChatMessage>& messages,
-                                   bool add_generation_prompt, int thinking) const {
+                                   bool add_generation_prompt, int thinking,
+                                   const std::string& reasoning_effort) const {
+  if (glm_style_) return render_chat_glm(messages, add_generation_prompt, thinking, reasoning_effort);
   std::string out;
   out += "<s>";
   if (!messages.empty() && messages[0].role == "system") {

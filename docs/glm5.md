@@ -155,10 +155,34 @@ boundaries via the new `Tokenizer::pretokenize`, not on token strings.)
 
 ## Chat template (from the checkpoint's `chat_template.jinja`)
 
-`[gMASK]<sop>` prompt prefix, `<|system|>Reasoning Effort: {Low|High|Max}` for a
-reasoning-effort control, then `<|user|>` / `<|assistant|>` turns with a
-`<think>`-style reasoning block; tool definitions are rendered between the
-template's tool markers.
+**Implemented** (`render_chat_glm` in src/tokenizer.cpp, selected automatically
+when the vocabulary has `[gMASK]`/`<|user|>`/`<|assistant|>`). Verified
+byte-for-byte against the real template rendered with jinja2 - see
+`tools/render_chat_reference.py` and `tests/chat_template_test.cpp` (5 cases:
+plain turn, effort + no generation prompt, reasoning content, tool
+observations, clear_thinking).
+
+Rendered layout (the template uses `-` whitespace control everywhere, so the
+result has NO cosmetic newlines - only the special tokens delimit things):
+
+```
+[gMASK]<sop><|system|>Reasoning Effort: {Low|High|Max}
+<|user|>{content}<|assistant|><think>{reasoning}</think>{content}<|assistant|><think>
+```
+
+- `reasoning_effort`: the template accepts only `low`/`high`, everything else
+  (including unset) renders `Max`; exposed as render_chat's 4th argument.
+- A turn whose content contains `</think>` is split at the FIRST `</think>`
+  and the reasoning is emitted RAW (not stripped); only the remaining content
+  is stripped.
+- `clear_thinking` (= `thinking == 0`) drops reasoning from turns at or before
+  the last user message.
+- Tool results: `<|observation|>` opens a run of tool messages, each wrapped as
+  `<tool_response>...</tool_response>` in the order given (the template's
+  fallback branch; reordering by tool_call_id needs ids the engine does not
+  carry).
+- Out of scope (unreachable in the engine's data model): the tools preamble,
+  media placeholders, tool_call argument XML.
 
 ## Implementation order
 
