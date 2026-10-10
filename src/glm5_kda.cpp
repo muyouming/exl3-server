@@ -74,8 +74,9 @@ mx::array kda_recurrence(const mx::array& q, const mx::array& k, const mx::array
     mx::array q_i = mx::squeeze(mx::slice(qf, {0, i, 0, 0}, {B, i + 1, H, kd}), 1);
     mx::array k_i = mx::squeeze(mx::slice(kf, {0, i, 0, 0}, {B, i + 1, H, kd}), 1);
     mx::array v_i = mx::squeeze(mx::slice(vf, {0, i, 0, 0}, {B, i + 1, H, vd}), 1);
-    mx::array g_i = mx::reshape(mx::squeeze(mx::slice(gf, {0, i, 0, 0}, {B, i + 1, H, 1}), 1),
-                                {B, H, 1, 1});
+    // decay is per (head, k-dim): g has shape (B, L, H, kd)
+    mx::array g_i = mx::expand_dims(mx::squeeze(mx::slice(gf, {0, i, 0, 0}, {B, i + 1, H, kd}), 1),
+                                    -1);
     mx::array b_i = mx::squeeze(mx::slice(bf, {0, i, 0, 0}, {B, i + 1, H, 1}), 1);
     S = mx::multiply(S, mx::exp(g_i));
     mx::array kv = mx::sum(mx::multiply(S, mx::expand_dims(k_i, -1)), std::vector<int>{-2}, false);
@@ -87,6 +88,57 @@ mx::array kda_recurrence(const mx::array& q, const mx::array& k, const mx::array
   mx::array out = outs[0];
   for (size_t i = 1; i < outs.size(); ++i) out = mx::concatenate({out, outs[i]}, 1);
   return out;
+}
+
+mx::array rms_norm_gated(const mx::array& x, const mx::array& weight, const mx::array& gate,
+                         float eps) {
+  mx::array xf = mx::astype(x, mx::float32);
+  mx::array var = mx::mean(mx::multiply(xf, xf), std::vector<int>{-1}, true);
+  mx::array y = mx::multiply(xf, mx::rsqrt(mx::add(var, mx::array(eps, mx::float32))));
+  y = mx::multiply(y, mx::astype(weight, mx::float32));
+  return mx::multiply(y, mx::sigmoid(mx::astype(gate, mx::float32)));
+}
+
+mx::array g5_linear(const G5Linear& lin, const mx::array& x) {
+  mx::array y = lin.quantized ? trellis_linear(lin.tw, x) : mx::matmul(x, lin.w);
+  if (lin.has_bias) y = mx::add(y, mx::astype(lin.bias, y.dtype()));
+  return y;
+}
+
+mx::array kda_layer(const G5Layer& l, const ModelConfig& cfg, const mx::array& h, KdaState& state) {
+  const int B = (int)h.shape(0), L = (int)h.shape(1);
+  const int H = cfg.layer_plan.empty() ? 0 : (l.kda_q.out_features / 128);
+  const int kd = 128;
+  // 1) q,k,v projections and the causal conv over their concatenation
+  mx::array mixed = mx::concatenate(
+      {g5_linear(l.kda_q, h), g5_linear(l.kda_k, h), g5_linear(l.kda_v, h)}, -1); // (B,L,3*H*kd)
+  const int C = (int)mixed.shape(2);
+  const int klen = (int)l.conv1d_w.shape(l.conv1d_w.ndim() - 1);
+  mx::array conv_in = mixed;
+  if (state.conv_window.size() > 1) {
+    conv_in = mx::concatenate({state.conv_window, mx::astype(mixed, mx::float32)}, 1);
+  }
+  state.conv_window =
+      mx::slice(conv_in, {0, (int)conv_in.shape(1) - (klen - 1), 0}, {B, (int)conv_in.shape(1), C});
+  mx::array conved = mx::astype(kda_conv1d(conv_in, l.conv1d_w, l.conv1d_b), mixed.dtype());
+  conved = mx::slice(conved, {0, (int)conved.shape(1) - L, 0}, {B, (int)conved.shape(1), C});
+  const int qkv = H * kd;
+  auto part = [&](int which) {
+    return mx::reshape(mx::slice(conved, {0, 0, which * qkv}, {B, L, (which + 1) * qkv}),
+                       {B, L, H, kd});
+  };
+  mx::array q = part(0), k = part(1), v = part(2);
+  // 2) forget-gate decay and beta
+  mx::array fg = g5_linear(l.kda_f_b, g5_linear(l.kda_f_a, h)); // (B,L,H*kd)
+  mx::array g = mx::reshape(
+      kda_decay(fg, l.dt_bias, l.a_log), {B, L, H, kd});         // per (head,dim) decay
+  mx::array beta = mx::reshape(mx::astype(g5_linear(l.kda_b, h), mx::float32), {B, L, H, 1});
+  // 3) delta-rule recurrence
+  mx::array core = kda_recurrence(q, k, v, g, beta, &state.recurrent); // (B,L,H,kd)
+  // 4) output gate and projection
+  mx::array gate = mx::reshape(g5_linear(l.kda_g_b, g5_linear(l.kda_g_a, h)), {B, L, H, kd});
+  mx::array out = rms_norm_gated(core, l.o_norm, gate, 1e-6f);
+  return g5_linear(l.kda_o, mx::reshape(out, {B, L, H * kd}));
 }
 
 } // namespace exl3

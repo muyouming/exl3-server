@@ -5,6 +5,9 @@
 
 #include <mlx/mlx.h>
 
+#include "glm5.h"
+#include "model.h"
+
 namespace exl3 {
 namespace mx = mlx::core;
 
@@ -21,11 +24,30 @@ mx::array kda_decay(const mx::array& fg, const mx::array& dt_bias, const mx::arr
 mx::array kda_conv1d(const mx::array& x, const mx::array& w, const mx::array& b);
 
 // Delta-rule recurrence (recurrent_kimi_delta_attention), all math in fp32:
-//   q,k (B,L,H,kd)  v (B,L,H,vd)  g (B,L,H,1) decay per head  beta (B,L,H,1)
+//   q,k (B,L,H,kd)  v (B,L,H,vd)  g (B,L,H,kd) per-(head,dim) decay  beta (B,L,H,1)
 //   S[i] = S[i-1]*exp(g_i); kv = (S*k_i).sum(kd); delta = (v_i-kv)*beta_i;
 //   S[i] += k_i (x) delta;  out[i] = (S[i]*q_i).sum(kd)
 // q is l2-normalised and scaled by 1/sqrt(kd) before use.
 mx::array kda_recurrence(const mx::array& q, const mx::array& k, const mx::array& v,
                          const mx::array& g, const mx::array& beta, mx::array* state = nullptr);
+
+// Gated RMSNorm (Glm5NextTextRMSNormGated): y = norm(x) * weight * sigmoid(gate),
+// fp32 internally, norm over the last dim.
+mx::array rms_norm_gated(const mx::array& x, const mx::array& weight, const mx::array& gate,
+                         float eps);
+
+// Per-layer KDA state for incremental decoding.
+struct KdaState {
+  mx::array conv_window = mx::array(0.0f); // (B, k-1, C) f32 conv history
+  mx::array recurrent = mx::array(0.0f);   // (B, H, kd, vd) f32 delta-rule state
+};
+
+// Apply one linear (EXL3 trellis or plain f16 weight) to x.
+mx::array g5_linear(const G5Linear& lin, const mx::array& x);
+
+// One full KDA layer (Glm5NextTextLinearAttention.forward): conv1d over
+// concat(q,k,v) with rolling state, forget-gate decay, delta-rule recurrence,
+// gated output norm and the output projection. h is (B, L, hidden).
+mx::array kda_layer(const G5Layer& l, const ModelConfig& cfg, const mx::array& h, KdaState& state);
 
 } // namespace exl3

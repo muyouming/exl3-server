@@ -228,11 +228,23 @@ out       = RMSNormGated(out)             # o_norm.weight, gated
 out       = o_proj(out)                   # output gate: g_a_proj -> SiLU -> g_b_proj -> sigmoid
 ```
 
+Decay granularity (verified in the reference): `g` from the forget gate is
+viewed as (B, L, heads, head_dim) and `recurrent_kimi_delta_attention` does
+`g[:, i][..., None].exp()`, so the decay is **per (head, k-dim)**, not per head.
+`beta` on the other hand is (B, L, heads) - a per-head scalar.
+
+The gated output norm (`Glm5NextTextRMSNormGated`, 374) is fp32 and uses
+`sigmoid` (not SiLU): `y = x * rsqrt(mean(x^2,-1) + eps) * weight * sigmoid(gate)`,
+with the gate coming from `g_b_proj(g_a_proj(h))` viewed as (B,L,heads,head_dim).
+
 Status: the recurrence itself (`kda_recurrence`, `kda_l2norm`, `kda_decay`,
 `kda_conv1d` in `src/glm5_kda.cpp`) is implemented and verified against the
 reference formula evaluated as a scalar fp64 oracle - `tests/kda_recurrence_test.cpp`
-reports max|diff| ~4e-8 with 0/56 mismatches. Still to wire: the per-layer
-projections, the conv1d rolling state and the gated output norm.
+reports max|diff| ~4e-8 with 0/56 mismatches. `kda_layer()` performs the whole layer (conv1d with
+rolling state -> projections -> decay -> recurrence -> gated norm -> o_proj);
+it compiles against the loader's `G5Layer`/`G5Linear` and is exercised
+end-to-end once real weights land (the recurrence underneath is already
+verified numerically).
 
 Recurrent-state details for the engine: the conv keeps a 3-position rolling
 window (kernel 4) and the delta rule keeps one (heads, k_head_dim, v_head_dim)

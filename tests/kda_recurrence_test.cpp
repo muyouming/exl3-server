@@ -18,18 +18,18 @@ int main() {
   const int B = 1, L = 7, H = 2, KD = 4, VD = 4;
   std::mt19937 rng(11);
   std::normal_distribution<float> nd(0, 1);
-  std::vector<float> q((size_t)B*L*H*KD), k(q.size()), v((size_t)B*L*H*VD), g((size_t)B*L*H), beta((size_t)B*L*H);
+  std::vector<float> q((size_t)B*L*H*KD), k(q.size()), v((size_t)B*L*H*VD), g((size_t)B*L*H*KD), beta((size_t)B*L*H);
   for (auto& x : q) x = nd(rng);
   for (auto& x : k) x = nd(rng);
   for (auto& x : v) x = nd(rng);
-  for (auto& x : g) x = -0.1f - 0.3f * std::fabs(nd(rng));   // negative decay, as the model produces
+  for (auto& x : g) x = -0.1f - 0.3f * std::fabs(nd(rng));   // per (head, dim) decay, as the model produces
   for (auto& x : beta) x = 0.2f + 0.6f * std::fabs(nd(rng)) / 3.0f;
   auto A = [&](std::vector<float>& src, mx::Shape sh) {
     auto* h = new std::vector<float>(src);
     return mx::array((void*)h->data(), sh, mx::float32, [h](void*) { delete h; });
   };
   mx::array Q = A(q, {B, L, H, KD}), K = A(k, {B, L, H, KD}), V = A(v, {B, L, H, VD});
-  mx::array G = A(g, {B, L, H, 1}), BE = A(beta, {B, L, H, 1});
+  mx::array G = A(g, {B, L, H, KD}), BE = A(beta, {B, L, H, 1});
   mx::array out = exl3::kda_recurrence(Q, K, V, G, BE);
   mx::eval(out);
   const float* o = out.data<float>();
@@ -44,9 +44,11 @@ int main() {
     for (int i = 0; i < L; ++i) {
       for (int h = 0; h < H; ++h) {
         const double nq = l2(q, b, i, h), nk = l2(k, b, i, h);
-        const double gi = g[((size_t)b*L + i)*H + h], bi = beta[((size_t)b*L + i)*H + h];
-        for (int d = 0; d < KD; ++d)
+        const double bi = beta[((size_t)b*L + i)*H + h];
+        for (int d = 0; d < KD; ++d) {
+          const double gi = g[(((size_t)b*L + i)*H + h)*KD + d];
           for (int e = 0; e < VD; ++e) S[(size_t)(h*KD + d)*VD + e] *= std::exp(gi);
+        }
         std::vector<double> kv((size_t)VD, 0.0);
         for (int d = 0; d < KD; ++d) {
           const double ki = k[((size_t)b*L + i)*H*KD + (size_t)h*KD + d] / nk;
@@ -83,9 +85,11 @@ int main() {
     for (int i = 0; i < L; ++i)
       for (int h = 0; h < H; ++h) {
         const double nq = l2(q, 0, i, h), nk = l2(k, 0, i, h);
-        const double gi = g[(size_t)i*H + h], bi = beta[(size_t)i*H + h];
-        for (int d = 0; d < KD; ++d)
+        const double bi = beta[(size_t)i*H + h];
+        for (int d = 0; d < KD; ++d) {
+          const double gi = g[((size_t)i*H + h)*KD + d];
           for (int e = 0; e < VD; ++e) S2[(size_t)(h*KD + d)*VD + e] *= std::exp(gi);
+        }
         std::vector<double> kv((size_t)VD, 0.0);
         for (int d = 0; d < KD; ++d) {
           const double ki = k[((size_t)i)*H*KD + (size_t)h*KD + d] / nk;
