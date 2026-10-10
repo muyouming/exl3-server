@@ -38,6 +38,7 @@
 #include "glm5_attn.h"
 #include "glm5_hc.h"
 #include "glm5_kda.h"
+#include "glm5_mtp.h"
 #include "model.h"
 
 namespace exl3 {
@@ -70,7 +71,12 @@ class Glm5Model {
 
   // The final normed hidden state after all layers, norm(hc_head(streams)):
   // (1, L, hidden), in the streams' dtype.
-  mx::array forward_hidden(const std::vector<int>& ids, int start_pos);
+  //
+  // `drafting` additionally keeps the MTP draft rows in step with the trunk's
+  // positions (one row per token of the chunk) and records what rewinding a
+  // partly accepted verify batch needs - see rewind() and kMaxRewindRows. The
+  // engine sets it exactly when it may run speculative rounds.
+  mx::array forward_hidden(const std::vector<int>& ids, int start_pos, bool drafting = false);
 
   // Full forward: (L, vocab) float32 logits, the logits of the position AFTER
   // each fed token. `start_pos` must equal position(), or be 0, which resets the
@@ -85,6 +91,44 @@ class Glm5Model {
   // position only (a prefill does not need the intermediate rows).
   mx::array apply_lm_head(const mx::array& hidden) const;
 
+  // ---- MTP draft block (the checkpoint's layer cfg_.num_layers) ------------
+  //
+  // While `forward_hidden(..., drafting=true)` is used, every chunk appends the
+  // draft rows it covers, so the committed state always holds exactly the rows
+  // 1..position()-1 and rewind() can drop the rows of a partly accepted verify
+  // batch. A wider chunk than kMaxRewindRows still appends its rows but cannot
+  // be rewound (the recurrence's prefix states are not kept for it).
+  static constexpr int kMaxRewindRows = 4;
+  bool has_mtp() const { return w_.mtp.present; }
+  // Keeps the draft rows in step with the trunk's positions. Only the MTP
+  // drafter reads them, so only installing it turns this on (a model-free
+  // drafter would pay for an extra layer per chunk for nothing).
+  void set_mtp_drafting(bool on) { mtp_drafting_ = on; }
+  bool mtp_drafting() const { return mtp_drafting_; }
+  // Highest committed draft row (row j belongs to the token at position j).
+  int mtp_rows() const { return mtp_.rows; }
+  // A copy of the committed draft state. Appending to the copy leaves the
+  // committed rows alone (an mx::array value is immutable), which is what the
+  // draft chain needs: rows past the round's first are provisional until the
+  // target accepts the token they were built for.
+  Glm5MtpState mtp_state() const { return mtp_; }
+  // The trunk's final-normed hidden at the last committed position - the
+  // predecessor of the next draft row.
+  const mx::array& last_hidden() const { return last_hidden_; }
+  // One draft row for `token` at position `pos` whose predecessor hidden is
+  // `prev` (1,1,hidden); returns `row_j`, what the shared head consumes.
+  mx::array mtp_row(int token, const mx::array& prev, int pos, Glm5MtpState& st);
+  // The trunk's lm_head on one draft row: (vocab) float32 logits.
+  std::vector<float> mtp_logits(const mx::array& row);
+  // Drops every draft row at or past `rows`.
+  void mtp_trim(int rows) { mtp_.trim(rows); }
+  // Rewinds the whole model (KDA state and window, compressed MLA cache, DSA
+  // indexer rows, draft rows and the last hidden) to `pos` committed tokens.
+  // `pos` must lie inside the last chunk; throws otherwise (a chunk wider than
+  // kMaxRewindRows cannot be rewound - the speculative loop must not be used
+  // with it).
+  void rewind(int pos);
+
   struct LayerState {
     KdaState kda;      // linear_attention layers
     MlaState mla;      // deepseek_sparse_attention layers
@@ -98,6 +142,21 @@ class Glm5Model {
   int pos_ = 0;
   int vocab_ = 0;
   double load_seconds_ = 0.0;
+
+ private:
+  // Appends the draft rows of a chunk: row j for every token of the chunk whose
+  // row is not there yet (row start_pos takes the stored last hidden, the rest
+  // take the chunk's own hidden states).
+  void mtp_extend(const mx::array& hidden, const std::vector<int>& ids, int start_pos);
+
+  Glm5MtpState mtp_;
+  bool mtp_drafting_ = false;              // Model::make_mtp_drafter() installed it
+  std::vector<KdaRewind> kda_rewind_;      // per trunk layer, for rewind()
+  mx::array last_hidden_ = mx::array(0.0f);  // (1,1,hidden) at pos_-1, compact
+  mx::array batch_hidden_ = mx::array(0.0f); // (1,L,hidden) of the last rewound-able chunk
+  int batch_start_ = 0;
+  int batch_rows_ = 0;
+  bool batch_captured_ = false;
 };
 
 } // namespace exl3

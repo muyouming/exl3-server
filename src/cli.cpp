@@ -17,6 +17,14 @@ void print_stats(const GenerateResult& r) {
   std::fprintf(stderr, "\n[%d prompt + %d generated tokens | prefill %.2fs | %.1f tok/s | %s]\n",
                r.prompt_tokens, r.completion_tokens, r.prefill_seconds, tps,
                r.finish_reason.c_str());
+  if (r.spec_rounds > 0) {
+    const double acc = r.spec_proposals > 0 ? (double)r.spec_accepted / (double)r.spec_proposals : 0.0;
+    std::fprintf(stderr,
+                 "[spec: %lld rounds, %lld/%lld proposals accepted (%.1f%%), %.2f tokens/round]\n",
+                 (long long)r.spec_rounds, (long long)r.spec_accepted,
+                 (long long)r.spec_proposals, 100.0 * acc,
+                 r.spec_rounds > 0 ? 1.0 + (double)r.spec_accepted / (double)r.spec_rounds : 0.0);
+  }
 }
 
 } // namespace

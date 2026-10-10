@@ -1,11 +1,16 @@
 #pragma once
 // GLM-5-Next (glm5_next_text / GLM-5.3-Flash) weight loading.
 //
-// Text-only. The vision tower (`model.visual.*`) and the MTP draft block
-// (stored as the extra layer `model.language_model.layers.{num_layers}.*` in
-// this checkpoint, or under `mtp.*` in other exports) are *explicitly* skipped:
-// the loader prints every skipped prefix with its tensor count and fails on any
+// Text-only. The vision tower (`model.visual.*`) is *explicitly* skipped: the
+// loader prints every skipped prefix with its tensor count and fails on any
 // tensor it does not recognize, so nothing is ever dropped silently.
+//
+// The MTP (multi-token-prediction) draft block IS loaded when the config
+// declares `num_nextn_predict_layers > 0`. This checkpoint stores it as one
+// extra decoder layer after the trunk (`layers.{num_hidden_layers}.*`, i.e.
+// layer 45): its own MLA + indexer + MoE weights, plus `enorm`/`hnorm`/`eh_proj`
+// `shared_head.norm` (the head itself is the trunk's `lm_head`). It has no
+// hyper-connection parameters, so its residuals are plain.
 //
 // Tensors are mixed-quantization: most are EXL3 (trellis + suh/svh + mul1
 // marker), while `kv_b_proj`, the indexer's small matrices, the KDA gate
@@ -80,11 +85,28 @@ struct G5Layer {
   G5Linear dense_gate, dense_up, dense_down;
 };
 
+// The MTP draft block: one decoder layer fed by
+//   x = eh_proj(cat[RmsNorm(Emb(t_j)), RmsNorm(h_{j-1})])
+// at the token's own position, whose output goes through `head_norm` and then
+// the trunk's `lm_head`. `h_{j-1}` is the trunk's final-normed hidden for the
+// token before `t_j` (so row j predicts the token after `t_j`), and the layer
+// attends causally over its own rows 1..j. `hc_*` fields of `layer` stay empty.
+struct G5Mtp {
+  bool present = false;
+  int layer_index = -1;                 // cfg.num_layers (45 here)
+  G5Layer layer;                        // MLA + indexer + MoE, plain residuals
+  mx::array enorm = mx::array(0.0f);    // f16 (hidden)
+  mx::array hnorm = mx::array(0.0f);    // f16 (hidden)
+  G5Linear eh_proj;                     // (2*hidden -> hidden)
+  mx::array head_norm = mx::array(0.0f); // shared_head.norm.weight, f16 (hidden)
+};
+
 struct Glm5Weights {
   mx::array embed = mx::array(0.0f);      // f16 (vocab, hidden)
   mx::array final_norm = mx::array(0.0f); // f16 (hidden)
   G5Linear lm_head;
   std::vector<G5Layer> layers;
+  G5Mtp mtp;                              // present only when the config has MTP
   int64_t bytes = 0;                      // bytes of all safetensors shards (mmap'd)
   int64_t used_bytes = 0;                 // bytes of the tensors actually loaded
   int64_t used_tensors = 0;               // tensors actually loaded

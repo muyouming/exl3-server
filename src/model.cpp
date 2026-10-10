@@ -12,6 +12,7 @@
 #include "exl3.h"
 #include "fp16.h"
 #include "glm5_forward.h"
+#include "glm5_mtp.h"
 #include "safetensors.h"
 #include "util.h"
 
@@ -459,11 +460,24 @@ void Model::reset_cache(KVCache& cache) const {
 int64_t Model::used_tensors() const { return glm5_ ? glm5_->used_tensors() : 0; }
 int64_t Model::total_tensors() const { return glm5_ ? glm5_->total_tensors() : 0; }
 
+std::shared_ptr<Drafter> Model::make_mtp_drafter() {
+  if (!glm5_) return nullptr;
+  std::shared_ptr<Drafter> d = exl3::make_mtp_drafter(*glm5_);
+  if (d) glm5_->set_mtp_drafting(true);
+  return d;
+}
+
+int Model::max_speculative_rows() const { return glm5_ ? Glm5Model::kMaxRewindRows : 0; }
+
+void Model::rewind_state(int pos) {
+  if (glm5_) glm5_->rewind(pos);
+}
+
 Model::ForwardResult Model::forward_glm5(const std::vector<int>& tokens, KVCache& cache,
                                          bool all_logits) {
   const int L = (int)tokens.size();
   ForwardResult res;
-  mx::array h = glm5_->forward_hidden(tokens, cache.offset); // (1, L, hidden)
+  mx::array h = glm5_->forward_hidden(tokens, cache.offset, all_logits); // (1, L, hidden)
   // A prefill only needs the last position: running the (EXL3, 6 bpw) head on
   // one row costs the same weight traffic as on all of them, but the f32 logits
   // of a long prompt would not fit next to the weights.

@@ -45,6 +45,8 @@ void usage() {
       "      --seed N                 RNG seed (default random)\n"
       "      --stop TEXT              stop string, repeatable\n"
       "      --draft-ngram N          speculative decoding with an n-gram drafter (N proposals)\n"
+      "      --draft-mtp N            speculative decoding with the checkpoint's MTP draft\n"
+      "                               block (N rows per verify round: 2..4, i.e. 1..3 drafts)\n"
       "      --ignore-eos             do not stop on EOS\n"
       "\n"
       "chat:\n"
@@ -74,6 +76,7 @@ int main(int argc, char** argv) {
   int port = 8080;
   int threads = 0;
   int draft_ngram = 0;
+  int draft_mtp = 0;
   bool serve = false;
   bool fp16_weights = false;
   exl3::CliOptions cli;
@@ -113,6 +116,8 @@ int main(int argc, char** argv) {
       system = arg(i, "--system");
     } else if (a == "--draft-ngram" || a.rfind("--draft-ngram=", 0) == 0) {
       draft_ngram = std::atoi(arg(i, "--draft-ngram").c_str());
+    } else if (a == "--draft-mtp" || a.rfind("--draft-mtp=", 0) == 0) {
+      draft_mtp = std::atoi(arg(i, "--draft-mtp").c_str());
     } else if (a == "--fp16-weights") {
       fp16_weights = true;
     } else if (a == "--think") {
@@ -169,6 +174,26 @@ int main(int argc, char** argv) {
   if (draft_ngram > 0) {
     engine.set_drafter(std::make_shared<exl3::NgramDrafter>());
     cli.gen.draft_tokens = draft_ngram;
+  }
+  if (draft_mtp > 0) {
+    if (draft_ngram > 0) {
+      std::fprintf(stderr, "exl3-server: --draft-mtp and --draft-ngram are exclusive\n");
+      return 2;
+    }
+    const int cap = engine.model().max_speculative_rows();
+    if (draft_mtp < 2 || (cap > 0 && draft_mtp > cap)) {
+      std::fprintf(stderr,
+                   "exl3-server: --draft-mtp %d is out of range (2%s)\n", draft_mtp,
+                   cap > 0 ? (std::string("..") + std::to_string(cap)).c_str() : " or more");
+      return 2;
+    }
+    std::shared_ptr<exl3::Drafter> drafter = engine.model().make_mtp_drafter();
+    if (!drafter) {
+      std::fprintf(stderr, "exl3-server: this checkpoint has no MTP draft block\n");
+      return 2;
+    }
+    engine.set_drafter(drafter);
+    cli.gen.draft_tokens = draft_mtp;
   }
   cli.system = system;
   cli.stats = verbose;

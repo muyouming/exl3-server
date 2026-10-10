@@ -367,6 +367,132 @@ bool expect_vec(const mx::array& a, int64_t n, const std::string& what, std::str
 // engine needs to pick the forget-gate arm; see G5Layer::kda_gate_lower_bound)
 // is parsed into ModelConfig::linear_gate_lower_bound by ModelConfig::load.
 
+// One GLM-5-Next decoder layer: shared norms, the attention sub-layer (KDA or
+// MLA + indexer, per `l.plan`) and the MLP sub-layer (MoE or dense). `with_hc`
+// loads the hyper-connection parameters, which every trunk layer has and the
+// MTP draft layer does not (its checkpoint tensors do not exist).
+bool load_decoder_layer(const Store& st, const ModelConfig& cfg, const std::string& lp,
+                        bool with_hc, G5Layer& l, std::string& err) {
+  l.input_norm = load_any(st, lp + "input_layernorm.weight", false, false, err);
+  l.post_norm = load_any(st, lp + "post_attention_layernorm.weight", false, false, err);
+  l.hc_attn_base = load_any(st, lp + "hc_attn_base", false, true, err, with_hc);
+  l.hc_attn_fn = load_any(st, lp + "hc_attn_fn", false, true, err, with_hc);
+  l.hc_attn_scale = load_any(st, lp + "hc_attn_scale", false, true, err, with_hc);
+  l.hc_ffn_base = load_any(st, lp + "hc_ffn_base", false, true, err, with_hc);
+  l.hc_ffn_fn = load_any(st, lp + "hc_ffn_fn", false, true, err, with_hc);
+  l.hc_ffn_scale = load_any(st, lp + "hc_ffn_scale", false, true, err, with_hc);
+  if (!err.empty()) return false;
+
+  if (l.plan.linear_attention) {
+    // KDA: the module is `self_attn` (not `linear_attn`), q|k|v are fused into
+    // `qkv_proj`, and A_log/dt_bias hang directly off `self_attn`.
+    const std::string a = lp + "self_attn.";
+    l.kda_qkv = load_linear(st, a + "qkv_proj", err);
+    l.kda_b = load_linear(st, a + "b_proj", err);
+    l.kda_g_a = load_linear(st, a + "g_a_proj", err);
+    l.kda_g_b = load_linear(st, a + "g_b_proj", err);
+    l.kda_f_a = load_linear(st, a + "f_a_proj", err);
+    l.kda_f_b = load_linear(st, a + "f_b_proj", err);
+    l.kda_o = load_linear(st, a + "o_proj", err);
+    l.conv1d_w = load_any(st, a + "conv1d.weight", false, false, err);
+    l.conv1d_b = load_any(st, a + "conv1d.bias", false, false, err, /*required=*/false);
+    l.o_norm = load_any(st, a + "o_norm.weight", false, false, err);
+    l.dt_bias = load_any(st, a + "dt_bias", false, true, err);
+    l.a_log = load_any(st, a + "A_log", false, true, err);
+    if (!err.empty()) return false;
+    l.kda_gate_lower_bound = st.gate_lower_bound;
+    // Geometry comes from the checkpoint itself (A_log/dt_bias).
+    l.kda_heads = (int)l.a_log.size();
+    l.kda_head_dim = l.kda_heads > 0 ? (int)(l.dt_bias.size() / (size_t)l.kda_heads) : 0;
+    const int H = l.kda_heads, kd = l.kda_head_dim, qkv = H * kd;
+    l.conv1d_has_bias = (int64_t)l.conv1d_b.size() == (int64_t)3 * qkv;
+    if (!expect_lin(l.kda_qkv, cfg.hidden_size, 3 * qkv, a + "qkv_proj", err) ||
+        !expect_lin(l.kda_b, cfg.hidden_size, H, a + "b_proj", err) ||
+        !expect_lin(l.kda_g_a, cfg.hidden_size, kd, a + "g_a_proj", err) ||
+        !expect_lin(l.kda_g_b, kd, qkv, a + "g_b_proj", err) ||
+        !expect_lin(l.kda_f_a, cfg.hidden_size, kd, a + "f_a_proj", err) ||
+        !expect_lin(l.kda_f_b, kd, qkv, a + "f_b_proj", err) ||
+        !expect_lin(l.kda_o, qkv, cfg.hidden_size, a + "o_proj", err) ||
+        !expect_vec(l.o_norm, kd, a + "o_norm.weight", err) ||
+        !expect_vec(l.dt_bias, qkv, a + "dt_bias", err)) {
+      return false;
+    }
+    if (l.conv1d_w.ndim() != 3 || l.conv1d_w.shape(0) != 3 * qkv || l.conv1d_w.shape(2) < 1) {
+      err = a + "conv1d.weight: expected (" + std::to_string(3 * qkv) + ", 1, kernel)";
+      return false;
+    }
+  } else {
+    // MLA + DSA indexer.
+    const std::string a = lp + "self_attn.";
+    l.q_a = load_linear(st, a + "q_a_proj", err);
+    l.q_a_norm = load_any(st, a + "q_a_layernorm.weight", false, false, err);
+    l.q_b = load_linear(st, a + "q_b_proj", err);
+    l.kv_a = load_linear(st, a + "kv_a_proj_with_mqa", err);
+    l.kv_a_norm = load_any(st, a + "kv_a_layernorm.weight", false, false, err);
+    l.kv_b = load_linear(st, a + "kv_b_proj", err);
+    l.attn_o = load_linear(st, a + "o_proj", err);
+    const std::string ix = a + "indexer.";
+    l.idx_wq_b = load_linear(st, ix + "wq_b", err);
+    l.idx_wk = load_any(st, ix + "wk.weight", true, false, err);
+    l.idx_k_norm_w = load_any(st, ix + "k_norm.weight", false, false, err);
+    l.idx_k_norm_b = load_any(st, ix + "k_norm.bias", false, false, err);
+    l.idx_weights_proj = load_any(st, ix + "weights_proj.weight", true, false, err);
+    l.idx_ape = load_any(st, ix + "index_kpool_compress_ape", false, true, err);
+    l.idx_gate = load_any(st, ix + "index_kpool_compress_gate", true, false, err);
+    if (!err.empty()) return false;
+    const int qk = cfg.qk_head_dim, vd = cfg.v_head_dim, nh = cfg.num_heads;
+    if (!expect_lin(l.q_a, cfg.hidden_size, cfg.q_lora_rank, a + "q_a_proj", err) ||
+        !expect_lin(l.q_b, cfg.q_lora_rank, nh * qk, a + "q_b_proj", err) ||
+        !expect_lin(l.kv_a, cfg.hidden_size, cfg.kv_lora_rank, a + "kv_a_proj_with_mqa", err) ||
+        !expect_lin(l.kv_b, cfg.kv_lora_rank, nh * (qk + vd), a + "kv_b_proj", err) ||
+        !expect_lin(l.attn_o, nh * vd, cfg.hidden_size, a + "o_proj", err) ||
+        !expect_vec(l.q_a_norm, cfg.q_lora_rank, a + "q_a_layernorm.weight", err) ||
+        !expect_vec(l.kv_a_norm, cfg.kv_lora_rank, a + "kv_a_layernorm.weight", err) ||
+        !expect_lin(l.idx_wq_b, cfg.q_lora_rank, cfg.index_n_heads * cfg.index_head_dim,
+                    ix + "wq_b", err) ||
+        !expect_vec(l.idx_k_norm_w, cfg.index_head_dim, ix + "k_norm.weight", err) ||
+        !expect_vec(l.idx_k_norm_b, cfg.index_head_dim, ix + "k_norm.bias", err)) {
+      return false;
+    }
+    if (l.idx_wk.ndim() != 2 || l.idx_wk.shape(0) != cfg.hidden_size ||
+        l.idx_wk.shape(1) != cfg.index_head_dim ||
+        l.idx_weights_proj.ndim() != 2 || l.idx_weights_proj.shape(0) != cfg.hidden_size ||
+        l.idx_weights_proj.shape(1) != cfg.index_n_heads ||
+        l.idx_ape.ndim() != 2 || l.idx_ape.shape(0) != cfg.index_kpool ||
+        l.idx_ape.shape(1) != cfg.index_head_dim ||
+        l.idx_gate.ndim() != 2 || l.idx_gate.shape(0) != cfg.hidden_size ||
+        l.idx_gate.shape(1) != cfg.index_head_dim) {
+      err = a + "indexer: unexpected shape for weights_proj/ape/gate";
+      return false;
+    }
+  }
+  if (!err.empty()) return false;
+
+  l.moe = l.plan.moe;
+  if (l.moe) {
+    const std::string m = lp + "mlp.";
+    l.router_w = load_any(st, m + "gate.weight", false, false, err);
+    l.router_bias = load_any(st, m + "gate.e_score_correction_bias", false, true, err);
+    l.shared_gate = load_linear(st, m + "shared_experts.gate_proj", err);
+    l.shared_up = load_linear(st, m + "shared_experts.up_proj", err);
+    l.shared_down = load_linear(st, m + "shared_experts.down_proj", err);
+    l.experts.resize((size_t)cfg.n_routed_experts * 3);
+    for (int e = 0; e < cfg.n_routed_experts; ++e) {
+      const std::string ep = m + "experts." + std::to_string(e) + ".";
+      l.experts[(size_t)(e * 3 + 0)] = load_linear(st, ep + "gate_proj", err);
+      l.experts[(size_t)(e * 3 + 1)] = load_linear(st, ep + "up_proj", err);
+      l.experts[(size_t)(e * 3 + 2)] = load_linear(st, ep + "down_proj", err);
+      if (!err.empty()) return false;
+    }
+  } else {
+    const std::string m = lp + "mlp.";
+    l.dense_gate = load_linear(st, m + "gate_proj", err);
+    l.dense_up = load_linear(st, m + "up_proj", err);
+    l.dense_down = load_linear(st, m + "down_proj", err);
+  }
+  return err.empty();
+}
+
 } // namespace
 
 bool load_glm5(const std::string& dir, const ModelConfig& cfg, Glm5Weights& out, std::string& err,
@@ -401,129 +527,47 @@ bool load_glm5(const std::string& dir, const ModelConfig& cfg, Glm5Weights& out,
     l.plan = cfg.layer_plan[(size_t)i];
     const int64_t layer_bytes0 = st.used_bytes;
     const int64_t layer_t0 = now_ms();
-    l.input_norm = load_any(st, lp + "input_layernorm.weight", false, false, err);
-    l.post_norm = load_any(st, lp + "post_attention_layernorm.weight", false, false, err);
-    l.hc_attn_base = load_any(st, lp + "hc_attn_base", false, true, err);
-    l.hc_attn_fn = load_any(st, lp + "hc_attn_fn", false, true, err);
-    l.hc_attn_scale = load_any(st, lp + "hc_attn_scale", false, true, err);
-    l.hc_ffn_base = load_any(st, lp + "hc_ffn_base", false, true, err);
-    l.hc_ffn_fn = load_any(st, lp + "hc_ffn_fn", false, true, err);
-    l.hc_ffn_scale = load_any(st, lp + "hc_ffn_scale", false, true, err);
-    if (!err.empty()) return false;
-
-    if (l.plan.linear_attention) {
-      // KDA: the module is `self_attn` (not `linear_attn`), q|k|v are fused into
-      // `qkv_proj`, and A_log/dt_bias hang directly off `self_attn`.
-      const std::string a = lp + "self_attn.";
-      l.kda_qkv = load_linear(st, a + "qkv_proj", err);
-      l.kda_b = load_linear(st, a + "b_proj", err);
-      l.kda_g_a = load_linear(st, a + "g_a_proj", err);
-      l.kda_g_b = load_linear(st, a + "g_b_proj", err);
-      l.kda_f_a = load_linear(st, a + "f_a_proj", err);
-      l.kda_f_b = load_linear(st, a + "f_b_proj", err);
-      l.kda_o = load_linear(st, a + "o_proj", err);
-      l.conv1d_w = load_any(st, a + "conv1d.weight", false, false, err);
-      l.conv1d_b = load_any(st, a + "conv1d.bias", false, false, err, /*required=*/false);
-      l.o_norm = load_any(st, a + "o_norm.weight", false, false, err);
-      l.dt_bias = load_any(st, a + "dt_bias", false, true, err);
-      l.a_log = load_any(st, a + "A_log", false, true, err);
-      if (!err.empty()) return false;
-      l.kda_gate_lower_bound = st.gate_lower_bound;
-      // Geometry comes from the checkpoint itself (A_log/dt_bias).
-      l.kda_heads = (int)l.a_log.size();
-      l.kda_head_dim = l.kda_heads > 0 ? (int)(l.dt_bias.size() / (size_t)l.kda_heads) : 0;
-      const int H = l.kda_heads, kd = l.kda_head_dim, qkv = H * kd;
-      l.conv1d_has_bias = (int64_t)l.conv1d_b.size() == (int64_t)3 * qkv;
-      if (!expect_lin(l.kda_qkv, cfg.hidden_size, 3 * qkv, a + "qkv_proj", err) ||
-          !expect_lin(l.kda_b, cfg.hidden_size, H, a + "b_proj", err) ||
-          !expect_lin(l.kda_g_a, cfg.hidden_size, kd, a + "g_a_proj", err) ||
-          !expect_lin(l.kda_g_b, kd, qkv, a + "g_b_proj", err) ||
-          !expect_lin(l.kda_f_a, cfg.hidden_size, kd, a + "f_a_proj", err) ||
-          !expect_lin(l.kda_f_b, kd, qkv, a + "f_b_proj", err) ||
-          !expect_lin(l.kda_o, qkv, cfg.hidden_size, a + "o_proj", err) ||
-          !expect_vec(l.o_norm, kd, a + "o_norm.weight", err) ||
-          !expect_vec(l.dt_bias, qkv, a + "dt_bias", err)) {
-        return false;
-      }
-      if (l.conv1d_w.ndim() != 3 || l.conv1d_w.shape(0) != 3 * qkv || l.conv1d_w.shape(2) < 1) {
-        err = a + "conv1d.weight: expected (" + std::to_string(3 * qkv) + ", 1, kernel)";
-        return false;
-      }
-    } else {
-      // MLA + DSA indexer.
-      const std::string a = lp + "self_attn.";
-      l.q_a = load_linear(st, a + "q_a_proj", err);
-      l.q_a_norm = load_any(st, a + "q_a_layernorm.weight", false, false, err);
-      l.q_b = load_linear(st, a + "q_b_proj", err);
-      l.kv_a = load_linear(st, a + "kv_a_proj_with_mqa", err);
-      l.kv_a_norm = load_any(st, a + "kv_a_layernorm.weight", false, false, err);
-      l.kv_b = load_linear(st, a + "kv_b_proj", err);
-      l.attn_o = load_linear(st, a + "o_proj", err);
-      const std::string ix = a + "indexer.";
-      l.idx_wq_b = load_linear(st, ix + "wq_b", err);
-      l.idx_wk = load_any(st, ix + "wk.weight", true, false, err);
-      l.idx_k_norm_w = load_any(st, ix + "k_norm.weight", false, false, err);
-      l.idx_k_norm_b = load_any(st, ix + "k_norm.bias", false, false, err);
-      l.idx_weights_proj = load_any(st, ix + "weights_proj.weight", true, false, err);
-      l.idx_ape = load_any(st, ix + "index_kpool_compress_ape", false, true, err);
-      l.idx_gate = load_any(st, ix + "index_kpool_compress_gate", true, false, err);
-      if (!err.empty()) return false;
-      const int qk = cfg.qk_head_dim, vd = cfg.v_head_dim, nh = cfg.num_heads;
-      if (!expect_lin(l.q_a, cfg.hidden_size, cfg.q_lora_rank, a + "q_a_proj", err) ||
-          !expect_lin(l.q_b, cfg.q_lora_rank, nh * qk, a + "q_b_proj", err) ||
-          !expect_lin(l.kv_a, cfg.hidden_size, cfg.kv_lora_rank, a + "kv_a_proj_with_mqa", err) ||
-          !expect_lin(l.kv_b, cfg.kv_lora_rank, nh * (qk + vd), a + "kv_b_proj", err) ||
-          !expect_lin(l.attn_o, nh * vd, cfg.hidden_size, a + "o_proj", err) ||
-          !expect_vec(l.q_a_norm, cfg.q_lora_rank, a + "q_a_layernorm.weight", err) ||
-          !expect_vec(l.kv_a_norm, cfg.kv_lora_rank, a + "kv_a_layernorm.weight", err) ||
-          !expect_lin(l.idx_wq_b, cfg.q_lora_rank, cfg.index_n_heads * cfg.index_head_dim,
-                      ix + "wq_b", err) ||
-          !expect_vec(l.idx_k_norm_w, cfg.index_head_dim, ix + "k_norm.weight", err) ||
-          !expect_vec(l.idx_k_norm_b, cfg.index_head_dim, ix + "k_norm.bias", err)) {
-        return false;
-      }
-      if (l.idx_wk.ndim() != 2 || l.idx_wk.shape(0) != cfg.hidden_size ||
-          l.idx_wk.shape(1) != cfg.index_head_dim ||
-          l.idx_weights_proj.ndim() != 2 || l.idx_weights_proj.shape(0) != cfg.hidden_size ||
-          l.idx_weights_proj.shape(1) != cfg.index_n_heads ||
-          l.idx_ape.ndim() != 2 || l.idx_ape.shape(0) != cfg.index_kpool ||
-          l.idx_ape.shape(1) != cfg.index_head_dim ||
-          l.idx_gate.ndim() != 2 || l.idx_gate.shape(0) != cfg.hidden_size ||
-          l.idx_gate.shape(1) != cfg.index_head_dim) {
-        err = a + "indexer: unexpected shape for weights_proj/ape/gate";
-        return false;
-      }
-    }
-    if (!err.empty()) return false;
-
-    l.moe = l.plan.moe;
-    if (l.moe) {
-      const std::string m = lp + "mlp.";
-      l.router_w = load_any(st, m + "gate.weight", false, false, err);
-      l.router_bias = load_any(st, m + "gate.e_score_correction_bias", false, true, err);
-      l.shared_gate = load_linear(st, m + "shared_experts.gate_proj", err);
-      l.shared_up = load_linear(st, m + "shared_experts.up_proj", err);
-      l.shared_down = load_linear(st, m + "shared_experts.down_proj", err);
-      l.experts.resize((size_t)cfg.n_routed_experts * 3);
-      for (int e = 0; e < cfg.n_routed_experts; ++e) {
-        const std::string ep = m + "experts." + std::to_string(e) + ".";
-        l.experts[(size_t)(e * 3 + 0)] = load_linear(st, ep + "gate_proj", err);
-        l.experts[(size_t)(e * 3 + 1)] = load_linear(st, ep + "up_proj", err);
-        l.experts[(size_t)(e * 3 + 2)] = load_linear(st, ep + "down_proj", err);
-        if (!err.empty()) return false;
-      }
-    } else {
-      const std::string m = lp + "mlp.";
-      l.dense_gate = load_linear(st, m + "gate_proj", err);
-      l.dense_up = load_linear(st, m + "up_proj", err);
-      l.dense_down = load_linear(st, m + "down_proj", err);
-    }
-    if (!err.empty()) return false;
+    if (!load_decoder_layer(st, cfg, lp, /*with_hc=*/true, l, err)) return false;
     if (verbose) {
       std::fprintf(stderr, "glm5: layer %2d %-18s %-17s %8.1f MB %6.0f ms\n", i,
                    l.plan.linear_attention ? "linear_attention" : "sparse_attention",
                    l.moe ? (std::to_string(l.experts.size() / 3) + " MoE experts").c_str() : "dense MLP",
                    (st.used_bytes - layer_bytes0) / 1048576.0, (double)(now_ms() - layer_t0));
+    }
+  }
+
+  // --- MTP draft block (the checkpoint's extra layer `num_layers`) -----------
+  if (cfg.num_nextn_predict_layers > 0) {
+    const std::string lp = p + "layers." + std::to_string(cfg.num_layers) + ".";
+    G5Mtp& m = out.mtp;
+    const int64_t mtp_bytes0 = st.used_bytes;
+    const int64_t mtp_t0 = now_ms();
+    // The draft layer is one more sparse-attention MoE layer; it carries no
+    // hyper-connection parameters (the reference builds the MTP block without
+    // them), so its residuals are plain.
+    ModelConfig::LayerPlan mp;
+    mp.linear_attention = false;
+    mp.sparse_attention = true;
+    mp.moe = true;
+    m.layer.plan = mp;
+    if (!load_decoder_layer(st, cfg, lp, /*with_hc=*/false, m.layer, err)) return false;
+    m.enorm = load_any(st, lp + "enorm.weight", false, false, err);
+    m.hnorm = load_any(st, lp + "hnorm.weight", false, false, err);
+    m.eh_proj = load_linear(st, lp + "eh_proj", err);
+    m.head_norm = load_any(st, lp + "shared_head.norm.weight", false, false, err);
+    if (!err.empty()) return false;
+    if (!expect_lin(m.eh_proj, 2 * cfg.hidden_size, cfg.hidden_size, lp + "eh_proj", err) ||
+        !expect_vec(m.enorm, cfg.hidden_size, lp + "enorm.weight", err) ||
+        !expect_vec(m.hnorm, cfg.hidden_size, lp + "hnorm.weight", err) ||
+        !expect_vec(m.head_norm, cfg.hidden_size, lp + "shared_head.norm.weight", err)) {
+      return false;
+    }
+    m.present = true;
+    m.layer_index = cfg.num_layers;
+    if (verbose) {
+      std::fprintf(stderr, "glm5: MTP draft layer %d (MLA + %zu MoE experts) %8.1f MB %6.0f ms\n",
+                   cfg.num_layers, m.layer.experts.size() / 3,
+                   (st.used_bytes - mtp_bytes0) / 1048576.0, (double)(now_ms() - mtp_t0));
     }
   }
 
@@ -540,16 +584,19 @@ bool load_glm5(const std::string& dir, const ModelConfig& cfg, Glm5Weights& out,
       continue;
     }
     if (name.rfind("mtp.", 0) == 0 || name.rfind("model.mtp.", 0) == 0) {
-      skipped["mtp. (MTP draft block, not wired yet)"]++;
+      // The `mtp.*` export layout is not wired (this checkpoint uses the extra
+      // layer layout instead); fail loudly rather than dropping it silently.
+      unexpected.push_back(name);
       continue;
     }
     if (name.rfind(layers_p, 0) == 0) {
       const char* num = name.c_str() + layers_p.size();
       char* end = nullptr;
       long idx = std::strtol(num, &end, 10);
-      if (end != num && *end == '.' && idx >= cfg.num_layers) {
-        skipped[layers_p + "{i>=" + std::to_string(cfg.num_layers) +
-                "} (MTP draft layer, not wired yet)"]++;
+      const long loaded = cfg.num_layers + (out.mtp.present ? 1 : 0);
+      if (end != num && *end == '.' && idx >= loaded) {
+        skipped[layers_p + "{i>=" + std::to_string(loaded) +
+                "} (draft layers beyond the loaded trunk + MTP block)"]++;
         continue;
       }
     }
@@ -578,9 +625,10 @@ bool load_glm5(const std::string& dir, const ModelConfig& cfg, Glm5Weights& out,
       moe += l.moe;
     }
     std::fprintf(stderr,
-                 "glm5: %d layers (%d KDA / %d DSA, %d dense + %d MoE), %lld tensors of %lld "
+                 "glm5: %d layers (%d KDA / %d DSA, %d dense + %d MoE)%s, %lld tensors of %lld "
                  "loaded, %.1f GB used of %.1f GB mapped, index scan %.1fs, total %.1fs\n",
-                 cfg.num_layers, kda, dsa, cfg.num_layers - moe, moe, (long long)out.used_tensors,
+                 cfg.num_layers, kda, dsa, cfg.num_layers - moe, moe,
+                 out.mtp.present ? " + 1 MTP draft layer" : "", (long long)out.used_tensors,
                  (long long)out.total_tensors, st.used_bytes / 1e9, st.bytes / 1e9,
                  (now_ms() - t_skip) / 1000.0, (now_ms() - t0) / 1000.0);
   }

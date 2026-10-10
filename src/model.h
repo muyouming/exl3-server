@@ -18,6 +18,7 @@ namespace mx = mlx::core;
 enum class Arch { Llama, Glm5Next };
 
 class Glm5Model;
+class Drafter;
 
 struct ModelConfig {
   Arch arch = Arch::Llama;
@@ -95,6 +96,27 @@ class Model {
   const ModelConfig& config() const { return cfg_; }
   size_t weight_bytes() const { return weight_bytes_; }
   double load_seconds() const { return load_seconds_; }
+
+  // The loaded GLM-5-Next MTP draft block as a speculative drafter, or nullptr
+  // when the model has none (the arch is not GLM-5-Next, or the checkpoint
+  // carries no MTP layer). Creating it also tells the model to keep its draft
+  // rows in step with the trunk (Glm5Model::set_mtp_drafting).
+  std::shared_ptr<Drafter> make_mtp_drafter();
+
+  // Widest verify batch speculative decoding may use, or 0 when there is no
+  // limit. GLM-5-Next keeps a recurrent state that can only be rewound inside
+  // the chunk whose prefix states were captured.
+  int max_speculative_rows() const;
+
+  // Rewinds model state to `pos` committed tokens after a verify batch was only
+  // partly accepted (the Llama path trims its KV cache itself, so this only
+  // affects GLM-5-Next). Throws when the model cannot rewind that far.
+  void rewind_state(int pos);
+
+  // GLM-5-Next only: the model itself (nullptr on the Llama path), for
+  // tests/benchmarks that drive its forward and rewind directly.
+  Glm5Model* glm5() { return glm5_.get(); }
+
   // GLM-5-Next only (0 on the Llama path): the loader's tensor inventory.
   int64_t used_tensors() const;
   int64_t total_tensors() const;
@@ -111,12 +133,18 @@ class Model {
   struct ForwardResult {
     std::vector<float> logits_last;      // (vocab) at the last position
     std::vector<int> greedy;             // argmax token at every position
-    std::vector<std::vector<float>> taps; // (positions, 5 * hidden) when requested
+    // Hidden-state taps, one entry per verified position, when requested. On
+    // the Llama/EXL3 path each entry is kNumTaps * hidden wide (concatenated
+    // kTapLayers reads); the GLM-5-Next path has no such layer taps and leaves
+    // them empty (its MTP drafter reads the model's own hidden directly).
+    std::vector<std::vector<float>> taps;
   };
 
   // Like forward(), but also returns the greedy token at every position (needed
   // to verify speculative proposals) and, optionally, the per-position hidden
-  // taps of kTapLayers.
+  // taps of kTapLayers. For GLM-5-Next, `capture_taps` also means "the caller
+  // may run speculative rounds": the model then keeps the MTP draft block and
+  // its rewind state in step (see Glm5Model::forward_hidden).
   ForwardResult forward_multi(const std::vector<int>& tokens, KVCache& cache,
                               bool capture_taps = false);
 

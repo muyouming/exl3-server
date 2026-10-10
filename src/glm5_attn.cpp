@@ -21,6 +21,28 @@ mx::array rms_norm(const mx::array& x, const mx::array& weight, float eps) {
   return y;
 }
 
+void MlaState::trim(int rows) {
+  if (rows >= len) return;
+  if (rows <= 0) {
+    k_pass = mx::array(0.0f);
+    len = 0;
+    return;
+  }
+  k_pass = mx::slice(k_pass, {0, 0, 0}, {1, rows, (int)k_pass.shape(2)});
+  len = rows;
+}
+
+void IndexerState::trim(int rows) {
+  if (rows >= len) return;
+  if (rows <= 0) {
+    packed = mx::array(0.0f);
+    len = 0;
+    return;
+  }
+  packed = mx::slice(packed, {0, 0, 0}, {1, rows, (int)packed.shape(2)});
+  len = rows;
+}
+
 mx::array layer_norm(const mx::array& x, const mx::array& weight, const mx::array& bias, float eps) {
   mx::array xf = mx::astype(x, mx::float32);
   mx::array mean = mx::mean(xf, std::vector<int>{-1}, true);

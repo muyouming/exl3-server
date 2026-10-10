@@ -65,7 +65,8 @@ mx::array kda_conv1d(const mx::array& x, const mx::array& w, const mx::array& b)
 }
 
 mx::array kda_recurrence(const mx::array& q, const mx::array& k, const mx::array& v,
-                         const mx::array& g, const mx::array& beta, mx::array* state) {
+                         const mx::array& g, const mx::array& beta, mx::array* state,
+                         std::vector<mx::array>* row_states) {
   const int L = (int)q.shape(1);
   const int H = (int)q.shape(2);
   const int kd = (int)q.shape(3);
@@ -94,6 +95,7 @@ mx::array kda_recurrence(const mx::array& q, const mx::array& k, const mx::array
     mx::array kv = mx::sum(mx::multiply(S, mx::expand_dims(k_i, -1)), std::vector<int>{-2}, false);
     mx::array delta = mx::multiply(mx::subtract(v_i, kv), b_i);
     S = mx::add(S, mx::multiply(mx::expand_dims(k_i, -1), mx::expand_dims(delta, -2)));
+    if (row_states && i + 1 < L) row_states->push_back(S);
     outs.push_back(mx::sum(mx::multiply(S, mx::expand_dims(q_i, -1)), std::vector<int>{-2}, false));
   }
   if (state) *state = S;
@@ -120,7 +122,8 @@ mx::array g5_linear(const G5Linear& lin, const mx::array& x) {
   return y;
 }
 
-mx::array kda_layer(const G5Layer& l, const ModelConfig& cfg, const mx::array& h, KdaState& state) {
+mx::array kda_layer(const G5Layer& l, const ModelConfig& cfg, const mx::array& h, KdaState& state,
+                    KdaRewind* rewind) {
   const int B = (int)h.shape(0), L = (int)h.shape(1);
   const int H = l.kda_heads, kd = l.kda_head_dim, qkv = H * kd;
   // 1) ONE fused q|k|v projection (the checkpoint stores them concatenated as
@@ -137,6 +140,14 @@ mx::array kda_layer(const G5Layer& l, const ModelConfig& cfg, const mx::array& h
   const int wlen = std::min(klen - 1, (int)conv_in.shape(1));
   state.conv_window =
       mx::slice(conv_in, {0, (int)conv_in.shape(1) - wlen, 0}, {B, (int)conv_in.shape(1), C});
+  if (rewind) {
+    rewind->captured = true;
+    rewind->chunk_rows = L;
+    rewind->pre_rows = (int)conv_in.shape(1) - L;
+    rewind->window_rows = wlen;
+    rewind->conv_in = conv_in;
+    rewind->prefix_states.clear();
+  }
   mx::array conved = mx::astype(
       kda_conv1d(conv_in, l.conv1d_w, l.conv1d_has_bias ? l.conv1d_b : mx::array(0.0f)),
       mixed.dtype());
@@ -152,7 +163,8 @@ mx::array kda_layer(const G5Layer& l, const ModelConfig& cfg, const mx::array& h
   mx::array beta =
       mx::reshape(mx::astype(mx::sigmoid(g5_linear(l.kda_b, h)), mx::float32), {B, L, H, 1});
   // 3) delta-rule recurrence
-  mx::array core = kda_recurrence(q, k, v, g, beta, &state.recurrent); // (B,L,H,kd)
+  mx::array core = kda_recurrence(q, k, v, g, beta, &state.recurrent,
+                                  rewind ? &rewind->prefix_states : nullptr); // (B,L,H,kd)
   // 4) output gate and projection (gated norm eps = rms_norm_eps, per the reference)
   mx::array gate = mx::reshape(g5_linear(l.kda_g_b, g5_linear(l.kda_g_a, h)), {B, L, H, kd});
   mx::array out = rms_norm_gated(core, l.o_norm, gate, cfg.rms_norm_eps);
@@ -160,6 +172,21 @@ mx::array kda_layer(const G5Layer& l, const ModelConfig& cfg, const mx::array& h
   // and the EXL3 o_proj only takes fp16 activations.
   out = mx::astype(out, h.dtype());
   return g5_linear(l.kda_o, mx::reshape(out, {B, L, qkv}));
+}
+
+void kda_rewind(KdaState& state, const KdaRewind& rewind, int rows) {
+  if (!rewind.captured || rewind.chunk_rows <= 0) return;
+  const int r = std::min(std::max(rows, 0), rewind.chunk_rows);
+  if (r <= 0) return;
+  // The state after rows 0..r-1: the prefix state when the chunk is only
+  // partly accepted, the layer's own committed state when it was fully used.
+  if (r - 1 < (int)rewind.prefix_states.size()) state.recurrent = rewind.prefix_states[(size_t)(r - 1)];
+  // The window the layer would hold: the tail of (previous window + the first
+  // `r` rows of the chunk's projection).
+  const int total = rewind.pre_rows + r;
+  const int w = std::min(rewind.window_rows, total);
+  const int C = (int)rewind.conv_in.shape(2);
+  state.conv_window = mx::slice(rewind.conv_in, {0, total - w, 0}, {1, total, C});
 }
 
 } // namespace exl3

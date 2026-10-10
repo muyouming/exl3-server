@@ -18,10 +18,13 @@ namespace exl3 {
 class Drafter {
  public:
   virtual ~Drafter() = default;
-  // Propose up to `k` tokens following `context`. `taps` holds the target's
-  // hidden taps for the last processed position (kNumTaps * hidden floats) or
-  // is empty when the model was not asked to capture them.
-  virtual std::vector<int> draft(const std::vector<int>& context, int k,
+  // Propose up to `k` tokens that must follow `cur` (the token the engine just
+  // emitted and has not fed to the target yet). `context` is the emitted-token
+  // history that ends before `cur`; `taps` holds the target's hidden taps for
+  // the last processed position (kNumTaps * hidden floats on the Llama/DSpark
+  // path) or is empty when the model was not asked to capture them. The MTP
+  // drafter ignores both and reads the model's own hidden and draft-row state.
+  virtual std::vector<int> draft(const std::vector<int>& context, int cur, int k,
                                  const std::vector<float>& taps) = 0;
 };
 
@@ -31,7 +34,7 @@ class NgramDrafter : public Drafter {
  public:
   explicit NgramDrafter(int max_suffix = 12, int min_suffix = 3)
       : max_suffix_(max_suffix), min_suffix_(min_suffix) {}
-  std::vector<int> draft(const std::vector<int>& context, int k,
+  std::vector<int> draft(const std::vector<int>& context, int cur, int k,
                          const std::vector<float>& taps) override;
 
  private:
@@ -58,6 +61,13 @@ struct GenerateResult {
   int completion_tokens = 0;
   double prefill_seconds = 0.0;
   double decode_seconds = 0.0;
+  // Speculative decoding accounting (all zero when it did not run): verified
+  // rounds, the proposals the drafter made and how many of them the target
+  // accepted. acceptance = spec_accepted / spec_proposals, tokens per round =
+  // 1 + spec_accepted / spec_rounds.
+  int64_t spec_rounds = 0;
+  int64_t spec_proposals = 0;
+  int64_t spec_accepted = 0;
 };
 
 using DeltaFn = std::function<void(const std::string& content, const std::string& reasoning)>;

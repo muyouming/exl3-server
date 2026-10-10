@@ -18,6 +18,9 @@ mx::array rms_norm(const mx::array& x, const mx::array& weight, float eps = 1e-6
 struct MlaState {
   mx::array k_pass = mx::array(0.0f); // (B, L_total, kv_lora_rank) f32
   int len = 0;
+  // Drops every row at or past `rows` (the compressed latent cache is a plain
+  // sequence, so a partly accepted verify batch can be rewound by slicing).
+  void trim(int rows);
 };
 
 // LayerNorm with bias (the indexer's k_norm is a LayerNorm, not an RMSNorm).
@@ -60,6 +63,8 @@ mx::array mla_q_resid(const G5Layer& l, const mx::array& h);
 struct IndexerState {
   mx::array packed = mx::array(0.0f); // (1, L_total, 2*head_dim + 1) f32
   int len = 0;
+  // Same as MlaState::trim: the packed per-token indexer rows are a sequence.
+  void trim(int rows);
 };
 
 // DSA indexer top-k token selection for the current chunk (B = 1). `start_pos`

@@ -87,7 +87,7 @@ class ThinkSplitter {
 // N-gram draft
 // ---------------------------------------------------------------------------
 
-std::vector<int> NgramDrafter::draft(const std::vector<int>& context, int k,
+std::vector<int> NgramDrafter::draft(const std::vector<int>& context, int /*cur*/, int k,
                                      const std::vector<float>& /*taps*/) {
   std::vector<int> out;
   if (k <= 0 || context.size() < (size_t)min_suffix_ + 1) return out;
@@ -141,7 +141,17 @@ GenerateResult Engine::generate(const std::vector<int>& prompt, const GenerateOp
     return res;
   }
 
-  const bool speculative = drafter_ && opt.draft_tokens > 1 && opt.sample.temperature <= 0.0f;
+  bool speculative = drafter_ && opt.draft_tokens > 1 && opt.sample.temperature <= 0.0f;
+  // Some architectures can only undo the state of a bounded verify batch (the
+  // GLM-5-Next recurrent state is rewound inside the chunk it was captured for).
+  const int spec_row_cap = model_.max_speculative_rows();
+  if (speculative && spec_row_cap > 0 && opt.draft_tokens > spec_row_cap) {
+    std::fprintf(stderr,
+                 "engine: speculative decoding needs %d rows per round but the model can only "
+                 "rewind %d; decoding serially\n",
+                 opt.draft_tokens, spec_row_cap);
+    speculative = false;
+  }
 
   // Reuse the longest common prefix already in the KV cache. GLM-5-Next keeps a
   // recurrent state (KDA delta matrices + a compressed KV/indexer cache) that
@@ -240,7 +250,7 @@ GenerateResult Engine::generate(const std::vector<int>& prompt, const GenerateOp
       for (;;) {
         if (cancelled && cancelled()) { res.finish_reason = "cancelled"; stopped = true; break; }
         if (res.completion_tokens >= opt.max_tokens) { res.finish_reason = "length"; break; }
-        std::vector<int> props = drafter_->draft(history, opt.draft_tokens - 1, taps);
+        std::vector<int> props = drafter_->draft(history, cur, opt.draft_tokens - 1, taps);
         std::vector<int> batch;
         batch.reserve(props.size() + 1);
         batch.push_back(cur);
@@ -252,6 +262,9 @@ GenerateResult Engine::generate(const std::vector<int>& prompt, const GenerateOp
         int accept = 0;
         while (accept < (int)props.size() && props[(size_t)accept] == vr.greedy[(size_t)accept])
           accept++;
+        res.spec_rounds++;
+        res.spec_proposals += (int64_t)props.size();
+        res.spec_accepted += accept;
         // Emit at most what the token budget allows, and keep the KV cache in
         // step with exactly what was emitted.
         const int budget = opt.max_tokens - (int)res.completion_tokens;
@@ -261,7 +274,12 @@ GenerateResult Engine::generate(const std::vector<int>& prompt, const GenerateOp
         // The cache must keep `cur` plus the accepted proposals; the last
         // emitted token always stays out of the cache (it is fed next round).
         const int keep = offset_before + std::min(1 + accept, n);
-        if (keep < cache_.offset) cache_.trim(keep);
+        if (keep < cache_.offset) {
+          cache_.trim(keep);
+          // The model's own state (GLM-5-Next: the KDA recurrence, the caches
+          // and the MTP draft rows) still covers the rejected rows.
+          model_.rewind_state(keep);
+        }
         bool stop_now = false;
         for (int j = 0; j < accept && j < n && !stop_now; ++j) {
           history.push_back(props[(size_t)j]);
