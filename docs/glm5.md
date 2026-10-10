@@ -205,6 +205,33 @@ Notes that matter for a faithful port:
 - MLX exposes `fast::gated_delta_update`, but the reference above is the exact
   formula to validate against before trusting the primitive.
 
+## KDA layer wiring (from `Glm5NextTextLinearAttention.forward`, 660-772)
+
+```
+mixed_qkv = concat(q_proj(h), k_proj(h), v_proj(h), dim=-1)     # each qkv_dim = head_dim*heads
+            .transpose(1, 2)                                     # (B, C, L) for the conv
+mixed_qkv = causal_conv1d(mixed_qkv, weight=conv1d.weight.squeeze(1), bias=conv1d.bias,
+                          activation=SiLU)[..., -seq_len:]       # depthwise, kernel 4, causal
+q, k, v   = split(mixed_qkv, qkv_dim) -> view (B, L, heads, head_dim)
+
+# forget gate (Glm5NextTextForgetGate, 339):
+fg        = f_b_proj(f_a_proj(h))                                # (B, L, qkv_dim)
+g         = (fg + dt_bias.view(1,1,-1)).view(B, L, heads, head_dim)   # dt_bias is per (head, dim)
+decay     = exp(A_log.view(1,1,heads,1))                         # A_log is per head
+g_out     = -decay * softplus(g)          # softplus(x) = x for x > 20 to avoid overflow
+# (the reference also supports a `linear_lower_bound` "safe" variant:
+#  lower_bound * sigmoid(decay * g); the published config does not set it)
+
+beta      = sigmoid(b_proj(h))
+out       = recurrent_kimi_delta_attention(q, k, v, g=g_out, beta=beta)   # formula above
+out       = RMSNormGated(out)             # o_norm.weight, gated
+out       = o_proj(out)                   # output gate: g_a_proj -> SiLU -> g_b_proj -> sigmoid
+```
+
+Recurrent-state details for the engine: the conv keeps a 3-position rolling
+window (kernel 4) and the delta rule keeps one (heads, k_head_dim, v_head_dim)
+state per layer; both must be part of the KV/state cache for incremental decode.
+
 ## Expected performance envelope
 
 Rough sizing: the MoE holds ~300 B expert parameters at 2.51 bpw (~95 GB on
