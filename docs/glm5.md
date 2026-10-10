@@ -87,6 +87,36 @@ Bitrates observed in that shard: **K = 2 for the routed experts** (3456 tensors)
 and **K = 4 for the attention/dense tensors** (23), i.e. all integer K in 2..6 -
 the existing trellis decoder and GEMV kernel cover them as-is.
 
+## Verified per-layer tensor set (layer 15, shard 5 - a DSA/MoE layer)
+
+Mixed quantization: EXL3 tensors carry `.trellis/.suh/.svh/.mul1` (K=2 for
+experts, K=4 elsewhere), the rest are plain F16/BF16/F32. Loader must handle both.
+
+```
+hc_attn_base  F32 [24]              hc_attn_fn  F32 [24, 16384]     hc_attn_scale  F32 [3]
+hc_ffn_base   F32 [24]              hc_ffn_fn   F32 [24, 16384]     hc_ffn_scale   F32 [3]
+input_layernorm.weight  BF16 [4096] post_attention_layernorm.weight BF16 [4096]
+mlp.gate.weight F16 [288, 4096]     mlp.gate.e_score_correction_bias F32 [288]
+mlp.experts.{e}.{gate,up,down}_proj.{trellis,suh,svh,mul1}   e = 0..287   (EXL3, K=2)
+mlp.shared_experts.{gate,up,down}_proj.{trellis,suh,svh,mul1}            (EXL3)
+self_attn.q_a_proj.*      EXL3      q_a_layernorm.weight  BF16 [1536]
+self_attn.q_b_proj.*      EXL3
+self_attn.kv_a_proj_with_mqa.* EXL3 kv_a_layernorm.weight  BF16 [512]
+self_attn.kv_b_proj.weight F16 [32768, 512]   # unquantized: 64 heads x (256 qk + 256 v)
+self_attn.o_proj.*        EXL3
+self_attn.indexer.wq_b.*  EXL3      indexer.wk.weight        F16 [128, 4096]
+self_attn.indexer.k_norm.{weight,bias}      F16 [128]
+self_attn.indexer.weights_proj.weight       F16 [32, 4096]
+self_attn.indexer.index_kpool_compress_gate F16 [128, 4096]
+self_attn.indexer.index_kpool_compress_ape  F32 [4, 128]
+```
+
+Shard 5 holds layers 15-18 (13992 tensors). KDA layers (e.g. layers 0-2, 4-6)
+carry `linear_attn.*` instead of `self_attn.*` with `q_proj`, `k_proj`, `v_proj`,
+`conv1d`, `b_proj`, `g_a_proj`, `g_b_proj`, `o_norm`, `o_proj` and
+`forget_gate.{f_a_proj,f_b_proj,dt_bias,A_log}` (names to confirm against a
+completed shard containing a KDA layer).
+
 ## Chat template (from the checkpoint's `chat_template.jinja`)
 
 `[gMASK]<sop>` prompt prefix, `<|system|>Reasoning Effort: {Low|High|Max}` for a
