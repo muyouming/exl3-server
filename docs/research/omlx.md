@@ -163,7 +163,7 @@ speed; the only byte-reducing mechanism in this family is the t5 base-3 repack (
 - The ~170-command-buffer mitigation in-tree is OVERLAP, not cap raising: `_DECODE_EVAL_EVERY = 8` ("encoding the first layers while the later ones are being built keeps it fed", 71-78). `set_command_buffer_caps` is the only cap-changing knob and writes MLX-private fields through explicit-instantiation friend tags - last resort, version-guarded.
 - The portable layer is `omlx/patches/mlx_vlm_glm5_next_compat/decode_kernels.py`: pure `mx.fast.metal_kernel` source strings (no nanobind, no metallib, no MLX-private symbols except where it transcribes MLX's own qmv/qmv_wide traversal arithmetic) - i.e. the same mechanism we already use in src/trellis_gemm.cpp. Stage map: glm_qmv_rows 191-195, DSA scores/topk 1137-1450, KDA decode step 1537-1947, moe_router_logits 2088-2173, hc_pre_fused 2352-2750, hc_post_mm 2680-2765 (NAX), mla_head_qmv 2776-2874, multi_qmv 2946-3004.
 - The exactness contract everywhere is transcription of the reference reduction order followed by token-identity tests.
-- **RETRACTION of the withdrawal (verified 2026-10-10).** The 'lm_head M=1 1.2 ms → M=4 4.3 ms' figure **IS present at commit 013bc3f3** — it is in that file's own module docstring, `omlx/patches/qwen35_verify_qmm.py:23-26` ("at M=3..6 it pays a steep per-row penalty — measured on Qwen3.6-27B/M3 Ultra the lm_head scales linearly (1.2ms at M=1 → 4.3ms at M=4) and the summed MLP/GDN projections add ~15ms per verify call"). Proof: `git show 013bc3f3:omlx/patches/qwen35_verify_qmm.py | sed -n '23,26p'`; blob sha256 `5d551745ac7506be357c1b046ee3cce7fc09e3b617c588ba06a271737f014ef9`. The earlier "not found in the clone" claim came from searching only `patches/mlx_lm_mtp/batch_generator.py`. Correct framing: this is **in-repo self-reported measurement** (the file's author's own number for Qwen3.6-27B on M3 Ultra), not an independently reproduced benchmark — cite it as such, and note that no harness in the repo reproduces it. The mechanism (§3-B rows 1, 3) is independently supported regardless.
+- **RETRACTION of the withdrawal (verified 2026-10-10).** The 'lm_head M=1 1.2 ms → M=4 4.3 ms' figure **IS present at commit 013bc3f3** — it is in that file's own module docstring, `omlx/patches/qwen35_verify_qmm.py:23-26` ("at M=3..6 it pays a steep per-row penalty — measured on Qwen3.6-27B/M3 Ultra the lm_head scales linearly (1.2ms at M=1 → 4.3ms at M=4) and the summed MLP/GDN projections add ~15ms per verify call"). Proof: `git show 013bc3f3:omlx/patches/qwen35_verify_qmm.py | sed -n '23,26p'`; blob sha256 `5d551745ac7506be357c1b046ee3cce7fc09e3b617c588ba06a271737f014ef9`. The earlier "not found in the clone" claim came from searching only `patches/mlx_lm_mtp/batch_generator.py` **and from grepping `"1.2 ms"` with a space** — the source writes `1.2ms` (`grep -rn "1\.2ms\|4\.3ms" omlx/patches/qwen35_verify_qmm.py` → rc=0, lines 25-26; the with-space pattern returns rc=1). Correct framing: this is **in-repo self-reported measurement** (the file's author's own number for Qwen3.6-27B on M3 Ultra), not an independently reproduced benchmark — cite it as such, and note that no harness in the repo reproduces it. The mechanism (§3-B rows 1, 3) is independently supported regardless.
 
 ## 4. Quantization support and layout
 
@@ -322,7 +322,15 @@ recover. **Do not port the packers.**
   arithmetic transcribed from MLX's `quantized.h`), and so are `moe_verify_gather` and `row_exact_qmv`. That
   raises T1/T3's feasibility on our GPU: only the HC kernels' *implementation* is M5-locked, the HC *fusion
   structure* is not (the pre-NAX path there is exactly the branchless-Sinkhorn kernel in §3-A, which is classic
-  Metal).
+  Metal). Precise boundary, re-verified: **`hc_pre_fused` is classic Metal in both variants** — its header is only
+  `<metal_simdgroup>` + `<metal_stdlib>` (`decode_kernels.py:2361-2364`), and the deferred path recomputes the
+  previous expand with the scalar helper `glm_hc_expand_value` (`:2367-2372`, `volatile float prod = post[r] *
+  static_cast<float>(y[col])`). NAX enters only through `hc_post_mm` (`_HC_POST_HEADER` + MPP `matmul2d`,
+  `:2554-2637`) and `hc_expand_one` (`_NAX_HEADER` `:2200-2218`, gated by `nax_relaxed_fp32_matmul()` at
+  `:2330-2331`), which produce the `mm` operand. So the non-deferred `hc_pre_fused` — hc_mix + collapse + RMSNorm,
+  **3 dependent dispatches → 1** — can be transcribed to our GPU as-is; only the post/sinkhorn/comb/expand
+  half-layer needs a classic-Metal replacement for its comb product. That is the exact split of our
+  `src/glm5_hc.cpp` bottleneck (165 ms of 317 ms).
 - **The MLX-affine / MXFP weight loaders.** `affine_qmv*`, `affine_gather_blocks_rhs_*`,
   `deepseek_mxfp4_gather_*`, `oq_a8_*` (which decodes affine Q4/Q5/Q8 codes into INT8 tensor fragments,
   `qwen35_oq_a8_nax.metal:1-78`) and the A8 Stage-A activation quantizer all read MLX's packing. EXL3 trellis is a
