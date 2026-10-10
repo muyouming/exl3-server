@@ -36,6 +36,7 @@
 
 #include "engine.h"
 #include "glm5_forward.h"
+#include "glm5_moe.h" // MoeRowsDiag: the routed-expert term's bytes per step
 #include "model.h"
 #include "trellis_gemm.h" // TrellisPathInfo: which kernel the step's classes take
 #include "util.h"
@@ -413,8 +414,29 @@ static int run(int argc, char** argv) {
     struct Case {
       int B;
       int prom;
-      std::vector<double> ms;     // the default tuning (staged where it applies)
-      std::vector<double> ms_off; // the byte-exact QMV, for the paired before/after
+      // The three arms of the interleaved measurement, each best-of-3-rounds:
+      //   ms       the shipped geometry (the default tuning: a run of rows >= the
+      //            threshold takes the staged matrix path)
+      //   ms_off   grouping WITHOUT staging: every run blocked to rows = r on the
+      //            byte-exact QMV (EXL3_MOE_QMVROWS + mat_min_rows = 0) - the
+      //            ablation that says the QMV row blocking does not pay
+      //   ms_legacy one member per (row, expert) pair (EXL3_MOE_ROWS1) - the
+      //            pre-grouping tree this change replaces, and identical to the
+      //            shipped geometry below the threshold
+      std::vector<double> ms;
+      std::vector<double> ms_off;
+      std::vector<double> ms_legacy;
+      // The routed-expert term the arm streamed, and the step's distinct
+      // experts - weight bytes per step (MoeRowsDiag), one entry per arm in the
+      // order above, plus the measured runs (grouped members) and distinct
+      // experts per layer per step. The gap between streamed and shared is the
+      // whole effect of the run geometry.
+      double streamed[3] = {0, 0, 0};
+      double shared[3] = {0, 0, 0};
+      double runs[3] = {0, 0, 0};
+      double staged_runs[3] = {0, 0, 0};
+      double distinct[3] = {0, 0, 0};
+      double layers[3] = {0, 0, 0}; // layers per step that took the rows path
     };
     const exl3::TrellisTuning dflt_tuning = exl3::trellis_get_tuning();
     std::vector<Case> cases;
@@ -432,11 +454,16 @@ static int run(int argc, char** argv) {
     cases.push_back({16, 4, {}});
     const int E = engine.config().n_routed_experts, K = engine.config().num_experts_per_tok;
     const int nprom = (int)ids.size();
+    int moe_layers = 0;
+    for (const auto& l : g5->weights().layers)
+      if (l.moe) moe_layers += 1;
     // One measured round of one case: join `prom` slots, warm `warm` steps, time
     // `meas`. The slots' state is per-batch, so dropping it here is what a
     // finished request does (batch_leave); reset is the bulk form.
-    auto run_case = [&](Case& c, std::vector<double>& ms) {
+    auto run_case = [&](Case& c, std::vector<double>& ms, int arm) {
       std::vector<int> feed((size_t)c.B);
+      exl3::moe_rows_diag_reset(); // the expert term of THIS run only
+      bool ran = false;
       try {
         for (int b = 0; b < c.B; ++b) {
           const size_t pi = (size_t)(b % std::min(c.prom, nprom));
@@ -455,38 +482,62 @@ static int run(int argc, char** argv) {
         const double s0 = now_s();
         for (int i = 0; i < meas; ++i) one();
         ms.push_back((now_s() - s0) / meas);
+        ran = true;
       } catch (const std::exception& e) {
         // A width this box cannot hold (the batch state is ~150 MB per slot
         // plus the caches) is reported, not fatal: the numbers above it stay
         // valid.
         std::printf("  B=%d %d prompts: SKIPPED (%s)\n", c.B, c.prom, e.what());
       }
+      if (ran) {
+        const exl3::MoeRowsDiag d = exl3::moe_rows_diag();
+        const double steps_all = (double)(warm + meas);
+        c.streamed[arm] = (double)d.streamed_bytes / steps_all;
+        c.shared[arm] = (double)d.shared_bytes / steps_all;
+        // Per moe_layer_rows call == per layer per step.
+        c.runs[arm] = d.calls ? (double)d.runs / (double)d.calls : 0.0;
+        c.staged_runs[arm] = d.calls ? (double)d.staged_runs / (double)d.calls : 0.0;
+        c.distinct[arm] = d.calls ? (double)d.distinct_experts / (double)d.calls : 0.0;
+        c.layers[arm] = (double)d.calls / steps_all;
+      }
       g5->batch_reset();
     };
-    // Interleaved rounds: each round measures every case twice - once with the
-    // default tuning and once with the staged path forced off - and the order
-    // alternates by round. The box drifts far more than the lever (this pass saw
-    // the B=8 two-prompt cell at 465 and 289 ms for the SAME code, and the B=1
-    // serial cell at 135/171/177 ms across three processes), so only a pair
-    // measured back to back in one process is a measurement. The printed
-    // "ms/step" line above stays the best-of-3 of the default tuning.
+    // Interleaved rounds: each round measures every case through all three arms,
+    // and the arm order rotates by round so none is always first (the box drifts
+    // monotonically inside a round - the three arms must not be ordered by
+    // position). The box drifts far more than any lever (this pass saw the B=8
+    // two-prompt cell at 465 and 289 ms for the SAME code, and the B=1 serial
+    // cell at 135/171/177 ms across three processes), so only arms measured back
+    // to back in one process are comparable. The printed "ms/step" line below
+    // stays the best-of-3 of the default arm.
     exl3::TrellisTuning off_tuning = dflt_tuning;
-    off_tuning.mat_min_rows = 0; // the byte-exact QMV
+    off_tuning.mat_min_rows = 0; // the byte-exact QMV (with the runs still blocked)
+    auto set_arm = [&](int arm) {
+      if (arm == 2) {
+        unsetenv("EXL3_MOE_QMVROWS");
+        exl3::trellis_set_tuning(dflt_tuning);
+        setenv("EXL3_MOE_ROWS1", "1", 1);
+      } else if (arm == 1) {
+        unsetenv("EXL3_MOE_ROWS1");
+        setenv("EXL3_MOE_QMVROWS", "1", 1);
+        exl3::trellis_set_tuning(off_tuning);
+      } else {
+        unsetenv("EXL3_MOE_ROWS1");
+        unsetenv("EXL3_MOE_QMVROWS");
+        exl3::trellis_set_tuning(dflt_tuning);
+      }
+    };
     for (int r = 0; r < 3; ++r) {
       for (auto& c : cases) {
-        if ((r & 1) == 0) {
-          exl3::trellis_set_tuning(dflt_tuning);
-          run_case(c, c.ms);
-          exl3::trellis_set_tuning(off_tuning);
-          run_case(c, c.ms_off);
-        } else {
-          exl3::trellis_set_tuning(off_tuning);
-          run_case(c, c.ms_off);
-          exl3::trellis_set_tuning(dflt_tuning);
-          run_case(c, c.ms);
+        for (int step = 0; step < 3; ++step) {
+          const int arm = (r + step) % 3;
+          set_arm(arm);
+          run_case(c, arm == 0 ? c.ms : (arm == 1 ? c.ms_off : c.ms_legacy), arm);
         }
       }
     }
+    unsetenv("EXL3_MOE_ROWS1");
+    unsetenv("EXL3_MOE_QMVROWS");
     exl3::trellis_set_tuning(dflt_tuning);
     for (auto& c : cases) {
       if (c.ms.empty()) continue;
@@ -496,27 +547,50 @@ static int run(int argc, char** argv) {
                   "per seq, aggregate %6.2f tok/s\n",
                   c.B, std::min(c.prom, nprom), c.prom == 1 ? " " : "s", distinct, best * 1000,
                   1.0 / best, (double)c.B / best);
+      std::printf("      expert term (%d of %d MoE layers on the rows path): shipped %5.2f GB "
+                  "streamed / %5.2f GB shared per step (%4.1f members, %4.1f staged, %4.1f distinct "
+                  "experts per layer) | one per pair %5.2f / %5.2f GB (%4.1f members)\n",
+                  (int)(c.layers[0] + 0.5), moe_layers, c.streamed[0] / 1e9, c.shared[0] / 1e9,
+                  c.runs[0], c.staged_runs[0], c.distinct[0], c.streamed[2] / 1e9,
+                  c.shared[2] / 1e9, c.runs[2]);
     }
 
-    // The same cases again with the staged fp16 + simdgroup_matrix path OFF: the
-    // paired measurement of what it buys, and it has to be in this process. The
-    // box drifts 10-30% between processes - this pass measured the B=1 serial
-    // cell (identical code in both runs, rows = 1 so the staged path cannot be
-    // involved) at 135 vs 177 ms across two back-to-back processes, a 24% spread
-    // - so a cross-process before/after is not a measurement.
-    // The pair, best of the interleaved rounds each: what the staged path buys
-    // at this row count, in this process.
-    std::printf("  --- paired (staged / QMV), interleaved rounds ---\n");
+    // The QMV row blocking's own contribution, measured with the staged path off
+    // in BOTH arms (so the pair isolates the run geometry): the shipped geometry
+    // keeps the rows=1 members below the threshold, so this arm is the ablation.
+    // The box drifts far more than any lever (this pass measured the B=1 serial
+    // cell, identical code in both arms, at 135 vs 177 ms across two back-to-back
+    // processes - a 24% spread), so only a back-to-back pair in one process is a
+    // measurement.
+    std::printf("  --- paired (shipped / every run row-blocked, staged off), interleaved rounds ---\n");
     {
       for (auto& c : cases) {
         if (c.ms.empty() || c.ms_off.empty()) continue;
         const double on = *std::min_element(c.ms.begin(), c.ms.end());
         const double of = *std::min_element(c.ms_off.begin(), c.ms_off.end());
-        std::printf("  pair B=%d %2d prompt%s: staged %7.2f ms (%5.2f tok/s) | QMV %7.2f ms "
-                    "(%5.2f tok/s) -> %.2fx\n",
+        std::printf("  pair B=%d %2d prompt%s: shipped %7.2f ms (%5.2f tok/s) | row-blocked QMV "
+                    "%7.2f ms (%5.2f tok/s) -> %.2fx\n",
                     c.B, std::min(c.prom, nprom), c.prom == 1 ? " " : "s", on * 1000,
                     (double)c.B / on, of * 1000, (double)c.B / of, of / on);
       }
+    }
+
+    // The before/after that matters: the shipped geometry against one rows=1
+    // member per (row, expert) pair - the pre-grouping tree. Both arms are in
+    // this process, and both carry the expert term's bytes so the numbers can be
+    // read against the mechanism rather than only against ms. Below the
+    // threshold the two arms ARE the same geometry, so those cells read 1.00x by
+    // construction (an internal consistency check, not a measurement).
+    std::printf("  --- paired (shipped / one member per pair), interleaved rounds ---\n");
+    for (auto& c : cases) {
+      if (c.ms.empty() || c.ms_legacy.empty()) continue;
+      const double grp = *std::min_element(c.ms.begin(), c.ms.end());
+      const double leg = *std::min_element(c.ms_legacy.begin(), c.ms_legacy.end());
+      std::printf("  pair B=%d %2d prompt%s: shipped %7.2f ms (%5.2f tok/s) | one per pair %7.2f ms "
+                  "(%5.2f tok/s) -> %.2fx | expert term %5.2f -> %5.2f GB/step\n",
+                  c.B, std::min(c.prom, nprom), c.prom == 1 ? " " : "s", grp * 1000,
+                  (double)c.B / grp, leg * 1000, (double)c.B / leg, leg / grp,
+                  c.streamed[2] / 1e9, c.streamed[0] / 1e9);
     }
   }
 

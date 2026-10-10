@@ -1265,3 +1265,133 @@ The next levers, in order of what the numbers now say:
    design; a chunked-over-k GEMM with the weight tile in threadgroup memory is
    the shape that serves (1, L>=64, hidden) - and it is what a longer prompt
    actually needs (the current QMV streams the weights L/mb times).
+
+---
+
+## Pass 7: the routed expert term - runs, the staged path, and the QMV row blocking that did not pay
+
+The sixth pass left the expert term as the largest one and named the mechanism
+precisely: at B=16 with one prompt the 16 rows share 8 experts, but in
+`moe_layer_rows` every (row, expert) pair is a `rows=1` member of a grouped
+launch, so each expert's weights are decoded once per selecting row. This pass
+made the pairs that share an expert ONE member - a *run*, the rows of the batch
+that selected that expert - and routed a run at `rows >= EXL3_QMV_MAT_MIN_ROWS`
+through the single-tensor entry point with its `(r, 1, hidden)` activation, which
+is decode-shaped by construction, so the staged fp16 + simdgroup_matrix path
+serves it. Rows below the threshold keep the byte-exact QMV as `rows=1` members;
+`moe_layer`'s general gather/scatter form is untouched (prefill, and the layers
+this path cannot admit).
+
+Two code points beyond the run geometry, both load-bearing:
+
+* `matmul_group_impl` summed the **wrong axis for a one-member grouped launch**:
+  `qmv_scalar_run` returns one member's split output flat `(splits, pad, out)`,
+  and the following `mx::sum(axis=1)` then reduced the padded row axis instead of
+  the split axis (it threw on the reshaped result, or silently wanted a
+  different shape). The member axis is now made explicit before the reduction -
+  a view, no value change - which the one-member buckets this pass creates
+  needed.
+* `moe_layer` is not the prefill-only path: **only 14 of the 42 MoE layers reach
+  `moe_layer_rows` at all**, because the other 28 fail `groupable()` on
+  `TrellisWeight::aligned` (the shard header's arbitrary length fixes the word
+  parity; 41 of 43 layers are wholly un-aligned). `EXL3_MOE_RUNS_DEBUG=1` now
+  traces that by name (`MOE_ROWS_BAIL ... aligned=000`). Those 28 layers take the
+  general path, which already groups the step's tokens per expert
+  (`mb = min(n, 4)` rows per decode pass) - i.e. the ticket's "43 GB/step" premise
+  covers the 14 layers, whose measured per-pair stream is 17.0 GB/step.
+
+### Measured (`tests/glm5_batch_test.cpp <model> 6 --bench`, one session)
+
+Three arms, interleaved in one process with the arm order rotating per round,
+best of 3 rounds each (the box drifts more than any lever; the same-session,
+same-code cells below are the noise floor, not a result):
+
+* **shipped** - a run at `rows >= 16` takes the staged path, everything else the
+  previous per-pair QMV geometry;
+* **row-blocked QMV** - every run blocked to `rows = r` on the byte-exact QMV
+  (`EXL3_MOE_QMVROWS=1`, `mat_min_rows=0`): the ablation of the row blocking alone;
+* **one per pair** - the pre-change tree (`EXL3_MOE_ROWS1=1`).
+
+| case | shipped ms (tok/s) | row-blocked QMV | one per pair | expert term shipped / one-per-pair |
+|---|---|---|---|---|
+| B=1 serial | - | - | 424.80 (2.35) | - |
+| B=1, 4 prompts | 107.50 (9.30) | 102.66 (9.74) | 103.47 (9.66) | 0.00 / 0.00 GB |
+| B=2, 4 prompts | 148.86 (13.44) | 146.33 (13.67) | 145.33 (13.76) | 2.12 / 2.12 GB |
+| B=4, 4 prompts | 334.01 (11.98) | 309.85 (12.91) | 315.97 (12.66) | 4.24 / 4.24 GB |
+| B=8, 4 prompts | 471.04 (16.98) | 465.16 (17.20) | 470.89 (16.99) | 8.49 / 8.49 GB |
+| B=4, 1 prompt | 171.68 (23.30) | 163.03 (24.54) | 171.06 (23.38) | 4.24 / 4.24 GB |
+| B=8, 1 prompt | 260.12 (30.75) | 250.99 (31.87) | 261.57 (30.58) | 8.49 / 8.49 GB |
+| B=8, 2 prompts | 349.02 (22.92) | 267.81 (29.87) | 438.01 (18.26) | 8.49 / 8.49 GB |
+| B=8, 8 prompts | 491.28 (16.28) | 504.63 (15.85) | 458.66 (17.44) | 8.49 / 8.49 GB |
+| **B=16, 1 prompt** | **322.20 (49.66)** | 427.96 (37.39) | 380.95 (42.00) | **1.06 / 16.98 GB** |
+| B=16, 4 prompts | 531.14 (30.12) | 583.05 (27.44) | 546.97 (29.25) | 15.97 / 16.98 GB |
+
+**The noise floor, measured, not assumed.** Eight of the eleven cells have the
+shipped and one-per-pair arms on *identical code* (no run reaches the threshold),
+and they read 0.93x to 1.25x - the B=8 two-prompt cell at 1.25x in this session,
+0.77x in the row-blocked arm, is the same cell the sixth pass saw at 465 and 289
+ms for one build. So nothing outside the B=16 one-prompt cell is a result here.
+
+**The result.** B=16 with one prompt: **380.95 -> 322.20 ms/step, 42.00 -> 49.66
+tok/s aggregate (+18%)**, and the one-per-pair arm of this run reproduces the
+recorded 41.93 tok/s baseline to within 0.2% - the paired "before" is the current
+tree. The expert term's streamed bytes on the 14 layers this path serves fall
+16x (16.98 -> 1.06 GB/step; 8.0 runs/layer, all 8 staged, against 128 `rows=1`
+members). The staged path is what buys it: the row-blocked QMV arm at the same
+cell is 427.96 ms (1.33x slower than shipped).
+
+**The negative result, kept.** Row-blocking the QMV alone does not pay, and this
+is why the sub-threshold runs deliberately keep the `rows=1` geometry. mb = 4
+does cut the weight passes 4x (that part is real), but `mb * nt <= 4` is the
+QMV's accumulator budget, so mb = 4 costs it nt = 4 - the tiles-per-threadgroup
+that amortises the per-iteration activation path - and the two cancel: +4..5% on
+the same-prompt cells, -5..10% on B=16 four-prompts (this session's full-matrix
+run measured the full-grouping variant at 583.05 vs 531.14 ms, 1.10x). The
+variant stays reachable (`EXL3_MOE_QMVROWS=1`) so the ablation is reproducible,
+and it is not the default.
+
+### Gates (real checkpoint)
+
+| gate | where | result |
+|---|---|---|
+| single-slot batch == serial decode | `glm5_batch_test` §1 | max abs logit diff = **0** (bit-identical) |
+| four identical slots == serial | §2 | 0.01758 (0.065% of max\|logit\|), rows bit-identical - **the recorded numbers** |
+| four different prompts == four serial runs | §3 | token identity every step; logits 0.4453 (1.52%) - **the recorded numbers** |
+| serving thread | §4 | 9/9 requests, `stop_batch()` in flight returns in 0.08 s |
+| rows path == single-row == general (bit-exact, incl. chunked duplicate experts) | `moe_test` | ALL OK |
+| nt/mb invariance, the 125 QMV hashes + 125 staged hashes over 25 real classes x 5 row counts, the grouped/scale-stack contracts | `glm5_gemv_nt_test` | **byte-identical output to the pre-change build (0 diff)**, both sections PASS |
+| staged-dispatch scope | bench `expert term ... N staged` column + `EXL3_MOE_RUNS_DEBUG` | 8.0 staged runs/layer at B=16 one-prompt; 0.0 at every B<=8 cell and at B=4; the prefill/single-sequence path cannot reach the batch entry (B<=1 returns to `moe_layer`) |
+
+The two named f32-association deviations of the staged path are unchanged and
+stay inside the same gate: this pass adds callers, not a scope. Every cell at
+B<=4 is the previous tree's arithmetic, which the §2/§3 numbers being *identical
+to the digit* shows.
+
+### Honest distance to 70 tok/s
+
+49.66 tok/s at B=16 with a shared prompt is +18% over 41.93 and +47% over the
+33.9 the expert-order pass ended at. The distance to 70 is 322 -> 229 ms/step,
+93 ms, and the expert bytes are no longer where it is: the 14 rows-path layers
+now stream 1.06 GB/step, and the step's ~13 GB/step total at 322 ms is ~40 GB/s
+effective - the constraint is issued work and small-kernel latency, not DRAM.
+
+The next levers, in the order the numbers put them:
+
+1. **A hybrid decode path for the 28 un-aligned layers.** They cannot enter
+   `moe_layer_rows` (`aligned=false`), so their expert term is still the general
+   path's: token-grouped at `mb = min(n, 4)`, 8 experts x 4 passes x 9.4 MB =
+   ~8.4 GB/step at B=16 one-prompt, un-staged. The staged path needs a
+   decode-shaped activation, which the general path's flat `(tokens, hidden)`
+   form is not - so the lever is a hybrid: staged single-tensor calls for a run at
+   `rows >= 16`, the general path's `(n, hidden)` per-expert call below it. That
+   keeps the sub-threshold arithmetic bit-identical (moe_test's gate) and moves
+   those 8.4 GB onto one pass + the tensor unit. A pure relaxation of
+   `groupable()` is *not* this: it would put those layers' B<16 runs on `rows=1`
+   members, which is 4x more passes than their current token-grouped form.
+2. **Re-tune the staged path's split target against the step**, the sixth pass's
+   lever 1, now that the expert runs are on it: `EXL3_QMV_MAT_TG`/`_NT`/`_MB` with
+   this bench as the instrument, 24 launches/layer of staged expert work changed
+   what the step wants.
+3. **A prefill-width GEMM**, unchanged: the staged path is out of scope for a
+   prefill by design, and a chunked-over-k GEMM is what (1, L >= 64, hidden)
+   needs.

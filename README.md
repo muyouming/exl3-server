@@ -96,22 +96,31 @@ thread's serial mode.
 
 The routed experts are the part batching cannot amortize by itself: 8 rows over
 top-8 of 288 experts select ~58 distinct experts, so those ~2.4 GB/token are read
-either way, while the ~3.3 GB of dense weight reads per token are shared. The
-step's B*K (row, expert) pairs are therefore executed in *expert order* (sorted by
-expert id, in chunks of 14/29 pairs per launch) so pairs sharing an expert run
-back to back and its tile is read from cache: bit-identical per pair (only the
-order changes) and worth 0-28% depending on the cell, but the mixed-prompt rate
-still sits on a line set by the number of distinct experts - 19.3 tok/s aggregate
-at B=8 with 4 distinct prompts against 29.7 tok/s with one. Measured gradients,
-tables and the honest reading: `docs/perf.md`, "expert-order pair execution" and
-"request-level batching".
+either way, while the ~3.3 GB of dense weight reads per token are shared. Each
+step's B*K (row, expert) pairs are therefore executed in *expert order*, and the
+pairs that share an expert are grouped into one **run** - the rows of the batch
+that selected it. A run whose row count reaches the staged path's threshold (16)
+is routed through the single-tensor entry point with its `(r, 1, hidden)`
+activation, which is decode-shaped, so its r rows share one staged fp16 +
+simdgroup_matrix tile and one weight pass instead of r row-at-a-time QMV members:
+on a shared prompt that is 16 identical rows per expert, i.e. the 16x the pair
+form cost. Below the threshold the pairs keep the byte-exact QMV as `rows=1`
+members, because row-blocking the QMV was measured a wash (mb = 4 costs the
+kernel its nt), and the layers whose packed words are not 4-byte aligned run the
+general gather/scatter path - which already groups the step's tokens per expert.
+Measured on the real checkpoint, paired in one process: B=16 with a shared prompt
+42.0 -> 49.7 tok/s aggregate (the expert term's streamed bytes fall 16x, 17.0 ->
+1.06 GB/step); every cell below 16 rows is the previous tree's arithmetic, to the
+digit. Tables, the noise floor and the honest reading: `docs/perf.md`, "Pass 7".
 
 
 ### Where this stands (external calibration, 2026-10-10)
 
-Measured by us, same-session, warmed, second process: **8.66 tok/s single stream**
-(115 ms/step) and **33.9 tok/s aggregate at B=16 with a shared prompt** (B=8
-mixed 19.3, B=16 four-prompts 31.5). Research into the wild numbers
+Measured by us, same-session, warmed: **6.0 tok/s single stream** (166 ms/step;
+the identical-code serial cell spans 135-424 ms across processes and sessions -
+the box's page-cache state, not the code) and **49.7 tok/s aggregate at B=16 with
+a shared prompt** (one-prompt B=8 30.8, four-prompts B=16 30.1; the same cell read
+42.0 tok/s on the previous tree in the same process). Research into the wild numbers
 (`docs/research/glm53-flash-mac-reports.md`) says:
 
 - **On an M4 Max at 2-3 bits, nobody has published a faster run of this model**

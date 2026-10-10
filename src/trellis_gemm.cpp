@@ -1019,17 +1019,27 @@ mx::array matmul_group_impl(const std::vector<TrellisWeight>& ws, const mx::arra
   // The grouped forms stay on the QMV, deliberately: their activation is
   // (n, rows, in) with the sequence axis already flattened into `rows`, so the
   // decode-shaped test (the scope of the staged path - see decode_shaped) cannot
-  // be made, and the two callers that reach rows >= the threshold with members
-  // are the routed experts of the model's MoE (rows = 1 per member, which the
-  // threshold excludes) and moe_layer's general path, whose (K, B*L, H) shaped
-  // activation includes the single-sequence prefill. Guessing there would take
-  // the staged path into every prefill through the back door.
+  // be made, and the two callers with members at rows >= the threshold are the
+  // routed experts of the model's MoE (one member per run of rows that selected
+  // one expert - a run at the threshold goes through the single-tensor entry
+  // point instead, which is the call whose activation IS decode-shaped) and
+  // moe_layer's general path, whose (K, B*L, H) shaped activation includes the
+  // single-sequence prefill. Guessing there would take the staged path into every
+  // prefill through the back door.
   const Geom g = pick_geom(k_tiles, n_tiles, rows, n);
   const int splits = g.splits, pad_rows = g.pad_rows;
 
   mx::array xin = pad_rows_zeros(x, rows, pad_rows);
   mx::array y = qmv_scalar_run(ws, xin, g);
-  if (splits > 1) y = mx::sum(y, std::vector<int>{1}, false); // (n, pad_rows, out)
+  // The split axis (axis 0 for one member - qmv_scalar_run returns that form
+  // flat - and axis 1 for a grouped launch) is reduced after an explicit member
+  // axis is made: `sum` over axis 1 only means "the split axis" once the leading
+  // member axis exists, so a one-member group must not take the flat form (the
+  // reshape is a view, so this is the same array either way).
+  if (splits > 1) {
+    y = mx::reshape(y, {n, splits, pad_rows, out});
+    y = mx::sum(y, std::vector<int>{1}, false); // (n, pad_rows, out)
+  }
   // One batched output Hadamard: the members' svh vectors concatenated give the
   // per-member scale (the kernel's block index runs member-major over rows).
   mx::array sstack = svh_stack;

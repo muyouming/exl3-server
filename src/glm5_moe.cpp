@@ -3,9 +3,12 @@
 
 #include "glm5_kda.h" // g5_linear
 
+#include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <limits>
+#include <map>
 #include <vector>
 
 namespace exl3 {
@@ -88,6 +91,13 @@ const G5MoePrep* moe_prep_of(const G5Layer& l, const ModelConfig& cfg);
 // bounds: must be between 0 and 30").
 constexpr int kMaxGroupMembers = 29;
 
+// The routed-expert byte accounting (MoeRowsDiag): one process-global accumulator
+// that moe_layer_rows fills and tests/glm5_batch_test.cpp reads per step.
+MoeRowsDiag& moe_rows_diag_state() {
+  static MoeRowsDiag d;
+  return d;
+}
+
 // Everything a grouped launch requires of one member. The *cross-member*
 // uniformity (same shape, K, codebook, alignment, no bias, for every expert of a
 // projection class) is established once per layer by moe_prep_of(), which
@@ -106,7 +116,9 @@ mx::array moe_layer_rows(const G5Layer& l, const ModelConfig& cfg, const mx::arr
   const G5MoePrep* prep = moe_prep_of(l, cfg);
   // A one-row call IS the serial decode path (its fast path is the same
   // arithmetic and one launch per class).
-  if (B <= 1 || L != 1 || prep == nullptr || E <= 0 || K <= 0) return moe_layer(l, cfg, h);
+  if (B <= 1 || L != 1 || prep == nullptr || E <= 0 || K <= 0) {
+    return moe_layer(l, cfg, h);
+  }
 
   // The shared expert does not depend on the router: dispatch it first so the
   // GPU has it queued while the host waits for the ids (as moe_layer does).
@@ -119,24 +131,30 @@ mx::array moe_layer_rows(const G5Layer& l, const ModelConfig& cfg, const mx::arr
   mx::eval(indices); // the step's one host round trip
   const int32_t* idx = indices.data<int32_t>();
 
-  // ---- the step's work items, in EXPERT order -------------------------------
+  // ---- the step's work items, grouped by expert -----------------------------
   //
   // The step has B*K (row, expert) pairs. Routing order visits them row by row,
-  // so the same expert's weight tile is read once per row that selected it -
-  // and on this checkpoint the rows of a real batch barely overlap (57.6
-  // distinct experts of 64 selections at B=8, top-8 of 288). Executing the
-  // pairs in EXPERT order makes every pair of one expert run back to back, so
-  // its tile is read from cache instead of DRAM for all but the first of them
-  // (the mechanism oMLX's `moe_verify_gather` ports; docs/research/omlx.md §B).
+  // so the same expert's weight tile is read once per row that selected it - and
+  // on this checkpoint the rows of a real batch barely overlap when the prompts
+  // differ (57.6 distinct experts of 64 selections at B=8, top-8 of 288).
+  // Executing the pairs in EXPERT order makes every pair of one expert run back
+  // to back, so its tile is read from cache instead of DRAM for all but the
+  // first of them (the mechanism oMLX's `moe_verify_gather` ports;
+  // docs/research/omlx.md §B).
   //
-  // Only the ORDER of the work items changes. Each pair is still one member of
-  // a grouped launch with rows=1, its own weight buffer and its own slice of the
-  // scale stacks, so every pair's arithmetic - the kernel's tile geometry, its
-  // k-order and its f32 split sum - is the one it had in routing order, and the
-  // per-pair results are reordered back with a `take` (a pure move) before the
-  // weighted sum, which sees the (K, B, 1, H) layout and the reduction order it
-  // always had. tests/moe_test.cpp (g) hashes this path against N single-row
-  // calls and against the general gather/scatter form, bit for bit.
+  // Ordering alone cannot remove the *duplication*: with rows=1 members the
+  // expert's tile is still decoded once per selecting row. The RUN - the rows of
+  // the batch that selected one expert - is therefore the launch's unit: a run of
+  // r rows whose r reaches the staged threshold is routed through the
+  // single-tensor entry point with its (r, 1, hidden) activation, which IS
+  // decode-shaped, so its r rows share one staged tile and one weight pass
+  // instead of r row-at-a-time QMV members (the mechanism, and why the
+  // sub-threshold runs deliberately keep the rows=1 geometry, are in the
+  // header). The per-run results are reordered back with a `take` (a pure move)
+  // before the weighted sum, which sees the (K, B, 1, H) layout and the
+  // reduction order it always had. tests/moe_test.cpp (g)/(h) hashes the rows
+  // path against N single-row calls and against the general gather/scatter form,
+  // bit for bit at every width it can be reached with.
   const int P = B * K;
   struct Pair {
     int expert, row, rank;
@@ -150,7 +168,23 @@ mx::array moe_layer_rows(const G5Layer& l, const ModelConfig& cfg, const mx::arr
       const G5Linear& g = l.experts[(size_t)(e * 3 + 0)];
       const G5Linear& u = l.experts[(size_t)(e * 3 + 1)];
       const G5Linear& d = l.experts[(size_t)(e * 3 + 2)];
-      if (!groupable(g) || !groupable(u) || !groupable(d)) return moe_layer(l, cfg, h);
+      if (!groupable(g) || !groupable(u) || !groupable(d)) {
+        // The layer goes to the general gather/scatter path. On this checkpoint
+        // that is what happens to the two thirds of the MoE layers whose packed
+        // words are not 4-byte aligned (TrellisWeight::aligned: the shard's
+        // header length, which is arbitrary, fixes the parity), and it is a
+        // real condition rather than a rare fallback - so it is traced by name.
+        if (std::getenv("EXL3_MOE_RUNS_DEBUG")) {
+          std::fprintf(stderr,
+                       "MOE_ROWS_BAIL e=%d quantized=%d%d%d bias=%d%d%d aligned=%d%d%d "
+                       "packed=%zu/%zu/%zu\n",
+                       e, (int)g.quantized, (int)u.quantized, (int)d.quantized, (int)g.has_bias,
+                       (int)u.has_bias, (int)d.has_bias, (int)g.tw.aligned, (int)u.tw.aligned,
+                       (int)d.tw.aligned, g.tw.packed.size(), u.tw.packed.size(),
+                       d.tw.packed.size());
+        }
+        return moe_layer(l, cfg, h);
+      }
       pairs.push_back(Pair{e, b, k});
     }
   }
@@ -165,68 +199,211 @@ mx::array moe_layer_rows(const G5Layer& l, const ModelConfig& cfg, const mx::arr
     perm[(size_t)(q.rank * B + q.row)] = p;
   }
 
+  // The step's members, one per launch slot. A RUN - the rows of the batch that
+  // selected one expert - is the unit the staged path takes: its activation is
+  // (r, 1, hidden), so routing it through the single-tensor entry point puts its
+  // r rows on one staged tile instead of r row-at-a-time QMV members, and that
+  // is the only part of the row grouping that paid.
+  //
+  // Below the threshold the step keeps the pre-grouping geometry - one rows=1
+  // member per (row, expert) pair - deliberately. Row-blocking the QMV is real
+  // in bytes (mb = min(rows, 4) rows share one decode pass, so a run of r >= 4
+  // rows costs ceil(r/4) passes instead of r: 4x at r = 16) and was measured NOT
+  // to move the time: mb = 4 inside a threadgroup costs the QMV its nt (mb * nt
+  // <= 4 is the accumulator budget, and nt = 4 is what amortises the
+  // per-iteration activation path), which cancels the pass saving - the
+  // ablation measured +4..5% on the same-prompt cells and -5..9% on B=16
+  // four-prompts with the grouping alone, and the same again with it plus every
+  // r >= 16 run staged. So the QMV keeps its rows=1 geometry. Two switches keep
+  // the ablation reproducible: EXL3_MOE_QMVROWS groups every run (the
+  // measured-worse variant) and EXL3_MOE_ROWS1 refuses to group at all (the
+  // tree this change replaces).
+  const bool per_pair = std::getenv("EXL3_MOE_ROWS1") != nullptr;
+  const bool qmv_rows = std::getenv("EXL3_MOE_QMVROWS") != nullptr;
+  struct Run {
+    int expert, off, r;
+  };
+  std::vector<Run> runs;
+  // Which runs the staged fp16 + simdgroup_matrix path takes. Its scope rule is a
+  // *shape* rule - a decode-shaped activation (>= 3-D, sequence axis 1) at rows
+  // >= the tuning threshold - and a run's activation IS (r, 1, hidden), so
+  // routing the run through the single-tensor entry point is exactly what puts
+  // it on the staged path. The three projections of an expert are one shape
+  // class, so their answers agree; the gate itself lives in trellis_path_info.
+  std::vector<char> staged;
+  runs.reserve((size_t)P);
+  staged.reserve((size_t)P);
+  for (int p = 0; p < P;) {
+    int q = p;
+    while (q < P && pairs[(size_t)q].expert == pairs[(size_t)p].expert) ++q;
+    const int e = pairs[(size_t)p].expert, r = q - p;
+    const bool st =
+        !per_pair && trellis_path_info(l.experts[(size_t)(e * 3 + 0)].tw, r).staged &&
+        trellis_path_info(l.experts[(size_t)(e * 3 + 1)].tw, r).staged &&
+        trellis_path_info(l.experts[(size_t)(e * 3 + 2)].tw, r).staged;
+    const bool grouped = !per_pair && (qmv_rows || st);
+    if (grouped) {
+      runs.push_back(Run{e, p, r});
+      staged.push_back(st ? 1 : 0);
+    } else {
+      for (int i = p; i < q; ++i) {
+        runs.push_back(Run{pairs[(size_t)i].expert, i, 1});
+        staged.push_back(0);
+      }
+    }
+    p = q;
+  }
+
   const float limit = cfg.swiglu_limit;
   mx::array hf = mx::reshape(h, {B, H});
-  // One merged gate|up launch holds two members per pair (every gate member
-  // first, then every up member - the layout moe_prep_of's scale stack and the
-  // gu4 split below assume), so a chunk is at most kMaxGroupMembers/2 pairs; a
-  // down launch holds one member per pair.
-  const int gu_chunk = kMaxGroupMembers / 2;
-  std::vector<mx::array> act_chunks;
-  act_chunks.reserve((size_t)((P + gu_chunk - 1) / gu_chunk));
-  for (int s = 0; s < P; s += gu_chunk) {
-    const int c = std::min(gu_chunk, P - s);
-    std::vector<TrellisWeight> wgu((size_t)2 * c);
-    std::vector<int32_t> gu_ids((size_t)2 * c), rows((size_t)2 * c);
-    for (int i = 0; i < c; ++i) {
-      const Pair& q = pairs[(size_t)(s + i)];
-      const int e = q.expert;
-      wgu[(size_t)i] = l.experts[(size_t)(e * 3 + 0)].tw;
-      wgu[(size_t)(c + i)] = l.experts[(size_t)(e * 3 + 1)].tw;
-      gu_ids[(size_t)i] = e;
-      gu_ids[(size_t)(c + i)] = E + e;
-      rows[(size_t)i] = q.row;
-      rows[(size_t)(c + i)] = q.row;
-    }
-    // The activation block is one row per member: member i<c is pair i's row for
-    // its gate expert, member c+i the same row for its up expert (moe_prep_of's
-    // member order).
-    mx::array xgu = mx::reshape(
-        mx::take(hf, mx::array(rows.data(), {2 * c}, mx::int32), 0), {2 * c, 1, H});
-    mx::array gu = trellis_linear_group_rows_scaled(
-        wgu, xgu, /*rows=*/1,
-        mx::take(prep->suh_gu, mx::array(gu_ids.data(), {2 * c}, mx::int32), 0),
-        mx::take(prep->svh_gu, mx::array(gu_ids.data(), {2 * c}, mx::int32), 0));
-    const int out_i = wgu[0].out_features;
-    mx::array gu4 = mx::reshape(gu, {2, c, 1, out_i});
-    mx::array gate = mx::reshape(mx::slice(gu4, {0, 0, 0, 0}, {1, c, 1, out_i}), {c, 1, out_i});
-    mx::array up = mx::reshape(mx::slice(gu4, {1, 0, 0, 0}, {2, c, 1, out_i}), {c, 1, out_i});
-    gate = mx::clip(gate, std::nullopt, mx::array(limit, gate.dtype()));
-    up = mx::clip(up, mx::array(-limit, up.dtype()), mx::array(limit, up.dtype()));
-    mx::array act = mx::multiply(gate, mx::sigmoid(gate));
-    act_chunks.push_back(mx::multiply(act, up)); // (c, 1, inn)
-  }
-  mx::array act_all = act_chunks.size() == 1 ? act_chunks[0] : mx::concatenate(act_chunks, 0);
-  const int inn = (int)act_all.shape(2);
+  auto run_rows = [&](const Run& rn) {
+    std::vector<int32_t> rows((size_t)rn.r);
+    for (int t = 0; t < rn.r; ++t) rows[(size_t)t] = pairs[(size_t)(rn.off + t)].row;
+    return rows;
+  };
 
-  std::vector<mx::array> down_chunks;
-  down_chunks.reserve((size_t)((P + kMaxGroupMembers - 1) / kMaxGroupMembers));
-  for (int s = 0; s < P; s += kMaxGroupMembers) {
-    const int c = std::min(kMaxGroupMembers, P - s);
-    std::vector<TrellisWeight> wd((size_t)c);
-    std::vector<int32_t> d_ids((size_t)c);
-    for (int i = 0; i < c; ++i) {
-      const Pair& q = pairs[(size_t)(s + i)];
-      wd[(size_t)i] = l.experts[(size_t)(q.expert * 3 + 2)].tw;
-      d_ids[(size_t)i] = q.expert;
+  // The expert term's byte accounting (MoeRowsDiag): the distinct experts' bytes
+  // and what these launches will actually read.
+  {
+    MoeRowsDiag& st = moe_rows_diag_state();
+    st.calls += 1;
+    st.pairs += P;
+    st.runs += (int64_t)runs.size();
+    auto proj_bytes = [&](int e, int w) { return l.experts[(size_t)(e * 3 + w)].tw.bytes(); };
+    for (int p = 0; p < P; ++p) {
+      const int e = pairs[(size_t)p].expert;
+      if (p == 0 || e != pairs[(size_t)(p - 1)].expert) {
+        st.distinct_experts += 1;
+        st.shared_bytes += proj_bytes(e, 0) + proj_bytes(e, 1) + proj_bytes(e, 2);
+      }
     }
-    mx::array xd = mx::reshape(mx::slice(act_all, {s, 0, 0}, {s + c, 1, inn}), {c, 1, inn});
-    down_chunks.push_back(trellis_linear_group_rows_scaled(
-        wd, xd, /*rows=*/1,
-        mx::take(prep->suh_d, mx::array(d_ids.data(), {c}, mx::int32), 0),
-        mx::take(prep->svh_d, mx::array(d_ids.data(), {c}, mx::int32), 0)));
+    for (size_t i = 0; i < runs.size(); ++i) {
+      if (staged[i]) st.staged_runs += 1;
+      for (int w = 0; w < 3; ++w) {
+        const TrellisWeight& tw = l.experts[(size_t)(runs[i].expert * 3 + w)].tw;
+        st.streamed_bytes += tw.bytes() * trellis_path_info(tw, runs[i].r).passes;
+      }
+    }
   }
-  mx::array down_all = down_chunks.size() == 1 ? down_chunks[0] : mx::concatenate(down_chunks, 0);
+  if (std::getenv("EXL3_MOE_RUNS_DEBUG")) {
+    std::map<int, int> hist;
+    for (const Run& rn : runs) hist[rn.r] += 1;
+    std::fprintf(stderr, "MOE_ROWS P=%d runs=%zu staged=%zu rhist=", P, runs.size(),
+                 (size_t)std::count(staged.begin(), staged.end(), (char)1));
+    for (const auto& hh : hist) std::fprintf(stderr, "%dx%d ", hh.second, hh.first);
+    std::fprintf(stderr, "\n");
+  }
+
+  // The per-run output (r, 1, H), filled by whichever path serves the run and
+  // concatenated in run order at the end; run order IS sorted-pair order, which
+  // is the order `perm` undoes.
+  std::vector<mx::array> run_out;
+  run_out.reserve(runs.size());
+  for (size_t i = 0; i < runs.size(); ++i) run_out.emplace_back(mx::array(0.0f));
+
+  // (a) the staged runs: one expert, r rows, three decode-shaped single-tensor
+  // calls. The gather is the grouped path's own row gather; the (r, 1, H) shape
+  // is what makes the call decode-shaped, and the r rows then share one staged
+  // tile instead of r rows=1 members.
+  for (size_t i = 0; i < runs.size(); ++i) {
+    if (!staged[i]) continue;
+    const Run& rn = runs[i];
+    std::vector<int32_t> rows = run_rows(rn);
+    mx::array xr = mx::reshape(
+        mx::take(hf, mx::array(rows.data(), {rn.r}, mx::int32), 0), {rn.r, 1, H});
+    run_out[i] = swiglu(l.experts[(size_t)(rn.expert * 3 + 0)],
+                        l.experts[(size_t)(rn.expert * 3 + 1)],
+                        l.experts[(size_t)(rn.expert * 3 + 2)], xr, limit);
+  }
+
+  // (b) the runs the QMV serves, as members of the grouped launches, bucketed by
+  // row count: the grouped activation is one (n, rows, in) block, so its members
+  // share `rows` - and with it the geometry mb = min(rows, 4) that decides how
+  // many rows share one decode pass. Every run of a bucket is one member pair:
+  // the merged gate|up launch holds the bucket's gate members first and its up
+  // members second (moe_prep_of's scale-stack order, and the gu4 split below), so
+  // a chunk is at most kMaxGroupMembers/2 runs; the down launch holds one member
+  // per run and is chunked separately (kMaxGroupMembers), exactly as the
+  // per-pair form was. A bucket of rows=1 runs with one run per pair is exactly
+  // that per-pair form, which is what EXL3_MOE_ROWS1 selects.
+  std::map<int, std::vector<size_t>> buckets;
+  for (size_t i = 0; i < runs.size(); ++i)
+    if (!staged[i]) buckets[runs[i].r].push_back(i);
+  std::vector<mx::array> act_run;
+  act_run.reserve(runs.size());
+  for (size_t i = 0; i < runs.size(); ++i) act_run.emplace_back(mx::array(0.0f));
+  const int gu_chunk = kMaxGroupMembers / 2;
+  for (const auto& bucket : buckets) {
+    const int r = bucket.first;
+    const std::vector<size_t>& ks = bucket.second;
+    const int c = (int)ks.size();
+    for (int s = 0; s < c; s += gu_chunk) {
+      const int cc = std::min(gu_chunk, c - s);
+      std::vector<TrellisWeight> wgu((size_t)2 * cc);
+      std::vector<int32_t> gu_ids((size_t)2 * cc), grow((size_t)2 * cc * r);
+      for (int i = 0; i < cc; ++i) {
+        const Run& rn = runs[ks[(size_t)(s + i)]];
+        const int e = rn.expert;
+        std::vector<int32_t> rows = run_rows(rn);
+        wgu[(size_t)i] = l.experts[(size_t)(e * 3 + 0)].tw;
+        wgu[(size_t)(cc + i)] = l.experts[(size_t)(e * 3 + 1)].tw;
+        gu_ids[(size_t)i] = e;
+        gu_ids[(size_t)(cc + i)] = E + e;
+        for (int t = 0; t < r; ++t) {
+          grow[(size_t)(i * r + t)] = rows[(size_t)t];
+          grow[(size_t)((cc + i) * r + t)] = rows[(size_t)t];
+        }
+      }
+      // The activation block is `r` rows per member: member i<cc is run i's rows
+      // for its gate expert, member cc+i the same rows for its up expert.
+      mx::array xgu = mx::reshape(
+          mx::take(hf, mx::array(grow.data(), {2 * cc * r}, mx::int32), 0), {2 * cc, r, H});
+      mx::array gu = trellis_linear_group_rows_scaled(
+          wgu, xgu, r,
+          mx::take(prep->suh_gu, mx::array(gu_ids.data(), {2 * cc}, mx::int32), 0),
+          mx::take(prep->svh_gu, mx::array(gu_ids.data(), {2 * cc}, mx::int32), 0));
+      const int out_i = wgu[0].out_features;
+      mx::array gu4 = mx::reshape(gu, {2, cc, r, out_i});
+      mx::array gate = mx::reshape(mx::slice(gu4, {0, 0, 0, 0}, {1, cc, r, out_i}), {cc, r, out_i});
+      mx::array up = mx::reshape(mx::slice(gu4, {1, 0, 0, 0}, {2, cc, r, out_i}), {cc, r, out_i});
+      gate = mx::clip(gate, std::nullopt, mx::array(limit, gate.dtype()));
+      up = mx::clip(up, mx::array(-limit, up.dtype()), mx::array(limit, up.dtype()));
+      mx::array act = mx::multiply(mx::multiply(gate, mx::sigmoid(gate)), up); // (cc, r, inn)
+      const int inn = (int)act.shape(2);
+      for (int i = 0; i < cc; ++i)
+        act_run[ks[(size_t)(s + i)]] =
+            mx::reshape(mx::slice(act, {i, 0, 0}, {i + 1, r, inn}), {r, 1, inn});
+    }
+  }
+  for (const auto& bucket : buckets) {
+    const int r = bucket.first;
+    const std::vector<size_t>& ks = bucket.second;
+    const int c = (int)ks.size();
+    for (int s = 0; s < c; s += kMaxGroupMembers) {
+      const int cc = std::min(kMaxGroupMembers, c - s);
+      std::vector<TrellisWeight> wd((size_t)cc);
+      std::vector<int32_t> d_ids((size_t)cc);
+      std::vector<mx::array> parts;
+      parts.reserve((size_t)cc);
+      for (int i = 0; i < cc; ++i) {
+        const Run& rn = runs[ks[(size_t)(s + i)]];
+        wd[(size_t)i] = l.experts[(size_t)(rn.expert * 3 + 2)].tw;
+        d_ids[(size_t)i] = rn.expert;
+        parts.push_back(act_run[ks[(size_t)(s + i)]]);
+      }
+      mx::array xd = parts.size() == 1 ? parts[0] : mx::concatenate(parts, 0);
+      const int inn = (int)xd.shape(xd.ndim() - 1);
+      xd = mx::reshape(xd, {cc, r, inn});
+      mx::array down = trellis_linear_group_rows_scaled(
+          wd, xd, r,
+          mx::take(prep->suh_d, mx::array(d_ids.data(), {cc}, mx::int32), 0),
+          mx::take(prep->svh_d, mx::array(d_ids.data(), {cc}, mx::int32), 0));
+      for (int i = 0; i < cc; ++i)
+        run_out[ks[(size_t)(s + i)]] =
+            mx::reshape(mx::slice(down, {i, 0, 0}, {i + 1, r, H}), {r, 1, H});
+    }
+  }
+  mx::array down_all = run_out.size() == 1 ? run_out[0] : mx::concatenate(run_out, 0);
 
   // Back to the rank-major (K, B, 1, H) stack this function has always built,
   // then the general path's weighted sum, term by term in rank order: (K, B, 1,
@@ -238,6 +415,9 @@ mx::array moe_layer_rows(const G5Layer& l, const ModelConfig& cfg, const mx::arr
                                  {B, L, H});
   return mx::add(routed, shared);
 }
+
+MoeRowsDiag moe_rows_diag() { return moe_rows_diag_state(); }
+void moe_rows_diag_reset() { moe_rows_diag_state() = MoeRowsDiag{}; }
 
 namespace {
 
