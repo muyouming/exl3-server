@@ -35,6 +35,31 @@ head 6 bits), a GLM-5-Next ("Flash" = smaller MoE member) text model.
   KDA, hyper-connections and the indexer. Check it before implementing
   hyper-connections or the sparse attention top-k selection.
 
+## Authoritative reference (fetched, class map)
+
+HF `transformers` GLM-5-Next implementation (Apache-2.0), used as the numerical
+reference for every new mechanism - fetch from
+`https://raw.githubusercontent.com/huggingface/transformers/main/src/transformers/models/glm5_next/`
+(`modeling_glm5_next.py`, ~2200 lines; `configuration_glm5_next.py`):
+
+| Component | Reference symbol (line in `modeling_glm5_next.py`) |
+|---|---|
+| KDA equations | `recurrent_kimi_delta_attention` (463), `chunk_kimi_delta_attention` (517) |
+| KDA layer wiring | `Glm5NextTextLinearAttention` (620); `causal_conv1d_fn` (429) / `causal_conv1d_update` (409); `Glm5NextTextForgetGate` (339); `Glm5NextTextRMSNormGated` (374); `l2norm` (451) |
+| MLA attention | `Glm5NextTextAttention` (1100), `eager_attention_forward` (1075), `repeat_kv` (1063) |
+| DSA indexer | `Glm5NextTextIndexer` (772) |
+| MoE | `Glm5NextTextMoE` (185), `Glm5NextTextTopkRouter` (144), `Glm5NextTextExperts` (107), `load_balancing_loss_func` (2063) |
+| Hyper-connections | `Glm5NextTextHyperConnection` (218), `Glm5NextTextHyperHead` (332) |
+| Layer / model wiring | `Glm5NextTextDecoderLayer` (1278), `Glm5NextTextModel` (1425), `Glm5NextForConditionalGeneration` (2133) |
+| Norms | `Glm5NextTextRMSNorm` (65), `Glm5NextTextUnweightedRMSNorm` (209) |
+
+## Chat template (from the checkpoint's `chat_template.jinja`)
+
+`[gMASK]<sop>` prompt prefix, `<|system|>Reasoning Effort: {Low|High|Max}` for a
+reasoning-effort control, then `<|user|>` / `<|assistant|>` turns with a
+`<think>`-style reasoning block; tool definitions are rendered between the
+template's tool markers.
+
 ## Implementation order
 
 1. **Loader + config**: extend `ModelConfig` for `glm5_next_text` (nested
